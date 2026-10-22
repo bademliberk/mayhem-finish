@@ -1,0 +1,116 @@
+import { PublicKey } from '@solana/web3.js';
+import { PUMP, MAYHEM } from './config.js';
+
+const CREATE = Buffer.from([27, 114, 169, 77, 222, 235, 99, 118]);
+const TRADE = Buffer.from([189, 219, 127, 211, 78, 230, 97, 238]);
+const CURVE = Buffer.from([23, 183, 248, 55, 96, 216, 172, 96]);
+class Reader {
+  constructor(bytes) { this.bytes = bytes; this.offset = 8; }
+  take(n) {
+    if (n < 0 || this.offset + n > this.bytes.length) throw new Error('Truncated event');
+    const value = this.bytes.subarray(this.offset, this.offset + n);
+    this.offset += n;
+    return value;
+  }
+  u64() { return this.take(8).readBigUInt64LE(); }
+  i64() { return Number(this.take(8).readBigInt64LE()); }
+  bool() {
+    const value = this.take(1)[0];
+    if (value > 1) throw new Error('Invalid boolean');
+    return value === 1;
+  }
+  key() { return new PublicKey(this.take(32)).toBase58(); }
+  string() { return this.take(this.take(4).readUInt32LE()).toString('utf8'); }
+}
+
+// Attribute events by invocation ancestry, not by transaction-wide program presence.
+export function decodeLogs(logs) {
+  const stack = [];
+  const starts = [];
+  const events = [];
+  for (const [index, line] of logs.entries()) {
+    const invoke = /^Program (\w+) invoke \[(\d+)\]$/.exec(line);
+    if (invoke) {
+      const depth = Number(invoke[2]) - 1;
+      stack.length = depth; starts.length = depth;
+      stack.push(invoke[1]); starts.push(events.length); continue;
+    }
+    if (/^Program \w+ (success|failed:)/.test(line)) {
+      const start = starts.pop();
+      if (line.includes(' failed:') && start != null) events.length = start;
+      stack.pop(); continue;
+    }
+    if (!line.startsWith('Program data: ') || stack.at(-1) !== PUMP) continue;
+    const data = Buffer.from(line.slice(14), 'base64');
+    const r = new Reader(data);
+    if (data.subarray(0, 8).equals(CREATE)) {
+      const name = r.string(), symbol = r.string(); r.string();
+      const mint = r.key(), curve = r.key(); r.key(); r.key();
+      const timestamp = r.i64();
+      r.take(32); // Four u64 reserve/supply fields.
+      // Legacy creation events have no token_program / Mayhem extension.
+      if (data.length === r.offset) continue;
+      r.key();
+      const mayhem = r.bool();
+      if (mayhem) events.push({ type: 'create', index, mint, curve, timestamp, name, symbol });
+    } else if (data.subarray(0, 8).equals(TRADE) && stack.includes(MAYHEM)) {
+      const mint = r.key();
+      const solAmount = r.u64().toString(), tokenAmount = r.u64().toString();
+      const buy = r.bool(), user = r.key(), timestamp = r.i64();
+      // A Pump TradeEvent under the Mayhem invocation is evidence of an actual trade.
+      events.push({ type: 'trade', index, mint, solAmount, tokenAmount, buy, user, timestamp });
+    }
+  }
+  return events;
+}
+
+export function transactionEvents(tx) {
+  if (!tx || !tx.meta || !Object.hasOwn(tx.meta, 'err') || tx.meta.err === undefined ||
+      !Number.isSafeInteger(tx.slot)) throw new Error('Malformed transaction metadata');
+  if (tx.meta.err !== null) return [];
+  if (tx.meta.logMessages?.some(line => line.includes('Log truncated'))) {
+    throw new Error('Transaction logs truncated; history remains incomplete');
+  }
+  if (!Array.isArray(tx.meta.logMessages) || !Number.isSafeInteger(tx.blockTime)) {
+    throw new Error('Missing logs or on-chain block time');
+  }
+  return decodeLogs(tx.meta.logMessages).map(event => ({ ...event, slot: tx.slot }));
+}
+
+export function decodeCurve(account) {
+  if (!account || account.owner !== PUMP) throw new Error('Missing or wrong-owner curve account');
+  const bytes = Buffer.from(account.data[0], 'base64');
+  if (bytes.length < 82 || !bytes.subarray(0, 8).equals(CURVE)) throw new Error('Unknown curve layout');
+  // Current IDL appends quote_mint after is_cashback_coin. All-zero means native SOL.
+  if (bytes.length >= 115 && bytes.subarray(83, 115).some(byte => byte !== 0)) {
+    throw new Error('Unsupported non-native-SOL quote');
+  }
+  const virtualTokens = bytes.readBigUInt64LE(8);
+  const virtualQuote = bytes.readBigUInt64LE(16);
+  const supply = bytes.readBigUInt64LE(40);
+  if (virtualTokens === 0n) throw new Error('Zero virtual token reserves');
+  return {
+    complete: bytes[48] === 1,
+    mayhem: bytes[81] === 1,
+    marketCap: Number(virtualQuote * supply / virtualTokens) / 1e9,
+    liquidity: Number(bytes.readBigUInt64LE(32)) / 1e9,
+  };
+}
+
+export function filterReasons(curve, cfg) {
+  const reasons = [];
+  if (curve.marketCap < cfg.minCap) reasons.push('market_cap_below_min');
+  if (curve.marketCap > cfg.maxCap) reasons.push('market_cap_above_max');
+  if (curve.liquidity <= cfg.minLiquidity) reasons.push('liquidity_at_or_below_min');
+  return reasons;
+}
+
+export function classify(lastTrade, now, curve, cfg) {
+  const reasons = filterReasons(curve, cfg);
+  const passes = reasons.length === 0;
+  if (curve.complete) return { category: 'graduated', age: null, passes };
+  if (lastTrade == null) return { category: 'never_traded', age: null, passes };
+  const age = now - lastTrade;
+  if (age < 0) throw new Error('Trade timestamp is in the future');
+  return { age, passes, reasons, category: age <= cfg.activeAge ? 'active' : age > cfg.staleAge ? 'long_inactive' : passes ? 'candidate' : 'unqualified' };
+}
