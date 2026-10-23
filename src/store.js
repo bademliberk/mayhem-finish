@@ -1,7 +1,8 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { addresses } from './config.js';
+import { addresses, screeningPolicy } from './config.js';
+import { migrateObservations } from './observations.js';
 import { filterReasons } from './chain.js';
 
 export class Store {
@@ -122,6 +123,18 @@ export class Store {
         this.run("INSERT INTO metadata VALUES('terminal_outcomes_v1','1')");
       });
     }
+    this.atomic(() => migrateObservations(this));
+    this.policy = cfg.trackingSeconds ? screeningPolicy(cfg) : 'legacy';
+  }
+  activatePolicy(now = Math.floor(Date.now() / 1000)) {
+    if (this.policy === 'legacy' || this.get("SELECT value FROM metadata WHERE key='screening_policy'")?.value === this.policy) return;
+    this.atomic(() => {
+      // Keep explicit error backoffs; only reschedule ordinary pending checks.
+      this.run(`UPDATE mints SET next_check=last_check_at+CASE WHEN last_check_at=created_at THEN ? ELSE ? END
+        WHERE status='monitoring' AND last_error IS NULL`, this.cfg.firstCheck, this.cfg.recheck);
+      this.run("INSERT INTO metadata VALUES('screening_policy',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", this.policy);
+      this.run("INSERT INTO metadata VALUES('policy_started_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", String(now));
+    });
   }
   run(sql, ...params) { return this.db.prepare(sql).run(...params); }
   get(sql, ...params) { return this.db.prepare(sql).get(...params); }
@@ -205,13 +218,21 @@ export class Store {
   evaluate(mint, now, slot, state, curve, result, lastTrade) {
     this.atomic(() => {
       const inserted = this.run(`INSERT INTO evaluations(mint,checked_at,slot,state_base64,market_cap_sol,
-        liquidity_sol,last_trade_at,trade_age_seconds,category,passes_filters,history_scope) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+        liquidity_sol,last_trade_at,trade_age_seconds,category,passes_filters,history_scope,screening_policy) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
       mint, now, slot, state, curve.marketCap, curve.liquidity, lastTrade, result.age, result.category, Number(result.passes),
-      result.historyScope ?? 'legacy');
+      result.historyScope ?? 'legacy', this.policy);
       this.run('UPDATE mints SET initial_state_base64=COALESCE(initial_state_base64,?),last_check_at=?,next_check=?,last_error=NULL WHERE mint=?',
         state, now, now + this.cfg.recheck, mint);
       if (result.category === 'candidate') {
-        this.run('INSERT OR IGNORE INTO candidates VALUES(?,?,?)', mint, now, inserted.lastInsertRowid);
+        const candidate = this.run(`INSERT OR IGNORE INTO candidates
+          (mint,first_seen,evaluation_id,market_cap_sol,liquidity_sol,screening_policy) VALUES(?,?,?,?,?,?)`,
+        mint, now, inserted.lastInsertRowid, curve.marketCap, curve.liquidity, this.policy);
+        if (candidate.changes) {
+          const started = result.detectedAtMs ?? now * 1000;
+          this.run(`INSERT INTO candidate_observations(mint,started_at_ms,deadline_ms,status) VALUES(?,?,?,?)`,
+            mint, started, started + (this.cfg.trackingSeconds ?? 0) * 1000,
+            this.cfg.trackingSeconds ? 'tracking' : 'not_tracked');
+        }
         // Never schedule this candidate again.
         this.run("UPDATE mints SET status='qualified' WHERE mint=?", mint);
       }

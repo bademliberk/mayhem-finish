@@ -26,13 +26,13 @@ node src/cli.js report > report.json
 
 Defaults are in `.env.example`; do not overwrite your real `.env`.
 
-- A dedicated async worker repeatedly queries SQLite for monitoring rows where at least **600 seconds have passed since `last_check_at`**, processes them, then sleeps **1.5 seconds**. It uses no per-mint timers and does not overlap evaluations. Retry backoff (`next_check`) is also respected; RPC load can delay actual processing.
-- First evaluation: creation + **600 seconds**. Only recently active mints are checked again **600 seconds after the evaluation** (10 minutes); infrastructure failures retry separately.
-- Once a mint qualifies as a candidate, mark it `qualified` and **permanently stop its scheduled RPC checks**, even if Mayhem trades resume. Existing candidates also stop polling after upgrading. Activity is refreshed from RPC history at each check, and observation closes at terminal classification; there is no ongoing trade feed.
-- Observe until creation + **24 hours** or detection of graduation. Graduation is detected by curve state while polling; detection time is not guaranteed to be its exact on-chain time. Graduated tokens are excluded from candidate evaluation. After qualification, no further liquidity/market-cap/graduation snapshots are fetched; durations reflect history through the final check, not later bot activity. Creation recovery can still encounter an already-recorded mint.
-- Trade age **≤20 seconds**: active/recently trading; retry in 10 minutes.
-- Trade age **>20 and ≤1,200 seconds**: candidate only when market cap is **0.04–0.5 SOL inclusive**, and real curve liquidity is **strictly >0.005 SOL**. Financial filter failures are saved in `unqualified` with all failing reasons (`market_cap_below_min`, `market_cap_above_max`, `liquidity_at_or_below_min`) and **never rechecked**.
-- Trade age **>1,200 seconds**: record in `long_inactive`, with market cap, liquidity and filter result, irrespective of those filters, then **permanently stop polling**. Later activity is not tracked and never restarts checks.
+- A dedicated async worker queries due monitoring rows, processes them serially, then sleeps **1.5 seconds**. Evaluations do not overlap. Retry backoff (`next_check`) is respected; RPC load can delay actual processing.
+- First evaluation: creation + **30 seconds**. Only recently active mints are checked again **30 seconds after the evaluation**; infrastructure failures retry separately.
+- A qualified candidate permanently stops ordinary history polling, but gets one **30-second bonding-curve account observation** (details below). Later Mayhem trades do not restart screening. Bot activity-duration tracking closes at terminal classification.
+- Observe monitoring mints until creation + **24 hours** or detection of graduation. Graduated tokens are excluded from candidate evaluation. Creation recovery can still encounter an already-recorded mint.
+- Trade age **≤5 seconds**: active/recently trading; recheck in 30 seconds.
+- Trade age **>5 and ≤60 seconds**: candidate only when market cap is **2–5 SOL inclusive**, and real curve liquidity is **strictly >0.005 SOL**. Financial filter failures are saved in `unqualified` with all failing reasons (`market_cap_below_min`, `market_cap_above_max`, `liquidity_at_or_below_min`) and **never rechecked**.
+- Trade age **>60 seconds**: record in `long_inactive`, with market cap, liquidity and filter result, irrespective of those filters, then **permanently stop polling**. Later activity never restarts checks.
 - Each check requests the **latest 20 signatures** for the mint's Mayhem state account, inspects successful transactions newest first, and stops at the first verified Mayhem buy/sell for that mint. Failed transactions count toward the 20-entry window but are not fetched; cached transactions are reused. No older pages are fetched for evaluation.
 - No successful Mayhem trade **in that window**: saved in `no_trades`; **never rechecked**. Older cached trades do not override this result. It does not mean the bot never traded. Missing transactions, malformed responses, truncated logs and RPC failures defer the check instead. The internal legacy category remains `never_traded`, but new evaluations record `history_scope=latest_20_transactions`, and reports give reason `no_mayhem_trade_in_last_20_transactions`.
 - At most one candidate and one long-inactive summary per mint. Both are terminal polling outcomes, so newly collected mints enter only one; historical records from earlier policies can overlap.
@@ -40,6 +40,18 @@ Defaults are in `.env.example`; do not overwrite your real `.env`.
 A successful **Pump TradeEvent emitted inside a Mayhem program invocation** qualifies as a Mayhem trade. Ordinary buys/sells, account touches, failed transactions, and Mayhem-enabled flags do not qualify by themselves. Invocation ancestry matters, not just whether a transaction mentions both programs. The decoder uses the public Pump event prefixes and refuses truncated/missing logs rather than claiming complete history.
 
 Market cap is the indicative virtual-reserve price times total curve supply, in SOL. Real liquidity is the curve's real SOL reserve field—not its account balance or virtual SOL reserve. Non-native-SOL quotes are rejected. These are on-chain snapshots, not guaranteed executable prices.
+
+## Candidate price observation
+
+Only newly qualifying mints are subscribed. One separate shared standard WebSocket uses `accountSubscribe` on each candidate's **bonding-curve PDA**, confirmed/base64—not the token mint account or full transaction history. After acknowledgment, one initial `getMultipleAccounts` snapshot seeds that window; subsequent MC and liquidity come directly from notifications, without per-update RPC. No candidate subscriptions are opened before qualification.
+
+The window ends **30 seconds after qualification**, regardless of connection/snapshot delays. Independent timers unsubscribe promptly even while the screening worker awaits RPC. A reconnect resumes only the remaining window without another baseline RPC in that process. Restart recovery marks an interruption and resumes still-open windows with a fresh subscription/baseline; expired windows are closed incomplete, never replayed. Shutdown leaves unfinished windows durable. No AMM tracking follows graduation.
+
+`candidates` stores the screening entry MC and real liquidity directly. `candidate_samples` stores accepted account samples, source, slot and local receipt time. Reports derive observed peak, minimum and final MC, liquidity at peak/final, percentage changes from entry and milliseconds to peak. Entry is not mixed into the sample extrema. Final means **last accepted sample**, not an exact deadline price; peak is **highest observed**, not a guaranteed on-chain maximum. Subscription setup delay, interruption, sample count and last sample time expose quality. No samples yield null metrics, not an invented flat return. A completed window means an acknowledged, uninterrupted feed with at least one sample—not proof of exhaustive chain coverage.
+
+Lower-slot samples and a late same-slot RPC snapshot after notifications are ignored. Consecutive identical same-slot payloads are deduplicated; distinct same-slot changes, including reversals, are retained in arrival order because account notifications have no intra-slot transaction index. Reconnects, malformed data and failed baselines mark the window incomplete. All observation `*_ms` timestamps are milliseconds; existing screening timestamps remain seconds.
+
+Existing candidates retain their original evaluation metrics, labeled `legacy` / `not_tracked`; they are **not** retroactively subscribed. New evaluations and candidates store a secret-free screening-policy JSON including actual configured thresholds. On `start`, a policy change reschedules only monitoring rows without explicit errors; terminal outcomes and error backoffs remain intact. Reports show policy-specific counts and suppress the pooled mean when multiple policies are present.
 
 ## Database
 
@@ -52,7 +64,9 @@ Default: **one database**, `data/collector.sqlite`, WAL mode. All categories bel
 | `mayhem_activity` | Creation baseline, sampled first/last trade, observed trade count and observation end |
 | `activity_durations` | `last-first` trading span and `last-creation` duration |
 | `evaluations` | Historical observations, raw state bytes, slot, liquidity, cap, category and history search scope |
-| `candidates` | Unique mint's first qualifying evaluation |
+| `candidates` | Unique qualifying evaluation, entry market cap/liquidity and screening policy |
+| `candidate_observations` | Fixed tracking deadline, subscription/setup times, outcome and quality flags |
+| `candidate_samples` | Candidate curve MC/liquidity samples with slot, source and receipt time |
 | `no_trades` | Terminal no-successful-trade observation and evaluation reference |
 | `unqualified` | Terminal financial-filter failure, evaluation reference and JSON reason list |
 | `long_inactive` | Unique mint's first/latest stale observation and last recovery time |
@@ -62,7 +76,7 @@ Default: **one database**, `data/collector.sqlite`, WAL mode. All categories bel
 | `coverage` | Process sessions, disconnects and backfill records |
 | `usage` | RPC attempts by method/day and received WebSocket payload bytes |
 
-`mints.last_check_at` starts at the on-chain creation timestamp as a scheduling baseline (not proof of a completed RPC check). Each successful evaluation updates it; only active mints remain eligible at `last_check_at + 600`. RPC failures leave it unchanged and schedule a retry separately. The existing mint/account row is updated, not deleted/reinserted. Existing databases automatically backfill it from the latest evaluation, or creation time if never evaluated.
+`mints.last_check_at` starts at the on-chain creation timestamp as a scheduling baseline (not proof of a completed RPC check). Each successful evaluation updates it; only active mints remain eligible at `last_check_at + 30`. RPC failures leave it unchanged and schedule a retry separately. The existing mint/account row is updated, not deleted/reinserted. Existing databases automatically backfill it from the latest evaluation, or creation time if never evaluated.
 
 The long-inactive table is a per-mint summary, not a complete pause-episode ledger. Evaluations and trades preserve the observations underneath it. `initial_state_base64` means the first fetched state, **not a reconstructed creation-slot state**.
 
@@ -114,6 +128,7 @@ A stable completed non-graduation evaluation uses **3 base RPC requests**: one s
 RPC requests/day ≈ 3 × completed evaluations/day
                  + uncached sampled transactions fetched/day
                  + creation-recovery requests
+                 + candidate baseline snapshots (normally one per new candidate)
                  + failed/deferred evaluation requests and retries
 
 WebSocket credits/day ≈ received_GB/day × 20,000
@@ -125,9 +140,9 @@ WebSocket credits/day ≈ received_GB/day × 20,000
 | 1,000 | ~4,000 credits | ~23,000 credits |
 | 10,000 | ~40,000 credits | ~230,000 credits |
 
-These exclude creation recovery, retries and streaming. **3–23 is not an all-in cap**: changing history or infrastructure errors can cause repeated attempts. A terminal first-check result has no further scheduled checks. Only active mints continue every 10 minutes; roughly 144 checks over a 24-hour horizon would cost ~576 credits when each finds a fresh bot trade immediately. Worker/network delays change actual check counts. These are scenarios, not measured mint volumes or a claim about your plan allowance. A 10-minute schedule and a 20-entry window can miss activity and qualification opportunities.
+These exclude creation recovery, retries and streaming. **3–23 is not an all-in cap**: changing history or infrastructure errors can cause repeated attempts. A terminal first-check result has no further scheduled history checks. Candidates add normally one baseline RPC plus 30 seconds of compact account notifications; WebSocket usage includes these payloads separately as `candidate_received_bytes`. Only active mints continue every 30 seconds; a continuously active mint could approach 2,880 checks over 24 hours (~11,520 credits at four requests/check). Worker/network delays reduce actual check counts. These are scenarios, not measured mint volumes or a claim about plan allowance. A 30-second schedule and 20-entry window can still miss activity and qualification opportunities.
 
-The initial implementation serializes RPC with `RPC_INTERVAL_MS=150` (at most ~6.7 requests/sec before network latency). This is deliberately conservative; sufficiently large populations still exceed capacity even with 10-minute checks. Recovery competes for that capacity. Before treating results as a whole-market daily estimate, measure traffic and backlog. Higher scale needs a higher-throughput plan and a revised concurrent/batched or streaming-account architecture—not just assuming the default loop keeps up.
+The initial implementation serializes RPC with `RPC_INTERVAL_MS=150` (at most ~6.7 requests/sec before network latency). This is deliberately conservative; **30-second checks make capacity more demanding**, and recovery plus candidate baselines share the serialized RPC queue. A baseline queued past its observation deadline is skipped, and a missing baseline is not represented as a flat price. Before treating results as a whole-market daily estimate, measure traffic and backlog. Higher scale needs a higher-throughput plan and a revised concurrent/batched or streaming-account architecture—not just assuming the default loop keeps up.
 
 Never infer a full-day opportunity count from a run whose queue or due-check lag keeps growing. No paid continuous run is started automatically by installation or tests.
 

@@ -24,16 +24,31 @@ export function config() {
   return {
     key: process.env.HELIUS_API_KEY ?? process.env.HELIUS_KEY,
     db: process.env.DB_PATH ?? 'data/collector.sqlite',
-    firstCheck: positive('FIRST_CHECK_SECONDS', 600),
-    recheck: positive('RECHECK_SECONDS', 600),
+    firstCheck: positive('FIRST_CHECK_SECONDS', 30),
+    recheck: positive('RECHECK_SECONDS', 30),
     horizon: positive('OBSERVATION_SECONDS', 86400),
-    activeAge: 20,
-    staleAge: 1200,
-    minCap: positive('MIN_MARKET_CAP_SOL', 0.04),
-    maxCap: positive('MAX_MARKET_CAP_SOL', 0.5),
+    activeAge: 5,
+    staleAge: 60,
+    trackingSeconds: 30,
+    minCap: positive('MIN_MARKET_CAP_SOL', 2),
+    maxCap: positive('MAX_MARKET_CAP_SOL', 5),
     minLiquidity: positive('MIN_LIQUIDITY_SOL', 0.005),
     rpcInterval: positive('RPC_INTERVAL_MS', 150),
     historyPages: positive('HISTORY_PAGES_PER_PASS', 10),
     backfillSeconds: positive('BACKFILL_SECONDS', 60),
   };
+}
+// Stable, secret-free description of the screening policy actually in force.
+export function screeningPolicy(cfg) {
+  return JSON.stringify({
+    version: 'candidate_tracking_v1',
+    firstCheck: cfg.firstCheck,
+    recheck: cfg.recheck,
+    activeAge: cfg.activeAge,
+    staleAge: cfg.staleAge,
+    minCap: cfg.minCap,
+    maxCap: cfg.maxCap,
+    minLiquidity: cfg.minLiquidity,
+    trackingSeconds: cfg.trackingSeconds,
+  });
 }

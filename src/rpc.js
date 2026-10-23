@@ -9,17 +9,18 @@ export class Rpc {
     this.interval = cfg.rpcInterval;
     this.next = Promise.resolve();
   }
-  call(method, params = []) {
+  call(method, params = [], { deadlineMs = Infinity } = {}) {
     const run = async () => {
       try {
         for (let attempt = 0; attempt < 4; attempt++) {
+          if (Date.now() >= deadlineMs) throw new Error(`RPC ${method}: observation deadline reached`);
           let response;
           try {
             this.store?.usage('rpc', method);
             response = await fetch(this.url, {
               method: 'POST', headers: { 'content-type': 'application/json' },
               body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-              signal: AbortSignal.timeout(30000),
+              signal: AbortSignal.timeout(Math.max(1, Math.min(30000, deadlineMs - Date.now()))),
             });
           } catch {
             if (attempt === 3) throw new Error(`RPC ${method}: network failure (credentials suppressed)`);
@@ -45,7 +46,7 @@ export class Rpc {
   signatures(address, options = {}) {
     return this.call('getSignaturesForAddress', [address, { commitment: 'confirmed', limit: 1000, ...options }]);
   }
-  accounts(addresses) {
-    return this.call('getMultipleAccounts', [addresses, { commitment: 'confirmed', encoding: 'base64' }]);
+  accounts(addresses, options = {}) {
+    return this.call('getMultipleAccounts', [addresses, { commitment: 'confirmed', encoding: 'base64' }], options);
   }
 }

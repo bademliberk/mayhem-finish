@@ -4,7 +4,9 @@ import { MAYHEM } from './config.js';
 export const nowSeconds = () => Math.floor(Date.now() / 1000);
 
 export class Collector {
-  constructor(store, rpc, cfg) { this.store = store; this.rpc = rpc; this.cfg = cfg; }
+  constructor(store, rpc, cfg, onCandidate = () => {}) {
+    this.store = store; this.rpc = rpc; this.cfg = cfg; this.onCandidate = onCandidate;
+  }
   async ingest(signature) {
     if (this.store.get('SELECT 1 FROM processed WHERE signature=?', signature)) return;
     if (this.store.get('SELECT 1 FROM quarantined_transactions WHERE signature=?', signature)) {
@@ -117,8 +119,9 @@ export class Collector {
       this.store.finish(row.mint, row.deadline, 'deadline');
       return { mint: row.mint, category: 'deadline' };
     }
-    const result = { ...classify(lastTrade, checkedAt, curve, this.cfg), historyScope: 'latest_20_transactions' };
+    const result = { ...classify(lastTrade, checkedAt, curve, this.cfg), historyScope: 'latest_20_transactions', detectedAtMs: Date.now() };
     this.store.evaluate(row.mint, checkedAt, snapshot.context.slot, state.data[0], curve, result, lastTrade);
+    if (result.category === 'candidate') this.onCandidate(row.mint);
     return { mint: row.mint, ...result, marketCapSOL: curve.marketCap, liquiditySOL: curve.liquidity, slot: snapshot.context.slot };
   }
   async checkDue(limit = 20) {

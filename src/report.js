@@ -1,3 +1,5 @@
+import { Observations } from './observations.js';
+
 const DAY = 86400;
 const date = seconds => new Date(seconds * 1000).toISOString().slice(0, 10);
 
@@ -26,6 +28,8 @@ export function report(store, now = Math.floor(Date.now() / 1000)) {
       date: date(day),
       creations: creationCount,
       uniqueCandidates: scalar('SELECT COUNT(*) n FROM candidates WHERE first_seen>=? AND first_seen<?', day, end),
+      candidatesByPolicy: store.all(`SELECT screening_policy,COUNT(*) count FROM candidates
+        WHERE first_seen>=? AND first_seen<? GROUP BY screening_policy`, day, end),
       uniqueLongInactive: scalar('SELECT COUNT(*) n FROM long_inactive WHERE first_seen>=? AND first_seen<?', day, end),
       noTrades: scalar('SELECT COUNT(*) n FROM no_trades WHERE checked_at>=? AND checked_at<?', day, end),
       unqualified: scalar('SELECT COUNT(*) n FROM unqualified WHERE checked_at>=? AND checked_at<?', day, end),
@@ -39,7 +43,9 @@ export function report(store, now = Math.floor(Date.now() / 1000)) {
       fullObservedDay: end <= now && covered === DAY && unresolved === 0 && quarantined === 0 && gaps === 0 && lateChecks === 0,
     });
   }
-  const counts = daily.filter(d => d.fullObservedDay).map(d => d.uniqueCandidates).sort((a, b) => a - b);
+  const policies = store.all('SELECT DISTINCT screening_policy FROM evaluations').map(row => row.screening_policy);
+  const counts = (policies.length <= 1 ? daily.filter(d => d.fullObservedDay) : [])
+    .map(d => d.uniqueCandidates).sort((a, b) => a - b);
   const middle = Math.floor(counts.length / 2);
   const usage = store.all('SELECT * FROM usage ORDER BY day,source,method');
   const rpcRequests = usage.filter(row => row.source === 'rpc').reduce((sum, row) => sum + row.amount, 0);
@@ -55,6 +61,11 @@ export function report(store, now = Math.floor(Date.now() / 1000)) {
       min: counts[0], max: counts.at(-1),
     } : null,
     caveat: 'Counts are observed, not guaranteed exhaustive. Trade searches use at most the latest 20 state-account transactions, not full histories. No-trades means no matching trade in that window. Activity counts and first observed trades are sampled. Inspect coverage gaps, backlog, quarantine and late detections. Only fully covered session days without queued or quarantined transactions enter the average; creation cohorts remain provisional through the observation horizon.',
+    screeningPolicies: policies,
+    averageSuppressedForMixedPolicies: policies.length > 1,
+    candidatesByPolicy: store.all('SELECT screening_policy,COUNT(*) count FROM candidates GROUP BY screening_policy'),
+    candidateObservations: new Observations(store).summaries(),
+    candidateObservationNote: 'Peak/min/final are observed curve samples, not guaranteed intrawindow extrema or an exact deadline price. Percent changes use the screening entry snapshot. Interrupted/no-sample windows are incomplete; legacy candidates are not_tracked. All *_ms timestamps use milliseconds.',
     monitoring: store.all('SELECT status,COUNT(*) count FROM mints GROUP BY status'),
     evaluationHistoryScopes: store.all('SELECT history_scope,COUNT(*) count FROM evaluations GROUP BY history_scope'),
     backlog: store.get('SELECT COUNT(*) count FROM queue').count,
@@ -62,7 +73,7 @@ export function report(store, now = Math.floor(Date.now() / 1000)) {
     graduations: store.all('SELECT mint,detected_at,slot FROM graduations ORDER BY detected_at'),
     coverage: store.all('SELECT * FROM coverage ORDER BY started_at'),
     overlap: store.get('SELECT COUNT(*) count FROM candidates JOIN long_inactive USING(mint)').count,
-    candidates: store.all(`SELECT c.mint,m.created_at,c.first_seen,e.market_cap_sol,e.liquidity_sol,e.last_trade_at,
+    candidates: store.all(`SELECT c.mint,m.created_at,c.first_seen,c.market_cap_sol,c.liquidity_sol,c.screening_policy,e.last_trade_at,
       e.trade_age_seconds,e.slot FROM candidates c JOIN mints m USING(mint) JOIN evaluations e ON e.id=c.evaluation_id ORDER BY c.first_seen`),
     noTrades: store.all(`SELECT n.*,e.history_scope FROM no_trades n
       JOIN evaluations e ON e.id=n.evaluation_id ORDER BY n.checked_at`)

@@ -8,6 +8,7 @@ import { decodeCurve, transactionEvents, classify } from './chain.js';
 import { report } from './report.js';
 import { checkLoop } from './worker.js';
 import { Recovery } from './recovery.js';
+import { CandidateTracker } from './tracker.js';
 
 const cfg = config();
 const command = process.argv[2] ?? 'start';
@@ -43,7 +44,10 @@ async function start(rpc) {
   const lastHeartbeat = Number(store.get("SELECT value FROM metadata WHERE key='heartbeat'")?.value ?? now);
   if (lastHeartbeat < now - 5) store.coverage('process_gap', lastHeartbeat, `Restart at ${now}; backfill requested`);
   const session = store.coverage('session', now, 'Collector process heartbeat; not a guarantee of complete event coverage');
-  const collector = new Collector(store, rpc, cfg);
+  store.activatePolicy(now);
+  const tracker = new CandidateTracker(store, rpc);
+  tracker.recover();
+  const collector = new Collector(store, rpc, cfg, mint => tracker.add(mint));
   let stopping = false;
   let lastConnected = lastHeartbeat;
   const recovery = new Recovery({ store, collector, programs: [MINT_AUTHORITY], retrySeconds: cfg.backfillSeconds });
@@ -51,7 +55,8 @@ async function start(rpc) {
   // actual disconnect (websocket_gap start) / last connected time, never from a prior recovery.
   const stream = new Stream(store, rpc, () => recovery.reconnected(lastConnected));
   recovery.begin({ lastHeartbeat, now });
-  const stop = () => { stopping = true; stream.stop(); };
+  let trackerStopped;
+  const stop = () => { stopping = true; stream.stop(); trackerStopped ??= tracker.stop(); };
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
   stream.start();
   console.log(JSON.stringify({ event: 'started', database: cfg.db, firstCheckSeconds: cfg.firstCheck,
@@ -67,6 +72,7 @@ async function start(rpc) {
       store.run("INSERT INTO metadata VALUES('heartbeat',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", String(tick));
       store.run('UPDATE coverage SET ended_at=? WHERE id=?', tick, session);
       stream.flushUsage();
+      tracker.flushUsage();
       if (stream.subscriptions.size === 1 && stream.socket?.readyState === 1) lastConnected = tick;
       else recovery.disconnected(lastConnected, tick);
       await recovery.run(tick);
@@ -74,9 +80,9 @@ async function start(rpc) {
       if (!stopping) await sleep(1000);
     }
   } finally {
-    stopping = true;
-    stream.stop();
+    stop();
     await worker;
+    await trackerStopped;
     store.run('UPDATE coverage SET ended_at=? WHERE id=?', nowSeconds(), session);
     process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
   }
