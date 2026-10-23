@@ -63,19 +63,15 @@ test('creation extension recognizes Mayhem and rejects truncated event', () => {
   assert.deepEqual(discoveryEvents(notify(0)),[]);
   assert.throws(() => decodeLogs(wrap(prefix.subarray(0, 40))));
 });
-test('all age, cap and liquidity boundaries', () => {
+test('financial cap and liquidity boundaries without activity inputs', () => {
   const curve = { marketCap: 0.04, liquidity: 0.005001, complete: false };
-  assert.equal(classify(100,120,curve,cfg).category,'active');
-  assert.equal(classify(100,121,curve,cfg).category,'candidate');
-  assert.equal(classify(100,1300,curve,cfg).category,'candidate');
-  assert.equal(classify(100,1301,curve,cfg).category,'long_inactive');
-  assert.equal(classify(null,1000,curve,cfg).category,'never_traded');
-  assert.equal(classify(100,200,{ ...curve,liquidity:0.005 },cfg).category,'unqualified');
-  assert.equal(classify(100,200,{ ...curve,marketCap:0.5 },cfg).category,'candidate');
-  assert.equal(classify(100,200,{ ...curve,marketCap:0.500001 },cfg).category,'unqualified');
-  assert.equal(classify(100,200,{ ...curve,marketCap:0.039999 },cfg).category,'unqualified');
-  assert.equal(classify(null,200,{ ...curve,complete:true },cfg).category,'graduated');
-  assert.throws(() => classify(201,200,curve,cfg));
+  assert.equal(classify(curve,cfg).category,'candidate');
+  assert.equal(classify(curve,cfg).age,null);
+  assert.equal(classify({ ...curve,liquidity:0.005 },cfg).category,'unqualified');
+  assert.equal(classify({ ...curve,marketCap:0.5 },cfg).category,'candidate');
+  assert.equal(classify({ ...curve,marketCap:0.500001 },cfg).category,'unqualified');
+  assert.equal(classify({ ...curve,marketCap:0.039999 },cfg).category,'unqualified');
+  assert.equal(classify({ ...curve,complete:true },cfg).category,'graduated');
 });
 test('curve decoder uses real reserves for liquidity, virtual price for cap', () => {
   const b = Buffer.alloc(166); Buffer.from([23,183,248,55,96,216,172,96]).copy(b);
@@ -100,9 +96,9 @@ test('store deduplicates replay, catches out-of-order creation, bounds activity'
 test('candidates deduplicate and long-inactive history survives resumption', () => {
   const s = new Store(':memory:',cfg);s.addMint(event);s.apply('trade',110,[trade()]);
   const curve={marketCap:0.1,liquidity:0.01,complete:false};
-  for(const t of [200,300]) s.evaluate(mint,t,1,'AA==',curve,classify(110,t,curve,cfg),110);
+  for(const t of [200,300]) s.evaluate(mint,t,1,'AA==',curve,classify(curve,cfg),110);
   assert.equal(s.get('SELECT COUNT(*) n FROM candidates').n,1);
-  s.evaluate(mint,1400,1,'AA==',curve,classify(110,1400,curve,cfg),110);
+  s.evaluate(mint,1400,1,'AA==',curve,{category:'long_inactive',age:1290,passes:true},110);
   s.apply('resume',1500,[trade(1500)]);
   assert.equal(s.get('SELECT recovered_at FROM long_inactive').recovered_at,null);
   assert.equal(s.get('SELECT status FROM mints').status,'qualified');

@@ -64,41 +64,15 @@ export class Collector {
       }
     }
   }
-  async recentSignatures(address, limit) {
-    const entries = await this.rpc.signatures(address, { limit });
-    if (!Array.isArray(entries)) throw new Error('Malformed signature history; retry');
-    const window = entries.slice(0, limit);
-    const seen = new Set();
-    for (const [index, entry] of window.entries()) {
-      if (!entry || typeof entry.signature !== 'string' || !entry.signature ||
-          !Number.isSafeInteger(entry.slot) || !Object.hasOwn(entry, 'err') ||
-          entry.err === undefined || seen.has(entry.signature) ||
-          (index > 0 && entry.slot > window[index - 1].slot)) {
-        throw new Error('Malformed signature history; retry');
-      }
-      seen.add(entry.signature);
-    }
-    return window;
-  }
-  async recentTrade(row, entries = null) {
-    entries ??= await this.recentSignatures(row.state_address, 20);
-    for (const entry of entries) {
-      if (entry.err) continue;
-      await this.ingest(entry.signature);
-      const trade = this.store.get(`SELECT traded_at FROM mayhem_trades
-        WHERE signature=? AND mint=? AND traded_at>=? AND traded_at<=?
-        ORDER BY event_index DESC LIMIT 1`, entry.signature, row.mint, row.created_at, row.deadline);
-      if (trade) return { lastTrade: trade.traded_at, head: entries[0]?.signature };
-    }
-    return { lastTrade: null, head: entries[0]?.signature };
-  }
   async evaluate(row) {
     if (nowSeconds() >= row.deadline) {
       this.store.finish(row.mint, row.deadline, 'deadline');
       return { mint: row.mint, category: 'deadline' };
     }
-    const entries = await this.recentSignatures(row.state_address, 20);
     const snapshot = await this.rpc.accounts([row.state_address, row.curve_address]);
+    if (!Number.isSafeInteger(snapshot?.context?.slot) || snapshot.context.slot < 0 || !Array.isArray(snapshot.value)) {
+      throw new Error('Malformed account snapshot; retry');
+    }
     const [state, curveAccount] = snapshot.value;
     const curve = decodeCurve(curveAccount);
     if (!curve.mayhem) throw new Error('Curve is not Mayhem-enabled');
@@ -109,24 +83,18 @@ export class Collector {
       return { mint: row.mint, category: 'graduated' };
     }
     if (!state || state.owner !== MAYHEM) throw new Error('Missing or wrong-owner Mayhem state');
-    const { lastTrade, head } = await this.recentTrade(row, entries);
-    // Close a race between history scanning and the account snapshot: if a new
-    // signature arrived, retry rather than classify using an out-of-date last trade.
-    const latest = await this.recentSignatures(row.state_address, 1);
-    if (latest[0]?.signature !== head) throw new Error('Mayhem history changed during evaluation; retry');
     const checkedAt = nowSeconds();
     if (checkedAt >= row.deadline) {
       this.store.finish(row.mint, row.deadline, 'deadline');
       return { mint: row.mint, category: 'deadline' };
     }
-    const result = { ...classify(lastTrade, checkedAt, curve, this.cfg), historyScope: 'latest_20_transactions', detectedAtMs: Date.now() };
-    this.store.evaluate(row.mint, checkedAt, snapshot.context.slot, state.data[0], curve, result, lastTrade);
+    const result = { ...classify(curve, this.cfg), historyScope: 'not_checked', detectedAtMs: Date.now() };
+    this.store.evaluate(row.mint, checkedAt, snapshot.context.slot, state.data[0], curve, result, null);
     if (result.category === 'candidate') this.onCandidate(row.mint);
     return { mint: row.mint, ...result, marketCapSOL: curve.marketCap, liquiditySOL: curve.liquidity, slot: snapshot.context.slot };
   }
   async checkDue(limit = 20) {
-    // Terminal outcomes have no trade stream or further checks; their activity
-    // observation closes at classification. Deadlines apply to active rows only.
+    // Successful financial screening is terminal; only unresolved checks retry.
     const rows = this.store.all(`SELECT * FROM mints WHERE status='monitoring'
       AND last_check_at<=? AND next_check<=? ORDER BY last_check_at LIMIT ?`,
       nowSeconds() - this.cfg.recheck, nowSeconds(), limit);

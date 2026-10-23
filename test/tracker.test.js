@@ -150,7 +150,7 @@ test('restart with time remaining subscribes only for original remaining window'
   const row=s.observations.get(mint); assert.equal(row.status,'incomplete'); assert.equal(row.deadline_ms,130000); await s.close();
 });
 
-test('collector immediately hands a persisted candidate to tracker and active rechecks use 30 seconds', async () => {
+test('collector immediately hands a persisted financial-only candidate to tracker', async () => {
   const store=new Store(':memory:',cfg), now=nowSeconds();
   store.addMint({mint,timestamp:now-35});
   store.apply('trade',1,[{type:'trade',index:1,mint,timestamp:now-10,slot:1,buy:true,solAmount:'1',tokenAmount:'1'}]);
@@ -165,11 +165,6 @@ test('collector immediately hands a persisted candidate to tracker and active re
   assert.equal(store.get('SELECT next_check FROM mints').next_check,now-5);
   await collector.evaluate(store.get('SELECT * FROM mints')); assert.equal(called,1);
   store.close();
-  const active=new Store(':memory:',cfg); active.addMint({mint,timestamp:now-35});
-  active.apply('trade',1,[{type:'trade',index:1,mint,timestamp:now,slot:1,buy:true,solAmount:'1',tokenAmount:'1'}]);
-  await new Collector(active,rpc,cfg,()=>assert.fail('Active mint must not subscribe')).evaluate(active.get('SELECT * FROM mints'));
-  const row=active.get('SELECT * FROM mints'); assert.equal(row.status,'monitoring'); assert.equal(row.next_check-row.last_check_at,30);
-  active.close();
 });
 
 test('multiple candidates share a socket and expired pending subscription is unsubscribed on late ack', async () => {

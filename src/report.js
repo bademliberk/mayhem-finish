@@ -60,7 +60,7 @@ export function report(store, now = Math.floor(Date.now() / 1000)) {
       median: counts.length % 2 ? counts[middle] : (counts[middle - 1] + counts[middle]) / 2,
       min: counts[0], max: counts.at(-1),
     } : null,
-    caveat: 'Counts are observed, not guaranteed exhaustive. Trade searches use at most the latest 20 state-account transactions, not full histories. No-trades means no matching trade in that window. Activity counts and first observed trades are sampled. Inspect coverage gaps, backlog, quarantine and late detections. Only fully covered session days without queued or quarantined transactions enter the average; creation cohorts remain provisional through the observation horizon.',
+    caveat: 'Counts are observed, not guaranteed exhaustive. Current screening checks only curve market cap and real liquidity; it does not query last trades or infer bot inactivity. New evaluations have null trade timestamps/ages and history_scope=not_checked. Historical trade-derived outcomes and sampled activity spans are retained, not recomputed. Inspect coverage gaps, backlog, quarantine and late detections. Only fully covered session days without queued or quarantined transactions enter the average; mixed screening policies suppress pooled averages.',
     screeningPolicies: policies,
     averageSuppressedForMixedPolicies: policies.length > 1,
     candidatesByPolicy: store.all('SELECT screening_policy,COUNT(*) count FROM candidates GROUP BY screening_policy'),

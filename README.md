@@ -11,7 +11,7 @@ npm test
 npm start
 ```
 
-Stop with Ctrl+C. SQLite persists across restarts. Run only one writer/collector for a database. `npm run report` can read it concurrently.
+Stop with Ctrl+C. SQLite persists across restarts. Run only one collector per database. `npm run report` can run concurrently.
 
 ```sh
 npm run inspect -- 9HzQCGsFEwLxZyHgf4XNzJSCi6EzCr1UHW1296SWpump
@@ -20,134 +20,111 @@ npm run report
 node src/cli.js report > report.json
 ```
 
-`inspect` is a bounded, read-only network probe: current accounts plus up to 20 recent state-account transactions, stopping at the latest successful Mayhem trade. It does **not** enroll the mint, insert candidates, or assert that the bot is paused. Usage counters are persisted. `start` monitors new creations from its start time, not every historical mint. Restart recovery backfills downtime.
+`inspect` fetches the current state/curve accounts and shows financial screening. It does **not** look up trades, enroll the mint, insert a candidate or infer whether the bot is paused. Usage counters are persisted. `start` monitors new creations; restart recovery backfills missed creation history.
 
-## Rules
+## Financial-only screening
 
-Defaults are in `.env.example`; do not overwrite your real `.env`.
+Defaults are in `.env.example`; do not overwrite your API key. Explicit environment values override timing and financial defaults.
 
-- A dedicated async worker queries due monitoring rows, processes them serially, then sleeps **1.5 seconds**. Evaluations do not overlap. Retry backoff (`next_check`) is respected; RPC load can delay actual processing.
-- First evaluation: creation + **30 seconds**. Only recently active mints are checked again **30 seconds after the evaluation**; infrastructure failures retry separately.
-- A qualified candidate permanently stops ordinary history polling, but gets one **30-second bonding-curve account observation** (details below). Later Mayhem trades do not restart screening. Bot activity-duration tracking closes at terminal classification.
-- Observe monitoring mints until creation + **24 hours** or detection of graduation. Graduated tokens are excluded from candidate evaluation. Creation recovery can still encounter an already-recorded mint.
-- Trade age **≤5 seconds**: active/recently trading; recheck in 30 seconds.
-- Trade age **>5 and ≤60 seconds**: candidate only when market cap is **2–5 SOL inclusive**, and real curve liquidity is **strictly >0.005 SOL**. Financial filter failures are saved in `unqualified` with all failing reasons (`market_cap_below_min`, `market_cap_above_max`, `liquidity_at_or_below_min`) and **never rechecked**.
-- Trade age **>60 seconds**: record in `long_inactive`, with market cap, liquidity and filter result, irrespective of those filters, then **permanently stop polling**. Later activity never restarts checks.
-- Each check requests the **latest 20 signatures** for the mint's Mayhem state account, inspects successful transactions newest first, and stops at the first verified Mayhem buy/sell for that mint. Failed transactions count toward the 20-entry window but are not fetched; cached transactions are reused. No older pages are fetched for evaluation.
-- No successful Mayhem trade **in that window**: saved in `no_trades`; **never rechecked**. Older cached trades do not override this result. It does not mean the bot never traded. Missing transactions, malformed responses, truncated logs and RPC failures defer the check instead. The internal legacy category remains `never_traded`, but new evaluations record `history_scope=latest_20_transactions`, and reports give reason `no_mayhem_trade_in_last_20_transactions`.
-- At most one candidate and one long-inactive summary per mint. Both are terminal polling outcomes, so newly collected mints enter only one; historical records from earlier policies can overlap.
+- First evaluation: creation + **30 seconds**.
+- **No last-trade lookup or trade-age condition.** Screening makes no state-account signature requests, transaction-history requests or latest-signature race check.
+- A non-graduated Mayhem mint qualifies if market cap is **2–5 SOL inclusive** and real curve liquidity is **strictly >0.005 SOL**.
+- Passing mints become terminal `qualified` candidates and receive the 30-second curve observation below. They are never screened again.
+- Financial failures become terminal `unqualified`, saving every failing reason: `market_cap_below_min`, `market_cap_above_max`, `liquidity_at_or_below_min`.
+- Completed curves become terminal `graduated`, without fabricating a market cap from zeroed reserves.
+- No new `active`, `long_inactive` or `no_trades` classifications are generated. There are **no activity-based rechecks**.
+- Missing/malformed account data and RPC failures leave the mint unresolved and retry after **30 seconds**. `RECHECK_SECONDS` now controls that retry delay. Unresolved mints stop at creation + **24 hours**; this is a research cutoff, not a bot shutdown flag.
+- A dedicated async worker processes due database rows serially, then sleeps **1.5 seconds**. Passes do not overlap. Queue and network load can delay actual checks.
 
-A successful **Pump TradeEvent emitted inside a Mayhem program invocation** qualifies as a Mayhem trade. Ordinary buys/sells, account touches, failed transactions, and Mayhem-enabled flags do not qualify by themselves. Invocation ancestry matters, not just whether a transaction mentions both programs. The decoder uses the public Pump event prefixes and refuses truncated/missing logs rather than claiming complete history.
+Market cap is indicative virtual-reserve price times total curve supply:
 
-Market cap is the indicative virtual-reserve price times total curve supply, in SOL. Real liquidity is the curve's real SOL reserve field—not its account balance or virtual SOL reserve. Non-native-SOL quotes are rejected. These are on-chain snapshots, not guaranteed executable prices.
+```text
+market_cap_sol = virtual_quote_reserves × token_total_supply / virtual_token_reserves / 1e9
+liquidity_sol  = real_quote_reserves / 1e9
+```
+
+Real liquidity is the curve's real SOL reserve field—not its account balance or virtual SOL reserve. Non-native-SOL quotes and non-Mayhem curves are rejected. These snapshots are not guaranteed executable prices. A candidate does **not** imply that Mayhem has paused.
 
 ## Candidate price observation
 
-Only newly qualifying mints are subscribed. One separate shared standard WebSocket uses `accountSubscribe` on each candidate's **bonding-curve PDA**, confirmed/base64—not the token mint account or full transaction history. After acknowledgment, one initial `getMultipleAccounts` snapshot seeds that window; subsequent MC and liquidity come directly from notifications, without per-update RPC. No candidate subscriptions are opened before qualification.
+Only newly qualifying mints are subscribed. One separate shared standard WebSocket uses `accountSubscribe` on each candidate's **bonding-curve PDA**, confirmed/base64—not the token mint account or full transactions. After acknowledgment, one initial `getMultipleAccounts` snapshot seeds the window; subsequent MC and liquidity come directly from notifications, without per-update RPC.
 
-The window ends **30 seconds after qualification**, regardless of connection/snapshot delays. Independent timers unsubscribe promptly even while the screening worker awaits RPC. A reconnect resumes only the remaining window without another baseline RPC in that process. Restart recovery marks an interruption and resumes still-open windows with a fresh subscription/baseline; expired windows are closed incomplete, never replayed. Shutdown leaves unfinished windows durable. No AMM tracking follows graduation.
+The window ends **30 seconds after qualification**, regardless of connection/snapshot delays. Independent timers unsubscribe while the screening worker awaits RPC. A reconnect resumes only the remaining window without another baseline RPC in that process. Restart recovery marks an interruption and resumes still-open windows with a fresh subscription/baseline; expired windows close incomplete, never replayed. Shutdown leaves unfinished windows durable. No AMM tracking follows graduation.
 
-`candidates` stores the screening entry MC and real liquidity directly. `candidate_samples` stores accepted account samples, source, slot and local receipt time. Reports derive observed peak, minimum and final MC, liquidity at peak/final, percentage changes from entry and milliseconds to peak. Entry is not mixed into the sample extrema. Final means **last accepted sample**, not an exact deadline price; peak is **highest observed**, not a guaranteed on-chain maximum. Subscription setup delay, interruption, sample count and last sample time expose quality. No samples yield null metrics, not an invented flat return. A completed window means an acknowledged, uninterrupted feed with at least one sample—not proof of exhaustive chain coverage.
+`candidates` stores screening entry MC and liquidity directly. `candidate_samples` stores accepted samples with source, slot and local receipt time. Reports derive observed peak, minimum and final MC, liquidity at peak/final, percentage changes from entry and milliseconds to peak. Entry is not mixed into sample extrema. Final means **last accepted sample**, not an exact deadline price; peak is **highest observed**, not a guaranteed on-chain maximum.
 
-Lower-slot samples and a late same-slot RPC snapshot after notifications are ignored. Consecutive identical same-slot payloads are deduplicated; distinct same-slot changes, including reversals, are retained in arrival order because account notifications have no intra-slot transaction index. Reconnects, malformed data and failed baselines mark the window incomplete. All observation `*_ms` timestamps are milliseconds; existing screening timestamps remain seconds.
+Subscription setup delay, interruption, sample count and last sample time expose quality. No samples yield null metrics, not an invented flat return. A completed window means an acknowledged, uninterrupted feed with a baseline completed before the deadline and at least one sample—not proof of exhaustive chain coverage. Lower-slot samples and late same-slot RPC snapshots after notifications are ignored. Consecutive identical same-slot payloads are deduplicated; distinct same-slot changes, including reversals, are retained in arrival order because notifications have no intra-slot transaction index. Reconnects, malformed data and missing baselines mark the window incomplete.
 
-Existing candidates retain their original evaluation metrics, labeled `legacy` / `not_tracked`; they are **not** retroactively subscribed. New evaluations and candidates store a secret-free screening-policy JSON including actual configured thresholds. On `start`, a policy change reschedules only monitoring rows without explicit errors; terminal outcomes and error backoffs remain intact. Reports show policy-specific counts and suppress the pooled mean when multiple policies are present.
+All observation `*_ms` timestamps use milliseconds; screening timestamps use seconds.
 
-## Database
+## Database and historical data
 
-Default: **one database**, `data/collector.sqlite`, WAL mode. All categories below are tables in that same database, never separate category databases. Earlier smoke-test databases under `data/` are unused test artifacts, preserved rather than silently deleted or merged into real statistics.
+Default: **one database**, `data/collector.sqlite`, WAL mode. Categories are tables in that database, not separate files. Existing databases and earlier smoke-test artifacts are never silently deleted or merged.
 
 | Table/view | Purpose |
 |---|---|
-| `mints` | Creation time, Mayhem/curve addresses, `last_check_at`, next check, observation deadline, errors, state snapshot |
-| `mayhem_trades` | Successful bot trades, deduplicated by transaction signature and event log index |
-| `mayhem_activity` | Creation baseline, sampled first/last trade, observed trade count and observation end |
-| `activity_durations` | `last-first` trading span and `last-creation` duration |
-| `evaluations` | Historical observations, raw state bytes, slot, liquidity, cap, category and history search scope |
-| `candidates` | Unique qualifying evaluation, entry market cap/liquidity and screening policy |
-| `candidate_observations` | Fixed tracking deadline, subscription/setup times, outcome and quality flags |
-| `candidate_samples` | Candidate curve MC/liquidity samples with slot, source and receipt time |
-| `no_trades` | Terminal no-successful-trade observation and evaluation reference |
-| `unqualified` | Terminal financial-filter failure, evaluation reference and JSON reason list |
-| `long_inactive` | Unique mint's first/latest stale observation and last recovery time |
-| `graduations` | Detection timestamp/slot and raw curve/state snapshots; no invented market cap for zeroed reserves |
-| `quarantined_transactions` | Unresolved truncated RPC transactions, original queue time, failed attempts and reason; excluded from routine retries |
-| `queue`, `processed`, `cursors` | Durable event ingestion, replay deduplication and pagination checkpoints |
-| `coverage` | Process sessions, disconnects and backfill records |
-| `usage` | RPC attempts by method/day and received WebSocket payload bytes |
+| `mints` | Creation time, state/curve addresses, scheduling, status, errors and initial state snapshot |
+| `evaluations` | Financial snapshots, slot, category, history scope and screening policy |
+| `candidates` | Unique qualifying evaluation, entry MC/liquidity and screening policy |
+| `candidate_observations` | Fixed deadline, subscription/setup times, outcome and quality flags |
+| `candidate_samples` | Curve MC/liquidity samples with slot, source and receipt time |
+| `unqualified` | Financial-filter failures and all reasons |
+| `graduations` | Screening graduation detection with raw curve/state snapshots |
+| `no_trades`, `long_inactive` | Preserved historical trade-based outcomes; no new screening entries |
+| `mayhem_trades`, `mayhem_activity`, `activity_durations` | Preserved historical/incidental observed trades and sampled spans; not used for screening |
+| `quarantined_transactions` | Unresolved truncated creation-recovery transactions excluded from routine retry |
+| `queue`, `processed`, `cursors` | Durable ingestion, deduplication and recovery pagination |
+| `coverage` | Sessions, disconnects, backfill and delayed/failed evaluation records |
+| `usage`, `metadata` | RPC attempts/WS bytes and durable operational metadata |
 
-`mints.last_check_at` starts at the on-chain creation timestamp as a scheduling baseline (not proof of a completed RPC check). Each successful evaluation updates it; only active mints remain eligible at `last_check_at + 30`. RPC failures leave it unchanged and schedule a retry separately. The existing mint/account row is updated, not deleted/reinserted. Existing databases automatically backfill it from the latest evaluation, or creation time if never evaluated.
+`mints.last_check_at` starts at creation as a scheduling baseline, not proof of an RPC check. A successful evaluation updates it and is terminal. Failures preserve it and set `next_check` to the retry time. `initial_state_base64` is the first fetched state, not a reconstructed creation-slot state.
 
-The long-inactive table is a per-mint summary, not a complete pause-episode ledger. Evaluations and trades preserve the observations underneath it. `initial_state_base64` means the first fetched state, **not a reconstructed creation-slot state**.
+New evaluations use `history_scope=not_checked`, with **null `last_trade_at` and `trade_age_seconds`** even if old trades exist in the database. The `financial_only_v1` screening-policy JSON includes actual configured financial/timing values and explicitly says trade history is not checked. Earlier policy labels and metrics remain unchanged. On `start`, a changed policy reschedules only monitoring rows without explicit errors; existing terminal outcomes and error backoffs remain intact.
 
-Durations use **creation as the assumed activation/first-trade time**: `first_trade_at = created_at`; `observed_first_trade_at` preserves the earliest successful bot trade actually collected, **not necessarily the bot's true first trade**. `trade_count` is the number of stored observed events, not total lifetime trades. `trading_span_seconds` and `last_trade_age_from_creation_seconds` both equal `last_trade_at - created_at`. This is a sampled, assumed-baseline activity span, not cumulative uptime. The baseline does not increment trade count or invent a last trade. With no trade ever collected, duration stays null; an older stored trade can leave a historical duration even when the current window yields `no_trades`. Evaluation decisions use only the current window, not that aggregate. Legacy `history_complete` flags are retained but are not set by bounded checks or treated as coverage failures. Reports group evaluations by `history_scope`; pre-upgrade evaluations are labeled `legacy`. The 24-hour horizon is a research cutoff, not a verified bot shutdown flag.
+Old candidates without tracking retain their original entry metrics and `legacy` / `not_tracked` labels; they are never retroactively subscribed. Candidates from the previous tracking policy retain their observations.
 
-## Recovery and coverage
+Historical activity spans remain `last_trade_at - created_at`, using creation as an assumed activation baseline. These are **sampled spans, not cumulative uptime or exact bot shutdown times**. The former latest-20 scanner usually stored only the newest matching trade. Existing durations and trade counts are not rewritten. Creation ingestion can still incidentally capture valid Mayhem trade events, but the financial-only collector does not deliberately gather trade history or claim to measure current bot activity duration. Missing observed trades leave duration null, not zero. Historical `no_trades` means no match in that evaluation's sampled window, not proof the bot never traded.
 
-RPC transactions with truncated logs are **quarantined**, not repeatedly downloaded. Existing queued truncation failures migrate automatically while retaining their original queue time and attempt counts. Missing transactions and network failures still retry. Quarantined signatures cannot be re-enqueued by discovery/backfill; a valid complete live replay can resolve them. If a bounded evaluation encounters one, it remains unresolved rather than becoming `no_trades`. Reports distinguish active backlog from quarantine; unresolved quarantine conservatively excludes affected and subsequent days from clean-day averages. Quarantine does not recover missing creations.
+## Creation discovery, recovery and coverage
 
-Completed curves are recognized before reserve division and before transaction decoding. Graduation is recorded separately without fabricating a market cap from zero reserves, then polling stops. The deadline is checked before RPC, so permanently unavailable history cannot keep a mint alive past its observation horizon.
+One enhanced Helius `transactionSubscribe` uses `accountRequired: [MAYHEM, MINT_AUTHORITY]`, `failed: false`, `vote: false`, full JSON-parsed details and transaction version 1, at **confirmed** commitment. The decoded CreateEvent must still have `is_mayhem_mode=true`; ordinary creations can match the address filter. This follows the separate `analyze_5K3N/mayhem_pattern/src/live.js` discovery approach. Enhanced subscription availability depends on the Helius plan.
 
-Fresh reconnect recovery uses the disconnected interval rather than time since the prior recovery. Pending recovery retains its earliest cutoff across restarts; another reconnect during a scan requires a follow-up head scan. A completed signature scan does not mean all queued or quarantined transactions were successfully decoded.
+**There is no global Mayhem trade subscription or global Mayhem backfill.** Creation recovery still uses mint-authority signature history and transaction RPC. Removing last-trade screening does not remove these discovery/recovery requests. The event decoder only accepts successful Pump trade events within a Mayhem invocation when such events are incidentally present; it excludes failed transactions and failed CPI events.
 
-One enhanced creation-discovery subscription delivers transaction logs. Successful Mayhem creation events are committed using on-chain event timestamps. A bounded recent-transaction search runs through RPC when a mint is due. Malformed/truncated discovery notifications enter a retry queue. After the account snapshot, the collector checks the latest signature again; a changed head defers classification to avoid using an outdated trade. Errors within the sampled window are not interpreted as inactivity; trades outside it are deliberately not searched.
+Malformed/truncated discovery notifications enter the durable retry queue. RPC transactions with truncated logs are quarantined, retaining original queue times/attempts. They are not repeatedly downloaded or re-enqueued; a complete live replay can resolve them. Missing transactions/network failures still retry. Quarantine can hide missed creations and conservatively prevents clean-day averages, but it **does not block financial screening of a known mint**.
 
-### Creation discovery subscription
+Reconnect recovery uses the actual disconnected interval, not time since a prior recovery. Pending recovery retains its earliest cutoff across restart; reconnect during an in-flight scan requires a follow-up scan. Completed signature pagination does not mean all queued/quarantined transactions were decoded. Recovery can fetch non-Mayhem creations and cannot reconstruct missed historical MC/liquidity snapshots.
 
-Discovery now follows the separate `analyze_5K3N/mayhem_pattern/src/live.js` implementation: one enhanced Helius `transactionSubscribe` using `accountRequired: [MAYHEM, MINT_AUTHORITY]`, `failed: false`, `vote: false`, full JSON-parsed details and transaction version 1. This collector uses **confirmed** rather than the reference's processed commitment. The decoded CreateEvent must still have `is_mayhem_mode=true`; ordinary creations can match the address filter.
+No system here promises exhaustive coverage under arbitrary throughput or failures. Review backlog, due-check lag, errors and coverage before trusting daily counts. Crashes may lose the last few seconds of usage counters; durable queues survive.
 
-**There is no global Mayhem trade subscription and no global Mayhem backfill.** Reconnection recovery scans mint-authority history for missed creations. Each due mint's state-account history supplies actual successful Mayhem trades via RPC. After a terminal classification, activity observation closes at that check; durations/trade counts are not continuously refreshed afterward.
+## Reports
 
-The live 12-second subscription check was acknowledged by Helius and received **8 transactions, 4 accepted Mayhem creations, 230,804 bytes**. This confirms the endpoint works with the configured key, and that the address filter is not an exact Mayhem-enabled flag filter. Enhanced subscription availability depends on the Helius plan; subscription errors do not silently fall back to the old global feeds.
-
-On startup/reconnect, address-history backfill covers the downtime for the mint-authority PDA only. Creation history includes non-Mayhem creations, so recovery still fetches some irrelevant transactions. If Pump changes creation accounts, this filter must be revisited. Logs can be large, and provider retention or inaccessible/truncated history may leave a mint unclassifiable. No system here promises exhaustive coverage under arbitrary throughput or failures. Review backlog, due-check lag, errors and coverage before trusting daily counts. A crash can lose the last few seconds of usage counters but persisted queue entries survive.
-
-## Daily counts
-
-`report` includes UTC discovery-day counts, creation-day cohorts, candidate lists, prolonged inactivity, overlap, coverage, and usage. Zero-candidate days are included only when actually observed; days before collection are not invented. The mean/median/range use complete UTC days meeting the report's coverage checks. Creation cohorts remain provisional through their observation horizon. Late recovery can shift first discovery to a later day; it cannot recover a missed historical liquidity/price snapshot. Run for at least 7–14 complete days before interpreting the average.
+`report` includes UTC candidate counts, creation-day cohorts, candidate financial metrics/observations, policy-specific counts, historical categories, coverage and usage. The pooled mean/median/range use only full UTC days passing coverage checks and are suppressed if multiple screening policies are present. Zero-candidate days are included only when actually observed. Creation cohorts remain provisional through their observation horizon. Historical and financial-only opportunities must not be treated as the same strategy.
 
 ## Helius usage and capacity
 
-According to [Helius credit documentation](https://www.helius.dev/docs/billing/credits), checked during implementation:
+Local estimates use the [Helius credit documentation](https://www.helius.dev/docs/billing/credits) assumptions below; actual provider dashboard billing is authoritative:
 
-- These standard RPC methods: **1 credit/request** (`getTransaction`, `getSignaturesForAddress`, `getMultipleAccounts`).
-- Standard WebSocket: **2 credits per 0.1 MB** before compression, or approximately **20,000 credits per GB** (decimal units).
-- Provider dashboard billing is authoritative. Pricing can change; retries and error requests may not be billed exactly like the local estimate.
+- Standard RPC methods used here: approximately **1 credit/request**.
+- Standard WebSocket: **2 credits per 0.1 MB**, approximately **20,000 credits per GB** (decimal units).
+- Retries and failed requests are counted locally; pricing and provider billing may differ.
 
-The collector records RPC attempts and received, decompressed WebSocket payload bytes. `report.usage` gives a local credit estimate. WebSocket traffic now includes full creation-discovery transactions matching the AND filter, including ordinary creations rejected locally. There is no global Mayhem-trade stream.
-
-### Short live measurement
-
-The current discovery-only smoke test received **230,804 bytes over ~12 seconds**. At unchanged traffic this would extrapolate to ~1.66 GB/day or ~33,000 streaming credits/day. This is only a short sample, not a reliable daily forecast. The earlier two-feed measurements no longer describe this architecture. RPC transaction-history costs increase because normal trades are no longer ingested live.
-
-### Estimate formula
-
-A stable completed non-graduation evaluation uses **3 base RPC requests**: one signature list (`limit: 20`), one account snapshot and one latest-signature race check (`limit: 1`). Add **0–20 `getTransaction` requests**, stopping at the first verified bot trade and reusing cached transactions. Thus the evaluation costs approximately **3–23 credits before retries** under the pricing assumption above. If the newest transaction is an uncached successful bot trade, it costs **4 credits**. Successful complete creation notifications are decoded directly. Graduation detection uses two requests (signature list and accounts), with no transaction fetches; an already-expired observation uses none. Truncated transactions are fetched at most once after upgrade before quarantine, unless a complete replay resolves them; quarantined entries retained from the old run require no migration fetch.
+A normal screening evaluation now costs **one `getMultipleAccounts` request**, including graduation detection. No per-mint `getSignaturesForAddress` or `getTransaction` requests are made. An already-expired mint costs zero RPC. A new candidate normally adds **one initial account snapshot**, then 30 seconds of account notifications. There are no active-mint repeated checks; only unresolved failures retry.
 
 ```text
-RPC requests/day ≈ 3 × completed evaluations/day
-                 + uncached sampled transactions fetched/day
+RPC requests/day ≈ screening account requests
+                 + candidate baseline snapshots
                  + creation-recovery requests
-                 + candidate baseline snapshots (normally one per new candidate)
-                 + failed/deferred evaluation requests and retries
-
+                 + retries
 WebSocket credits/day ≈ received_GB/day × 20,000
 ```
 
-| Completed evaluations/day | Newest entry is an uncached bot trade | Full 20 uncached entries searched |
-|---:|---:|---:|
-| 100 | ~400 credits | ~2,300 credits |
-| 1,000 | ~4,000 credits | ~23,000 credits |
-| 10,000 | ~40,000 credits | ~230,000 credits |
+At 1,000 successful first screenings/day and 100 candidates, screening/tracking baselines total roughly **1,100 RPC credits**, excluding recovery/retries and streaming. Account payload bytes are recorded as `candidate_received_bytes`; creation-discovery transactions remain the larger streaming feed. An earlier 12-second discovery-only smoke test received 230,804 bytes; that is not a reliable current daily forecast or a live verification of candidate tracking.
 
-These exclude creation recovery, retries and streaming. **3–23 is not an all-in cap**: changing history or infrastructure errors can cause repeated attempts. A terminal first-check result has no further scheduled history checks. Candidates add normally one baseline RPC plus 30 seconds of compact account notifications; WebSocket usage includes these payloads separately as `candidate_received_bytes`. Only active mints continue every 30 seconds; a continuously active mint could approach 2,880 checks over 24 hours (~11,520 credits at four requests/check). Worker/network delays reduce actual check counts. These are scenarios, not measured mint volumes or a claim about plan allowance. A 30-second schedule and 20-entry window can still miss activity and qualification opportunities.
-
-The initial implementation serializes RPC with `RPC_INTERVAL_MS=150` (at most ~6.7 requests/sec before network latency). This is deliberately conservative; **30-second checks make capacity more demanding**, and recovery plus candidate baselines share the serialized RPC queue. A baseline queued past its observation deadline is skipped, and a missing baseline is not represented as a flat price. Before treating results as a whole-market daily estimate, measure traffic and backlog. Higher scale needs a higher-throughput plan and a revised concurrent/batched or streaming-account architecture—not just assuming the default loop keeps up.
-
-Never infer a full-day opportunity count from a run whose queue or due-check lag keeps growing. No paid continuous run is started automatically by installation or tests.
+RPC is serialized with `RPC_INTERVAL_MS=150` (at most ~6.7 requests/sec before network latency). Recovery and candidate baselines share that queue. A baseline queued beyond its observation deadline is skipped, and missing data is never represented as a flat price. Under load, the 30-second first-check target may slip. Measure backlog rather than assuming whole-market coverage. Installation/tests do not start a paid continuous run.
 
 ## Dependencies and tests
 
-`npm test` uses synthetic events, mock RPC and in-memory SQLite. A live `inspect` verifies the configured Helius key and supplied mint without starting collection. `.env`, databases and logs are ignored by Git.
+`npm test` uses synthetic events, mock RPC/WebSockets/clocks and SQLite. Tests cover financial-only evaluation without history calls, filter boundaries, retry/terminal behavior, legacy preservation, creation recovery and candidate-window lifecycle. `.env`, databases and logs are ignored by Git.
 
-The pinned WebSocket dependency includes current security patches. The installed `@solana/web3.js` 1.x dependency tree still has moderate npm advisories in its transitive RPC/JSON dependencies; this project uses its public-key/PDA utilities, not its RPC client. Review `npm audit` before deployment; do not blindly apply a major-version forced fix.
+The pinned WebSocket dependency includes security patches. The installed `@solana/web3.js` 1.x tree still has moderate transitive RPC/JSON advisories; this project uses its public-key/PDA utilities, not its RPC client. Review `npm audit` before deployment; do not blindly apply a forced major-version upgrade.

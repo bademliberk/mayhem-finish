@@ -27,8 +27,6 @@ export function config() {
     firstCheck: positive('FIRST_CHECK_SECONDS', 30),
     recheck: positive('RECHECK_SECONDS', 30),
     horizon: positive('OBSERVATION_SECONDS', 86400),
-    activeAge: 5,
-    staleAge: 60,
     trackingSeconds: 30,
     minCap: positive('MIN_MARKET_CAP_SOL', 2),
     maxCap: positive('MAX_MARKET_CAP_SOL', 5),
@@ -41,11 +39,10 @@ export function config() {
 // Stable, secret-free description of the screening policy actually in force.
 export function screeningPolicy(cfg) {
   return JSON.stringify({
-    version: 'candidate_tracking_v1',
+    version: 'financial_only_v1',
+    tradeHistory: 'not_checked',
     firstCheck: cfg.firstCheck,
     recheck: cfg.recheck,
-    activeAge: cfg.activeAge,
-    staleAge: cfg.staleAge,
     minCap: cfg.minCap,
     maxCap: cfg.maxCap,
     minLiquidity: cfg.minLiquidity,

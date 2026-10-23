@@ -108,12 +108,9 @@ export function filterReasons(curve, cfg) {
   return reasons;
 }
 
-export function classify(lastTrade, now, curve, cfg) {
+export function classify(curve, cfg) {
+  if (curve.complete) return { category: 'graduated', age: null, passes: false, reasons: [] };
   const reasons = filterReasons(curve, cfg);
   const passes = reasons.length === 0;
-  if (curve.complete) return { category: 'graduated', age: null, passes };
-  if (lastTrade == null) return { category: 'never_traded', age: null, passes };
-  const age = now - lastTrade;
-  if (age < 0) throw new Error('Trade timestamp is in the future');
-  return { age, passes, reasons, category: age <= cfg.activeAge ? 'active' : age > cfg.staleAge ? 'long_inactive' : passes ? 'candidate' : 'unqualified' };
+  return { age: null, passes, reasons, category: passes ? 'candidate' : 'unqualified' };
 }

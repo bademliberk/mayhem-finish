@@ -4,7 +4,7 @@ import { Store } from './store.js';
 import { Rpc } from './rpc.js';
 import { Collector, nowSeconds } from './collector.js';
 import { Stream } from './stream.js';
-import { decodeCurve, transactionEvents, classify } from './chain.js';
+import { decodeCurve, classify } from './chain.js';
 import { report } from './report.js';
 import { checkLoop } from './worker.js';
 import { Recovery } from './recovery.js';
@@ -20,21 +20,12 @@ async function inspect(rpc, mint) {
   const snapshot = await rpc.accounts([state, curve]);
   const metrics = decodeCurve(snapshot.value[1]);
   if (!snapshot.value[0] || snapshot.value[0].owner !== MAYHEM || !metrics.mayhem) throw new Error('Not a Mayhem mint');
-  const signatures = await rpc.signatures(state, { limit: 20 });
-  let trade = null;
-  for (const entry of signatures) {
-    if (entry.err) continue;
-    const tx = await rpc.transaction(entry.signature);
-    if (!tx) throw new Error('Transaction unavailable');
-    const events = transactionEvents(tx).filter(e => e.type === 'trade' && e.mint === mint);
-    if (events.length) { trade = { ...events.at(-1), signature: entry.signature }; break; }
-  }
   const now = nowSeconds();
   console.log(JSON.stringify({ mint, checkedAt: new Date(now * 1000).toISOString(), slot: snapshot.context.slot,
     stateAddress: state, stateBytes: Buffer.from(snapshot.value[0].data[0], 'base64').length,
-    ...metrics, lastMayhemTrade: trade,
-    screening: trade ? classify(trade.timestamp, now, metrics, cfg) : 'unknown: no trade in latest 20 state transactions',
-    note: 'Read-only snapshot; not a decoded pause flag. No candidate inserted. History and account snapshot are not atomic.',
+    ...metrics, tradeHistory: 'not_checked',
+    screening: classify(metrics, cfg),
+    note: 'Read-only financial snapshot; bot activity is not checked. No candidate inserted.',
   }, null, 2));
 }
 

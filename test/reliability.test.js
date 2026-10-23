@@ -31,7 +31,7 @@ test('graduation bypasses quarantined trade decoding and stops scheduled RPC',as
     accounts:async()=>({context:{slot:2},value:[{owner:MAYHEM,data:['AA==','base64']},curve(true)]}),
     transaction:async()=>assert.fail('Do not decode graduated history')};
   const c=new Collector(s,rpc,cfg);await c.evaluate(s.get('SELECT * FROM mints'));
-  assert.equal(listings,1);assert.equal(s.get('SELECT status FROM mints').status,'graduated');
+  assert.equal(listings,0);assert.equal(s.get('SELECT status FROM mints').status,'graduated');
   assert.equal(s.get('SELECT COUNT(*) n FROM graduations').n,1);
   assert.equal(s.get('SELECT COUNT(*) n FROM evaluations').n,0);
   assert.equal(s.get('SELECT slot FROM graduations').slot,2);
@@ -95,6 +95,6 @@ test('quarantined history prevents clean-day averages and cannot become no_trade
   const c=new Collector(s,{signatures:async()=>[{signature:'bad',slot:1,err:null}],
     accounts:async()=>({context:{slot:2},value:[{owner:MAYHEM,data:['AA==','base64']},b]}),
     transaction:async()=>assert.fail('Must not refetch quarantine')},cfg);
-  await assert.rejects(c.evaluate(s.get('SELECT * FROM mints')),/Quarantined/);
+  assert.equal((await c.evaluate(s.get('SELECT * FROM mints'))).category,'unqualified');
   assert.equal(s.get('SELECT COUNT(*) n FROM no_trades').n,0);s.close();
 });
