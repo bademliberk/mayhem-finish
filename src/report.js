@@ -50,10 +50,11 @@ export function report(store, now = Math.floor(Date.now() / 1000)) {
   const usage = store.all('SELECT * FROM usage ORDER BY day,source,method');
   const rpcRequests = usage.filter(row => row.source === 'rpc').reduce((sum, row) => sum + row.amount, 0);
   const wsBytes = usage.filter(row => row.source === 'websocket').reduce((sum, row) => sum + row.amount, 0);
+  const preprocessedTransactions = usage.filter(row => row.source === 'preprocessed' && row.method === 'transactions').reduce((sum, row) => sum + row.amount, 0);
   return {
-    usage: { rows: usage, rpcRequests, websocketBytes: wsBytes,
-      estimatedCredits: rpcRequests + wsBytes / 100000 * 2,
-      note: 'Estimate: these standard RPC methods cost 1 credit/request; WebSocket 2 credits/0.1 MB. Local received payload bytes approximate uncompressed billed bytes. Actual dashboard billing is authoritative. Retries included.' },
+    usage: { rows: usage, rpcRequests, websocketBytes: wsBytes, preprocessedTransactions,
+      estimatedCredits: rpcRequests + wsBytes / 100000 * 2 + preprocessedTransactions * 0.1,
+      note: 'Estimate: standard RPC methods 1 credit/request; standard WebSocket 2 credits/0.1 MB; preprocessed feed 0.1 credit/delivered transaction (not also byte-billed here). Local received payload bytes approximate uncompressed billed bytes. Actual dashboard billing is authoritative. Retries included.' },
     generatedAt: new Date(now * 1000).toISOString(), daily,
     average: counts.length ? {
       days: counts.length, mean: counts.reduce((a, b) => a + b, 0) / counts.length,

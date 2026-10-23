@@ -123,6 +123,47 @@ At 1,000 successful first screenings/day and 100 candidates, screening/tracking 
 
 RPC is serialized with `RPC_INTERVAL_MS=150` (at most ~6.7 requests/sec before network latency). Recovery and candidate baselines share that queue. A baseline queued beyond its observation deadline is skipped, and missing data is never represented as a flat price. Under load, the 30-second first-check target may slip. Measure backlog rather than assuming whole-market coverage. Installation/tests do not start a paid continuous run.
 
+## Paper trading
+
+```sh
+# Explicit opt-in; keep only one process/writer per database.
+npm run paper
+npm run paper-report
+```
+
+`npm start` remains monitor-only. `npm run paper` uses the same creation discovery and 30-second financial screening, then enrolls **new candidates only** into a separate durable paper watchlist. Existing historical candidates are not reenrolled. Restart restores paper watches/positions. New paper candidates use `paper_watch` instead of starting the old 30-second observation timer. No private key, wallet loading, signing or `sendTransaction` exists in this mode. No live trades are placed.
+
+### Strategy
+
+- Watch until executed MC **≤0.1 SOL**, graduation, or a completed simulated round trip. No 30-second expiry.
+- Buy budget **0.01 SOL**, including modeled swap fees but excluding modeled network cost.
+- Entry requires predicted MC **strictly >0.1 and <0.5 SOL**, and a price decline **at least 60%** from the highest executed price observed in slots `[signalSlot-4, signalSlot]`. The triggering transaction's projected post-state is the comparison price. This is an observed peak, not a guarantee every chain state was received.
+- One successful paper buy per mint. Default **25 successful buys total**, persisted across restarts; pending buys reserve capacity atomically. Canceled/failed reservations release capacity. Closed positions still count toward 25. Changing settings never resets orders or positions. There is no automatic counter reset.
+- Profit exit when modeled net sale proceeds for the full held token amount are **strictly >130% of modeled entry cost**, after swap and network costs and own sell price impact.
+- Executed MC **≤0.1 SOL** stops new entry and requests a floor exit if holding. An illiquid exit stays open/blocked; it is not assigned fictional proceeds. The floor exit remains requested even if price subsequently rebounds.
+- Graduation stops entry; an existing position remains **exit-blocked/manual attention**, not magically sold. AMM execution is outside this implementation.
+- `PAPER_ENTRIES_ENABLED=false` disables entries but does not block exits. The trade cap likewise never blocks exits.
+
+### Predictions versus hypothetical fills
+
+The [Helius preprocessed feed](https://www.helius.dev/docs/preprocessed-transactions/preprocessed-subscribe) sends binary transaction frames **before execution** on the beta WebSocket endpoint. It has no outcome, logs, inner instructions or account states. The paper feed filters to watched curve accounts plus the Pump program; it is not an unrestricted global Pump feed. Filter changes use a brief make-before-break replacement, with at most two preprocessed connections during the handover. Actual feed gaps invalidate rolling signal history; overlapping deliveries are deduplicated for strategy processing but still counted for billing.
+
+A separate `processed` curve account feed plus slot notifications supplies executed reserve snapshots. Reconnects/overflow invalidate entry readiness; fresh baselines and five-slot history are required before entry. Old, already-applied/same-slot, duplicate, unresolved or unsupported signals are rejected and counted. Predictions are never added cumulatively to the executed reserve cache. Account notifications can still come from a fork; they are not finality guarantees.
+
+The decoder supports **one direct exact-token `buy`, `sell`, `buy_v3` or `sell_v3` instruction** in a legacy/v0 transaction, using the [public Pump IDL](https://github.com/pump-fun/pump-public-docs/blob/main/idl/pump.json). It validates mint/curve pairing and native-SOL layouts; partial-fill requests and v3 cashback curves are rejected. Exact-input buys, v2 variants, transaction-wire v1, address lookup tables, routed/CPI swaps, multiple swaps and unrecognized surrounding account effects are **skipped**, not inferred. Thus this is a limited-coverage paper experiment, not a complete trade decoder. Token-2022 extension effects are not loaded; estimates assume plain token transfers. MC uses the curve's recorded supply, not a separately fetched mint supply.
+
+Orders initially stay **pending**, without creating a position. The reconciler waits for a confirmed successful triggering signature, fetches a subsequent confirmed curve snapshot, and rechecks bounds, drop, slippage and liquidity. Signals with unknown/failed execution, changed slots, timeout or invalidated entry conditions cancel. Entries also expire after the five-slot signal horizon. Pending orders on restart cancel as unreconciled; already-filled paper positions remain durable. All fills are **hypothetical later-state simulations**, not on-chain holdings, priority ordering guarantees or realizable returns. This conservative model may miss very short-lived opportunities.
+
+### Cost assumptions and operating limits
+
+`.env.example` lists paper settings. Default modeled swap fee is **200 bps**, network cost **10,000 lamports per side**, and buy/sell slippage tolerance **500 bps**. These are configurable **simulation assumptions**, not verified dynamic Pump/Mayhem fee schedules, wallet rent, tips, fee quotes or a live execution recommendation. Each order retains the complete assumption set. Entry budget includes modeled swap fees, so actual modeled reserve input can be below 0.01 SOL.
+
+Defaults cap simultaneous watches at 1,000, queued frames at 1,000, state age at 5 seconds and pending-order lifetime at 10 seconds. Enrollment skipped due to limits is counted rather than silently presented as complete coverage. The persistent trade count limits cumulative modeled entries, not a claim that losses cannot exceed principal once fees are considered. No maximum holding timeout is imposed; positions can remain blocked/open indefinitely when no exit is available.
+
+Preprocessed delivery costs **0.1 credit per delivered transaction** according to Helius documentation; it is counted separately from byte-based standard WebSocket traffic. Status reconciliation and fresh fill snapshots add RPC usage beyond monitoring. A shared serialized RPC queue can miss short windows; monitor pending/canceled orders and queue counters before interpreting results. Paid-plan access is required. Tests do not start feeds or consume live RPC credits.
+
+`paper-report` lists assumptions, capacity, order counts, positions, realized simulated P&L per closed position, blocked exits and rejection/gap counters. SQL tables are `paper_watches`, `paper_signals`, `paper_orders`, `paper_positions`, and `paper_counters`, in the same database as monitoring records. Raw quantities/costs use decimal integer strings; paper timestamps use milliseconds. Historical monitoring records are preserved.
+
 ## Dependencies and tests
 
 `npm test` uses synthetic events, mock RPC/WebSockets/clocks and SQLite. Tests cover financial-only evaluation without history calls, filter boundaries, retry/terminal behavior, legacy preservation, creation recovery and candidate-window lifecycle. `.env`, databases and logs are ignored by Git.

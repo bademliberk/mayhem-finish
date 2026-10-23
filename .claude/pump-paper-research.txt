@@ -1,0 +1,86 @@
+PUMP BONDING-CURVE RESEARCH (read-only; no trades; SDK not run; quotes unconfirmed vs real txs)
+Date: 2026-10-23
+
+SOURCES
+- Official docs/IDL repo: https://github.com/pump-fun/pump-public-docs
+- Raw IDL: https://raw.githubusercontent.com/pump-fun/pump-public-docs/main/idl/pump.json (program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P)
+- Fee IDL: https://raw.githubusercontent.com/pump-fun/pump-public-docs/main/idl/pump_fees.json
+- Docs: https://raw.githubusercontent.com/pump-fun/pump-public-docs/main/docs/instructions/BUY.md , SELL.md , TRADE_V3.md ; docs/FEE_RECIPIENTS.md ; docs/PUMP_PROGRAM_README.md
+- SDK source: https://unpkg.com/@pump-fun/pump-sdk@4.3.1/src/bondingCurve.ts and fees.ts
+- web3.js 1.98.4 source: https://unpkg.com/@solana/web3.js@1.98.4/src/message/versioned.ts , v0.ts , transaction/versioned.ts
+- Tx v1: https://solana.com/docs/core/transactions/versioned-transactions ; https://github.com/solana-foundation/solana-improvement-documents/blob/main/proposals/0385-transaction-v1.md
+
+SDK
+- @pump-fun/pump-sdk 4.3.1 (npm latest, published 2026-10-22, MIT). 4.0.0 on 2026-10-08; moves fast, pin exact version.
+- deps: @coral-xyz/anchor ^0.31.1, @solana/spl-token ^0.4.13, @solana/web3.js ^1.98.2, bn.js ^5.2.2, @pump-fun/agent-payments-sdk 1.0.7
+- Recommendation: do not add for paper mode; reimplement math in BigInt.
+
+INSTRUCTION ABI (ix data = 8-byte discriminator + args; u64 little-endian; OptionBool = 1 byte; trailing partial_fill may be absent)
+buy                    [102,6,61,18,1,218,235,234]  amount u64, max_sol_cost u64, track_volume OptionBool, partial_fill OptionBool   16 accts
+buy_exact_sol_in       [56,252,116,8,158,223,205,95] spendable_sol_in u64, min_tokens_out u64, track_volume, partial_fill            16 accts
+sell                   [51,230,133,164,1,127,131,173] amount u64, min_sol_output u64                                                 14 accts
+buy_v2                 [184,23,238,97,103,197,211,61] amount, max_sol_cost, partial_fill                                             27 accts
+sell_v2                [93,246,130,60,231,233,64,178] amount, min_sol_output                                                         26 accts
+buy_exact_quote_in_v2  [194,171,28,70,104,77,91,47]   spendable_quote_in, min_tokens_out, partial_fill                              27 accts
+buy_v3                 [7,5,29,196,245,23,101,80]     amount, max_sol_cost, optional partial_fill                                    17 accts
+buy_exact_quote_in_v3  [225,247,80,30,213,179,132,136] spendable_quote_in, min_tokens_out, optional partial_fill                    17 accts
+sell_v3                [28,146,222,119,38,196,105,213] amount, min_sol_output                                                        17 accts
+
+ACCOUNT INDICES (0-based)
+legacy buy / buy_exact_sol_in (16): 0 global, 1 fee_recipient(W), 2 mint, 3 bonding_curve(W), 4 assoc_bonding_curve(W), 5 assoc_user(W),
+  6 user(WS), 7 system, 8 token_program, 9 creator_vault(W), 10 event_authority, 11 pump program, 12 global_volume_accumulator,
+  13 user_volume_accumulator(W), 14 fee_config, 15 fee_program
+legacy sell (14): 0 global, 1 fee_recipient(W), 2 mint, 3 bonding_curve(W), 4 assoc_bonding_curve(W), 5 assoc_user(W), 6 user(WS), 7 system,
+  8 creator_vault(W), 9 token_program, 10 event_authority, 11 program, 12 fee_config, 13 fee_program
+  (creator_vault/token_program swap places vs buy)
+v3 buy and sell (17): 0 global, 1 base_mint, 2 quote_mint (wSOL So11111111111111111111111111111111111111112 for SOL curves), 3 base_token_program,
+  4 quote_token_program, 5 bonding_curve(W), 6 assoc_base_curve(W), 7 assoc_quote_curve(W), 8 user(WS), 9 assoc_base_user(W), 10 assoc_quote_user(W),
+  11 user_volume_accumulator(W), 12 fee_config, 13 buyback_fee_recipient(W), 14 system, 15 event_authority, 16 program
+  v3 rejects cashback coins (error 6094).
+v2 (26/27 accts): full order not captured here; see BUY.md / SELL.md. sell_v2 user is the 14th account (index 13).
+Fee program: pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ
+PDA seeds: ["bonding-curve", mint]; ["global"]; ["creator-vault", curve.creator]; ["user_volume_accumulator", user];
+  fee_config = ["fee_config", pump_program_id] under fee program.
+Fee recipients: Mayhem coins use Global reserved recipients; others use normal recipients (FEE_RECIPIENTS.md lists them); buyback recipients from a third list.
+Token program: create_v2 coins -> Token-2022 TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb; older coins -> legacy SPL token. Read mint owner. Docs do not link Mayhem to Token-2022.
+Decoder rule: match program id + first 8 data bytes; read mint/curve/user from index for that instruction.
+Account discriminators: BondingCurve [23,183,248,55,96,216,172,96]; Global [167,232,232,177,200,108,114,127]; FeeConfig [143,52,146,187,219,123,76,155]
+
+BONDING CURVE LAYOUT (offsets include 8-byte discriminator; u64 little-endian)
+8 virtual_token, 16 virtual_quote, 24 real_token, 32 real_quote, 40 token_total_supply, 48 complete, 49 creator(32), 81 is_mayhem_mode,
+82 is_cashback_coin, 83 quote_mint(32; zero key = SOL), 115 creator_fee_bps u64, 123 can_edit_creator_fee, 124 is_holder_reward,
+125 creator_fee, 133 protocol_fees, 141 depth u8, 142 initial_virtual_quote_reserves, 150 post_complete_base_out, 158 post_complete_quote_in.
+Older accounts shorter; absent trailing fields = zero/false. Repo's existing offsets (48, 81) are correct.
+Initial: vtoken 1,073,000,000,000,000; vsol 30,000,000,000; real token 793,100,000,000,000; supply 1e15.
+
+FEE CONFIG (live mainnet read, own decode)
+- fee_config PDA 8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt (owner = fee program): single tier threshold 0: protocol 95 bps, creator 30 bps, lp 0 => 125 bps. flat_fees identical. Threshold is u128.
+  Layout: u8 bump, 32B admin, flat_fees(lp,protocol,creator u64), vec tiers(u128 threshold + fees), stable tiers, exotic flat fees.
+- Global PDA 4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf: fee_basis_points 95, creator_fee_basis_points 5 (fallback only without fee_config), buyback_basis_points 5000.
+- Tier = largest threshold <= marketCap; marketCap = vq*supply/vt (supply 1e15 non-Mayhem; actual mint supply for Mayhem).
+- If global creator_fee_configurable and curve.creator_fee_bps != 0 -> replaces creator rate. Creator rate 0 if creator is zero key.
+- Fetch and refresh fee_config; do not hardcode.
+
+QUOTE MATH (integer; inferred from SDK 4.3.1; docs give no rounding rules; validate against real txs)
+fee(x,bps) = ceil(x*bps/10000), protocol and creator separately.
+Legacy buy, budget B: net = floor((B-1)*10000/(10000+p+c)); tokens = min(floor(net*vt/(vq+net)), real_token)
+v3 exact-in: net = floor(B*10000/(10000+p+c)); if net+fees > B, net -= excess; tokens = floor((net-1)*vt/(vq+net-1)) capped at real_token
+Buy cost for t tokens: net = floor(t*vq/(vt-t))+1; cost = net + fee_p(net) + fee_c(net)
+Sell t: sol = floor(t*vq/(vt+t)); net = sol - fee_p(sol) - fee_c(sol)
+Reserves: buy adds net to virtual+real quote, subtracts tokens from virtual+real token; sell reverses.
+Buyback is a slice of protocol fee paid in-trade (none on Mayhem); buyer debit unchanged.
+Buy exceeding remaining curve tokens crosses into a synthetic pool for non-Mayhem in v3: reject/cap in paper mode.
+
+EXTRA ENTRY COSTS (not in SDK quote)
+- user_volume_accumulator init 0.0018444 SOL (docs); base ATA if absent ~0.00204 SOL legacy / ~0.00207 Token-2022 (my estimate, unverified); 5000 lamports/signature + priority fee.
+
+WIRE DECODING (web3.js 1.98.4)
+- VersionedTransaction.deserialize: legacy and v0 only; others throw "Transaction message version N deserialization is not supported".
+- v1 (SIMD-0385): byte 0x81 at offset 0, signatures at end, no ALTs, fixed-width counts, 4096-byte limit. Docs say enabled on mainnet/devnet/testnet; feature gate/slot unverified.
+- Recommended: (1) bytes[0]===0x81 -> unsupported-v1 before deserialize; (2) VersionedTransaction.deserialize; (3) v0: connection.getAddressLookupTable(key) or AddressLookupTableAccount.deserialize, then message.getAccountKeys({addressLookupTableAccounts}); order static, lookup writable, lookup readonly; (4) missing/closed table or bad index -> unresolvable.
+- v1/CPI/multi-swap options: skip+count (recommended for paper); custom v1 parser from SIMD; or fetch confirmed tx meta.innerInstructions.
+- CPI/router swaps are invisible in raw wire data. Multiple Pump ixs in one tx can be applied sequentially.
+
+UNKNOWNS
+- No published rounding rules/fee-tier table; Mayhem trading mechanics undocumented; Mayhem base token Token-2022 transfer-fee extension unverified;
+  program changes often (v2/v3, new accounts, SDK majors): re-check IDL, fee_config, Global before relying on numbers. SDK output untested.

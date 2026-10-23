@@ -231,7 +231,7 @@ export class Store {
           const started = result.detectedAtMs ?? now * 1000;
           this.run(`INSERT INTO candidate_observations(mint,started_at_ms,deadline_ms,status) VALUES(?,?,?,?)`,
             mint, started, started + (this.cfg.trackingSeconds ?? 0) * 1000,
-            this.cfg.trackingSeconds ? 'tracking' : 'not_tracked');
+            this.cfg.paperMode ? 'paper_watch' : this.cfg.trackingSeconds ? 'tracking' : 'not_tracked');
         }
         // Never schedule this candidate again.
         this.run("UPDATE mints SET status='qualified' WHERE mint=?", mint);

@@ -8,6 +8,8 @@
   },
   "scripts": {
     "start": "node src/cli.js start",
+    "paper": "node src/cli.js paper",
+    "paper-report": "node src/cli.js paper-report",
     "inspect": "node src/cli.js inspect",
     "report": "node src/cli.js report",
     "test": "node --test"

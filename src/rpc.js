@@ -46,7 +46,7 @@ export class Rpc {
   signatures(address, options = {}) {
     return this.call('getSignaturesForAddress', [address, { commitment: 'confirmed', limit: 1000, ...options }]);
   }
-  accounts(addresses, options = {}) {
-    return this.call('getMultipleAccounts', [addresses, { commitment: 'confirmed', encoding: 'base64' }], options);
+  accounts(addresses, { commitment = 'confirmed', ...options } = {}) {
+    return this.call('getMultipleAccounts', [addresses, { commitment, encoding: 'base64' }], options);
   }
 }
