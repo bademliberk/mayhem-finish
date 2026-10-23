@@ -5,7 +5,8 @@ export function paperConfig(env = process.env) {
     return value;
   };
   return {
-    mode: 'paper', version: 'dump_five_slots_v1', buyLamports: '10000000',
+    mode: 'paper', version: 'creation_staged_v2', buyLamports: '10000000',
+    activationCap: 2, idleMs: 60000,
     maxTrades: number('MAX_TRADE_COUNT', 25, 1, 100000),
     windowSlots: 5, dropBps: 6000, floorCap: 0.1, ceilingCap: 0.5, profitBps: 3000,
     // Simulation assumptions, not authoritative on-chain fee or fill guarantees.
@@ -26,7 +27,7 @@ export class PaperStore {
     this.store = store; this.cfg = cfg;
     store.db.exec(`
       CREATE TABLE IF NOT EXISTS paper_watches (
-        mint TEXT PRIMARY KEY REFERENCES candidates(mint), curve_address TEXT NOT NULL,
+        mint TEXT PRIMARY KEY REFERENCES mints(mint), curve_address TEXT NOT NULL,
         enrolled_at_ms INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'watching', reason TEXT,
         last_slot INTEGER, last_cap REAL
       );
@@ -47,11 +48,45 @@ export class PaperStore {
         signature TEXT PRIMARY KEY, slot INTEGER NOT NULL, received_at_ms INTEGER NOT NULL,
         mint TEXT, outcome TEXT NOT NULL, detail TEXT
       );
+      CREATE TABLE IF NOT EXISTS paper_rejections (id INTEGER PRIMARY KEY, reason TEXT NOT NULL, at_ms INTEGER NOT NULL, detail TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS paper_counters (name TEXT PRIMARY KEY, count INTEGER NOT NULL);
     `);
+    // Rebuild only the parent table; preserve child FK names and all historical paper rows.
+    if (store.all('PRAGMA foreign_key_list(paper_watches)').some(row => row.table === 'candidates')) {
+      store.db.exec('PRAGMA foreign_keys=OFF');
+      try {
+        store.atomic(() => {
+          store.db.exec(`CREATE TABLE paper_watches_new (
+            mint TEXT PRIMARY KEY REFERENCES mints(mint), curve_address TEXT NOT NULL,
+            enrolled_at_ms INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'watching', reason TEXT,
+            last_slot INTEGER, last_cap REAL
+          );
+          INSERT INTO paper_watches_new SELECT * FROM paper_watches;
+          DROP TABLE paper_watches;
+          ALTER TABLE paper_watches_new RENAME TO paper_watches;`);
+          if (store.all('PRAGMA foreign_key_check').length) throw new Error('Paper watch migration foreign-key failure');
+        });
+      } finally { store.db.exec('PRAGMA foreign_keys=ON'); }
+    }
+    const columns = store.all('PRAGMA table_info(paper_watches)').map(row => row.name);
+    for (const [name, type] of [['fingerprint', 'TEXT'], ['last_change_ms', 'INTEGER'], ['preprocessed', 'INTEGER NOT NULL DEFAULT 0']]) {
+      if (!columns.includes(name)) store.db.exec(`ALTER TABLE paper_watches ADD COLUMN ${name} ${type}`);
+    }
   }
   count(name) {
     this.store.run('INSERT INTO paper_counters VALUES(?,1) ON CONFLICT(name) DO UPDATE SET count=count+1', name);
+  }
+  rejection(reason, details = {}, now) {
+    this.count(`decode:${reason}`);
+    // Bounded public-chain metadata only; never raw transport errors or credential-bearing URLs.
+    const key = value => typeof value === 'string' && /^[1-9A-HJ-NP-Za-km-z]{32,90}$/.test(value) ? value : null;
+    const safe = { signature: key(details?.signature), slot: Number.isSafeInteger(details?.slot) ? details.slot : null,
+      table: key(details?.table), instructions: (details?.instructions ?? []).slice(0,8).map(ix => ({
+        program: key(ix.program), discriminator: /^[a-f0-9]{0,16}$/.test(ix.discriminator) ? ix.discriminator : null,
+        accounts: Number.isSafeInteger(ix.accounts) ? ix.accounts : null, bytes: Number.isSafeInteger(ix.bytes) ? ix.bytes : null,
+      })) };
+    this.store.run('INSERT INTO paper_rejections(reason,at_ms,detail) VALUES(?,?,?)', reason, now, JSON.stringify(safe));
+    this.store.run('DELETE FROM paper_rejections WHERE id NOT IN (SELECT id FROM paper_rejections ORDER BY id DESC LIMIT 100)');
   }
   capacity() {
     const used = this.store.get("SELECT COUNT(*) n FROM paper_orders WHERE side='buy' AND status IN ('pending','filled')").n;
@@ -62,7 +97,7 @@ export class PaperStore {
     if (this.store.get('SELECT 1 FROM paper_watches WHERE mint=?', mint)) return false;
     if (!this.cfg.entriesEnabled || !this.capacity().remaining) { this.count('enrollment_entry_cap'); return false; }
     if (this.active().length >= this.cfg.maxWatches) { this.count('enrollment_watch_cap'); return false; }
-    const row = this.store.get('SELECT curve_address FROM mints WHERE mint=? AND mint IN (SELECT mint FROM candidates)', mint);
+    const row = this.store.get('SELECT curve_address FROM mints WHERE mint=?', mint);
     if (!row) return false;
     this.store.run('INSERT INTO paper_watches(mint,curve_address,enrolled_at_ms) VALUES(?,?,?)', mint, row.curve_address, now);
     return true;
@@ -118,12 +153,15 @@ export class PaperStore {
     const positions = this.store.all('SELECT * FROM paper_positions ORDER BY opened_at_ms');
     return {
       mode: 'paper', assumptions: this.cfg, capacity: this.capacity(),
+      coverage: this.store.all(`SELECT mint,status,last_cap,last_change_ms,preprocessed FROM paper_watches
+        WHERE status IN ('watching','holding','exit_blocked')`),
       realizedPnlLamports: positions.reduce((sum, row) => sum + BigInt(row.pnl_lamports ?? '0'), 0n).toString(),
       watches: this.store.all('SELECT status,COUNT(*) count FROM paper_watches GROUP BY status'),
       orders: this.store.all('SELECT side,status,COUNT(*) count FROM paper_orders GROUP BY side,status'),
       positions,
       recentOrders: this.store.all('SELECT * FROM paper_orders ORDER BY id DESC LIMIT 25'),
       recentSignals: this.store.all('SELECT * FROM paper_signals ORDER BY received_at_ms DESC LIMIT 25'),
+      recentRejections: this.store.all('SELECT * FROM paper_rejections ORDER BY id DESC LIMIT 25'),
       counters: this.store.all('SELECT * FROM paper_counters ORDER BY name'),
       blocked: this.store.all("SELECT * FROM paper_watches WHERE status='exit_blocked'"),
       usage: this.store.all("SELECT * FROM usage WHERE source IN ('preprocessed','preprocessed_bytes') OR method='paper_account_received_bytes' ORDER BY day,source,method"),

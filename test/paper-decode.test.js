@@ -8,7 +8,7 @@ import { buyTokens, sell } from '../src/paper-math.js';
 
 const cfg = paperConfig({});
 const mint = Keypair.generate().publicKey.toBase58();
-const token = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCxEpPxuEb';
+const token = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 const spl = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const state = { virtualTokens: 1000000000000n, virtualSol: 1000000000n,
   realTokens: 900000000000n, realSol: 900000000n, supply: 1000000000000n, complete: false };
@@ -78,6 +78,22 @@ test('mint/curve pairing, program and native quote are validated', () => {
   assert.throws(() => project(instruction('sell_v3', keys => { keys[2] = mint; })), /non_sol_quote/);
   assert.throws(() => projectTransaction(frame([instruction()]), new Map(), cfg), /unwatched_mint/);
   assert.throws(() => projectTransaction(frame([instruction('sell_v3')]), new Map([[mint, { state: { ...state, cashback: true } }]]), cfg), /v3_cashback/);
+});
+test('exact-input legacy/v3 variants enforce output minimums and partial-fill rejection', () => {
+  for (const [kind, disc] of [['buy',[56,252,116,8,158,223,205,95]],['buy_v3',[225,247,80,30,213,179,132,136]]]) {
+    const ix=instruction(kind,(_,data)=>{Buffer.from(disc).copy(data);data.writeBigUInt64LE(10000000n,8);data.writeBigUInt64LE(1n,16);});
+    assert.equal(project(ix).side,'buy');
+    ix.data.writeBigUInt64LE(999999999999n,16);assert.throws(()=>project(ix),/modeled_instruction_slippage/);
+    ix.data[ix.data.length-1]=1;assert.throws(()=>project(ix),/partial_fill/);
+  }
+});
+test('old case-typo token program and unsafe nonce/close effects are rejected',()=>{
+  assert.throws(()=>project(instruction('sell',keys=>{keys[9]='TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCxEpPxuEb';})),/token_program/);
+  const ix=instruction('sell_v3');
+  const close=new TransactionInstruction({programId:new PublicKey(token),keys:[ix.keys[6],ix.keys[8],ix.keys[8]],data:Buffer.from([9])});
+  assert.throws(()=>project([ix,close]),/other_instruction_effects/);
+  const nonce=new TransactionInstruction({programId:PublicKey.default,keys:[ix.keys[5],{pubkey:new PublicKey('SysvarRecentB1ockHashes11111111111111111111'),isSigner:false,isWritable:false},ix.keys[8]],data:Buffer.from([4,0,0,0])});
+  assert.throws(()=>project([nonce,ix]),/other_instruction_effects/);
 });
 test('multiple swaps, router/CPI and other account effects are rejected', () => {
   assert.throws(() => project([instruction(), instruction('buy')]), /cpi_or_multi_swap/);

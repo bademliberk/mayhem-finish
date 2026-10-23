@@ -42,6 +42,22 @@ export function buyBudget(state, budget, feeBps) {
   if (!low) throw new Error('budget_too_small');
   return buyTokens(state, low, feeBps);
 }
+export function buyExactInput(state, budget, feeBps, v3 = false) {
+  if (budget <= 1n || state.complete || state.virtualTokens <= 1n) throw new Error('invalid_buy');
+  let net = (v3 ? budget : budget - 1n) * BPS / (BPS + BigInt(feeBps));
+  if (v3) {
+    const excess = net + fee(net, feeBps) - budget;
+    if (excess > 0n) net -= excess;
+  }
+  const input = v3 ? net - 1n : net;
+  if (input <= 0n) throw new Error('budget_too_small');
+  const tokens = input * state.virtualTokens / (state.virtualSol + input);
+  // No partial-fill or synthetic-pool inference for Mayhem.
+  if (tokens <= 0n || tokens >= state.realTokens) throw new Error('inventory_exhaustion');
+  const quote = buyTokens(state, tokens, feeBps);
+  if (quote.cost > budget) throw new Error('budget_exceeded');
+  return quote;
+}
 export function entryQuote(state, cfg) {
   const result = buyBudget(state, BigInt(cfg.buyLamports), cfg.swapFeeBps);
   return { tokens: result.tokens.toString(), swapCost: result.cost.toString(),

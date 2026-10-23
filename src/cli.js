@@ -41,7 +41,7 @@ async function start(rpc) {
   const lastHeartbeat = Number(store.get("SELECT value FROM metadata WHERE key='heartbeat'")?.value ?? now);
   if (lastHeartbeat < now - 5) store.coverage('process_gap', lastHeartbeat, `Restart at ${now}; backfill requested`);
   const session = store.coverage('session', now, 'Collector process heartbeat; not a guarantee of complete event coverage');
-  store.activatePolicy(now);
+  if (!cfg.paperMode) store.activatePolicy(now);
   const tracker = cfg.paperMode
     ? new PaperEngine(store, rpc, paperCfg, { project: projectTransaction })
     : new CandidateTracker(store, rpc);
@@ -49,7 +49,9 @@ async function start(rpc) {
     tracker.attach(new PaperFeeds(store, rpc, {
       onAccount: (...args) => tracker.onAccount(...args), onTransaction: raw => tracker.enqueue(raw),
       onGap: reason => tracker.gap(reason), onReady: () => tracker.onReady(), onSlot: slot => tracker.onSlot(slot),
+      onCoverage: mint => tracker.coverage(mint),
     }));
+    store.onDiscovery = () => tracker.discover();
     tracker.start();
   } else tracker.recover();
   const collector = new Collector(store, rpc, cfg, mint => tracker.add(mint));
@@ -72,7 +74,7 @@ async function start(rpc) {
     while (!stopping) { await tracker.tick(); if (!stopping) await sleep(100); }
   })().catch(error => { paperError = error; stop(); }) : Promise.resolve();
   let workerError;
-  const worker = checkLoop(collector, () => stopping).catch(error => {
+  const worker = cfg.paperMode ? Promise.resolve() : checkLoop(collector, () => stopping).catch(error => {
     workerError = error;
     stop();
   });

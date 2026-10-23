@@ -41,12 +41,12 @@ const newPreprocessed = () => ({
 // Decoding, paper accounting and gap policy live in the caller.
 export class PaperFeeds {
   constructor(store, rpc, {
-    onAccount = noop, onTransaction = noop, onGap = noop, onReady = noop, onSlot = noop,
+    onAccount = noop, onTransaction = noop, onGap = noop, onReady = noop, onSlot = noop, onCoverage = noop,
     socketFactory = url => new WebSocket(url, { handshakeTimeout: 10000, maxPayload: MAX_FRAME_BYTES }),
     setTimer = setTimeout, clearTimer = clearTimeout,
   } = {}) {
     this.store = store; this.rpc = rpc;
-    this.callbacks = { onAccount, onTransaction, onGap, onReady, onSlot };
+    this.callbacks = { onAccount, onTransaction, onGap, onReady, onSlot, onCoverage };
     this.socketFactory = socketFactory; this.setTimer = setTimer; this.clearTimer = clearTimer;
     this.preprocessedUrl = preprocessedUrl(rpc.wsUrl);
     this.standard = newLink('standard');
@@ -60,17 +60,37 @@ export class PaperFeeds {
   }
 
   // ---- public API ----
-  add(mint, curveAddress) {
+  add(mint, curveAddress, preprocessed = true) {
     if (this.stopped) return;
     const existing = this.watches.get(mint);
     if (existing) {
       if (existing.curve === curveAddress) return;
       this.remove(mint);
     }
-    const watch = { mint, curve: curveAddress, request: null, subscription: null, lastSlot: -1, seq: 0 };
+    const watch = { mint, curve: curveAddress, preprocessed, covered: false, request: null, subscription: null, lastSlot: -1, seq: 0 };
     this.watches.set(mint, watch);
     if (this.standard.socket?.readyState === WebSocket.OPEN) this.subscribe(watch);
     this.scheduleSync();
+  }
+  setPreprocessed(mint, enabled) {
+    const watch = this.watches.get(mint);
+    if (!watch || watch.preprocessed === enabled) return;
+    watch.preprocessed = enabled;
+    if (!enabled) watch.covered = false;
+    this.scheduleSync(); this.checkReady();
+  }
+  covers(mint) {
+    const watch = this.watches.get(mint);
+    return Boolean(watch?.preprocessed && watch.covered && this.preprocessed.conn?.curves.includes(watch.curve));
+  }
+  notifyCoverage() {
+    for (const watch of this.watches.values()) {
+      const included = watch.preprocessed && this.preprocessed.conn?.curves.includes(watch.curve);
+      if (!included) watch.covered = false;
+      else if (!watch.covered) {
+        watch.covered = true; this.safe('onCoverage', watch.mint);
+      }
+    }
   }
   remove(mint) {
     const watch = this.watches.get(mint);
@@ -83,7 +103,7 @@ export class PaperFeeds {
       this.send(this.standard, 'accountUnsubscribe', [id]);
     }
     this.scheduleSync();
-    if (!this.watches.size) this.checkReady(); // the preprocessed stream is no longer required
+    if (!this.curves().length) this.checkReady(); // curve-only watches do not require preprocessed coverage
   }
   start() {
     if (this.started || this.stopped) return;
@@ -131,14 +151,17 @@ export class PaperFeeds {
   }
   markGap(reason) {
     this.ready = false;
-    if (this.gapPending) return;
+    for (const watch of this.watches.values()) watch.covered = false;
+    if (this.gapPending) return false;
     this.gapPending = true;
     this.safe('onGap', reason);
+    return true;
   }
   checkReady() {
     if (this.stopped || this.ready) return;
     if (!this.standard.acked) return;
-    if (this.watches.size && !this.preprocessed.conn) return; // no watchlist, no preprocessed stream to wait for
+    if (this.curves().length && !this.preprocessed.conn) return;
+    this.notifyCoverage();
     this.ready = true; this.gapPending = false;
     this.safe('onReady');
   }
@@ -276,7 +299,7 @@ export class PaperFeeds {
     if (!this.started || this.stopped || this.syncTimer) return;
     this.syncTimer = this.setTimer(() => { this.syncTimer = null; this.reconcile(); }, SYNC_DEBOUNCE_MS);
   }
-  curves() { return [...new Set([...this.watches.values()].map(watch => watch.curve))].sort(); }
+  curves() { return [...new Set([...this.watches.values()].filter(watch => watch.preprocessed).map(watch => watch.curve))].sort(); }
   // Brings the preprocessed connection in line with the current watchlist.
   reconcile() {
     if (this.stopped || !this.started) return;
@@ -285,6 +308,7 @@ export class PaperFeeds {
     const curves = this.curves(), key = curves.join(',');
     if (!curves.length) { this.closePreprocessed(); this.checkReady(); return; }
     if (pre.conn?.key === key) {
+      this.notifyCoverage();
       if (pre.next) { const stale = pre.next; pre.next = null; this.closeConn(stale); }
       return;
     }
@@ -353,6 +377,7 @@ export class PaperFeeds {
     const old = pre.conn;
     pre.conn = conn; pre.next = null;
     this.closeConn(old);
+    this.notifyCoverage();
     this.checkReady();
     if (this.curves().join(',') !== conn.key) this.scheduleSync(); // membership moved while connecting
   }
@@ -365,6 +390,7 @@ export class PaperFeeds {
   closePreprocessed() {
     const pre = this.preprocessed;
     const conns = [pre.conn, pre.next];
+    for (const watch of this.watches.values()) watch.covered = false;
     pre.conn = null; pre.next = null;
     this.clearTimer(pre.retry); pre.retry = null; pre.attempts = 0;
     this.clearTimer(this.syncTimer); this.syncTimer = null;
@@ -377,10 +403,10 @@ export class PaperFeeds {
     if (wasActive) pre.conn = null;
     else if (conn != null && pre.next === conn) pre.next = null;
     this.closeConn(conn);
-    if (!pre.conn) this.markGap(reason);
-    // The caller discards account state on any gap: refresh baselines of still-subscribed accounts so quiet
-    // accounts regain state even though the standard socket stayed up.
-    if (wasActive && this.standard.socket) {
+    const newGap = !pre.conn && this.markGap(reason);
+    // Refresh quiet accounts once per announced gap, including a failed first subscription.
+    // Repeated retry failures do not invalidate the recovered baselines again.
+    if (newGap && this.standard.socket) {
       for (const watch of this.watches.values()) {
         if (watch.subscription != null) { watch.lastSlot = -1; this.snapshot(watch); }
       }

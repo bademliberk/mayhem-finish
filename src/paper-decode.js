@@ -1,25 +1,36 @@
 import { PUMP, addresses } from './config.js';
 import { decodeFrame, unsupported } from './paper-wire.js';
-import { buyTokens, sell } from './paper-math.js';
+import { buyTokens, buyExactInput, sell } from './paper-math.js';
 
 // Official pump-public-docs/idl/pump.json. Unknown/changed layouts fail closed.
 const BUY = Buffer.from([102,6,61,18,1,218,235,234]);
 const SELL = Buffer.from([51,230,133,164,1,127,131,173]);
 const BUY_V3 = Buffer.from([7,5,29,196,245,23,101,80]);
 const SELL_V3 = Buffer.from([28,146,222,119,38,196,105,213]);
+const BUY_EXACT = Buffer.from([56,252,116,8,158,223,205,95]);
+const BUY_EXACT_V3 = Buffer.from([225,247,80,30,213,179,132,136]);
 const WSOL = 'So11111111111111111111111111111111111111112';
-const TOKEN = new Set(['TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCxEpPxuEb']);
+const TOKEN = new Set(['TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb']);
 const COMPUTE = 'ComputeBudget111111111111111111111111111111';
 const ATA = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
 const SYSTEM = '11111111111111111111111111111111';
 
-export function projectTransaction(raw, states, cfg) {
-  const frame = decodeFrame(raw);
+export function projectTransaction(raw, states, cfg, resolveLookup) {
+  const frame = decodeFrame(raw, resolveLookup);
+  try { return projectFrame(frame, states, cfg); }
+  catch (error) {
+    error.details = { slot: frame.slot, signature: frame.signature, version: frame.version,
+      instructions: frame.instructions.slice(0,8).map(ix => ({ program: ix.program, discriminator: ix.data.subarray(0,8).toString('hex'), accounts: ix.accounts.length, bytes: ix.data.length })) };
+    throw error;
+  }
+}
+function projectFrame(frame, states, cfg) {
   const pumps = frame.instructions.filter(ix => ix.program === PUMP);
   if (pumps.length !== 1) throw unsupported('cpi_or_multi_swap');
   const ix = pumps[0], disc = ix.data.subarray(0, 8);
-  const buy = disc.equals(BUY) || disc.equals(BUY_V3);
-  const v3 = disc.equals(BUY_V3) || disc.equals(SELL_V3);
+  const exact = disc.equals(BUY_EXACT) || disc.equals(BUY_EXACT_V3);
+  const buy = exact || disc.equals(BUY) || disc.equals(BUY_V3);
+  const v3 = disc.equals(BUY_EXACT_V3) || disc.equals(BUY_V3) || disc.equals(SELL_V3);
   if (!buy && !disc.equals(SELL) && !disc.equals(SELL_V3)) throw unsupported('instruction_variant');
   const expected = v3 ? 17 : buy ? 16 : 14;
   if (ix.accounts.length !== expected || ix.data.length < 24 || ix.data.length > (buy ? (v3 ? 25 : 26) : 24)) throw unsupported('instruction_layout');
@@ -41,6 +52,16 @@ export function projectTransaction(raw, states, cfg) {
     if (other === ix) continue;
     // No routers or other token operations: their CPI/account effects are not visible pre-execution.
     if (other.program === COMPUTE) continue;
+    // A leading durable nonce advance touches only nonce state, not swap reserves.
+    if (other === frame.instructions[0] && other.program === SYSTEM && other.data.length === 4 &&
+        other.data.readUInt32LE(0) === 4 && other.accounts.length === 3 &&
+        other.accounts[1] === 'SysvarRecentB1ockHashes11111111111111111111' &&
+        !ix.accounts.includes(other.accounts[0])) continue;
+    // Only a post-sell close of the user's base-token account into the user wallet.
+    if (!buy && frame.instructions.indexOf(other) > frame.instructions.indexOf(ix) && other.program === tokenProgram &&
+        other.data.length === 1 && other.data[0] === 9 && other.accounts.length === 3 &&
+        other.accounts[0] === ix.accounts[v3 ? 9 : 5] && other.accounts[1] === ix.accounts[v3 ? 8 : 6] &&
+        other.accounts[2] === ix.accounts[v3 ? 8 : 6] && other.accounts[0] !== ix.accounts[v3 ? 6 : 4]) continue;
     if (other.program === ATA && other.data.length === 1 && other.data[0] === 1 && !other.accounts.includes(curve)) continue;
     if (other.program === SYSTEM && other.data.length === 12 && other.data.readUInt32LE(0) === 2 &&
         !other.accounts.some(key => ix.accounts.includes(key) && key !== ix.accounts[v3 ? 8 : 6])) continue;
@@ -48,8 +69,9 @@ export function projectTransaction(raw, states, cfg) {
   }
   const amount = ix.data.readBigUInt64LE(8), limit = ix.data.readBigUInt64LE(16);
   let projected;
-  try { projected = buy ? buyTokens(row.state, amount, cfg.swapFeeBps) : sell(row.state, amount, cfg.swapFeeBps); }
+  try { projected = exact ? buyExactInput(row.state, amount, cfg.swapFeeBps, v3) : buy ? buyTokens(row.state, amount, cfg.swapFeeBps) : sell(row.state, amount, cfg.swapFeeBps); }
   catch { throw unsupported('reserve_or_amount_limit'); }
-  if ((buy && projected.cost > limit) || (!buy && projected.net < limit)) throw unsupported('modeled_instruction_slippage');
+  if (buy && projected.tokens >= row.state.realTokens) throw unsupported('inventory_exhaustion');
+  if ((exact && projected.tokens < limit) || (buy && !exact && projected.cost > limit) || (!buy && projected.net < limit)) throw unsupported('modeled_instruction_slippage');
   return { signature: frame.signature, slot: frame.slot, mint, state: projected.state, side: buy ? 'buy' : 'sell' };
 }

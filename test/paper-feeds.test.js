@@ -39,6 +39,7 @@ function setup({ accounts, watches = [['m1', CURVE]] } = {}) {
     onGap: reason => events.push(['gap', reason]),
     onReady: () => events.push(['ready']),
     onSlot: slot => events.push(['slot', slot]),
+    onCoverage: mint => events.push(['coverage', mint]),
     socketFactory: (url, kind) => { const s = new Socket(url, kind); sockets.push(s); return s; },
     setTimer: (fn, delay) => { const id = ++seq; timers.set(id, { fn, at: clock + delay }); return id; },
     clearTimer: id => timers.delete(id),
@@ -251,7 +252,9 @@ test('preprocessed-only disconnect gaps, reconnects, re-baselines subscribed acc
   const t = setup({ watches: [['m1', CURVE]] });
   const [a, b] = await t.bringUp();
   assert.equal(t.rpcCalls.length, 1);
+  assert.equal(t.of('coverage').length, 1);
   b.terminate();
+  assert.equal(t.feeds.covers('m1'), false);
   assert.deepEqual(t.of('gap').map(e => e[1]), ['preprocessed_disconnected']);
   assert.equal(a.readyState, 1); // standard untouched
   await settle();
@@ -261,7 +264,49 @@ test('preprocessed-only disconnect gaps, reconnects, re-baselines subscribed acc
   const b2 = t.pre()[1];
   b2.open(); b2.ack('preprocessedSubscribe', 4);
   assert.equal(t.of('ready').length, 2);
+  assert.equal(t.of('coverage').length, 2);
+  assert.equal(t.feeds.covers('m1'), true);
   assert.equal(t.std().length, 1);
+  await t.feeds.stop();
+});
+
+test('initial preprocessed failures refresh subscribed baselines only once per gap', async () => {
+  const t = setup();
+  t.feeds.start();
+  const a = t.std()[0], b = t.pre()[0];
+  a.open(); a.ack('slotSubscribe', 9); a.ack('accountSubscribe', 21);
+  await settle();
+  assert.equal(t.rpcCalls.length, 1);
+  b.terminate();
+  await settle();
+  assert.equal(t.rpcCalls.length, 2);
+  assert.equal(t.of('account').length, 2);
+  t.advance(1000); t.pre()[1].terminate();
+  await settle();
+  assert.equal(t.of('gap').length, 1);
+  assert.equal(t.rpcCalls.length, 2);
+  t.advance(2000);
+  const retry = t.pre()[2]; retry.open(); retry.ack('preprocessedSubscribe', 4);
+  assert.equal(t.feeds.isReady(), true);
+  assert.equal(t.of('coverage').length, 1);
+  assert.equal(t.feeds.watches.get('m1').subscription, 21);
+  await t.feeds.stop();
+});
+
+test('idle reactivation socket factory failure refreshes reserves without resubscribing curves', async () => {
+  const t = setup();
+  const [a] = await t.bringUp();
+  t.feeds.setPreprocessed('m1', false); t.advance(100);
+  const factory = t.feeds.socketFactory;
+  t.feeds.socketFactory = () => { throw new Error('connect failed'); };
+  t.feeds.setPreprocessed('m1', true); t.advance(100);
+  await settle();
+  assert.equal(t.of('gap').length, 1); assert.equal(t.rpcCalls.length, 2);
+  assert.equal(t.feeds.covers('m1'), false);
+  assert.equal(a.sent.filter(m => m.method === 'accountSubscribe').length, 1);
+  t.feeds.socketFactory = factory; t.advance(1000);
+  const retry = t.pre().at(-1); retry.open(); retry.ack('preprocessedSubscribe', 4);
+  assert.equal(t.feeds.isReady(), true); assert.equal(t.of('coverage').length, 2);
   await t.feeds.stop();
 });
 
@@ -376,6 +421,7 @@ test('resync reconnects both sockets at once, rebaselines, and re-readies withou
   a2.ack('slotSubscribe', 10); a2.ack('accountSubscribe', 22); b2.ack('preprocessedSubscribe', 4);
   await settle();
   assert.equal(t.of('ready').length, 2);
+  assert.equal(t.of('coverage').length, 2);
   assert.equal(t.rpcCalls.length, 2);
   t.advance(120000);
   assert.equal(t.sockets.length, 4); // no stray reconnect timers
@@ -639,6 +685,8 @@ test('a failing replacement keeps the healthy stream, raises no gap and retries 
   const b3 = t.pre()[2]; b3.open(); b3.ack('preprocessedSubscribe', 6);
   assert.equal(b1.readyState, 3);
   assert.deepEqual(preSubs(b3)[0].params.accountInclude, [CURVE, C2].sort());
+  assert.equal(t.rpcCalls.length, 1); // a failed replacement never clears or refreshes existing reserves
+  assert.deepEqual(t.of('coverage'), [['coverage', 'm1'], ['coverage', 'm2']]);
   await t.feeds.stop();
 });
 
@@ -761,6 +809,51 @@ test('stop closes active and pending preprocessed connections', async () => {
   assert.equal(b1.readyState, 3); assert.equal(b2.readyState, 3);
   assert.equal(t.timers.size, 0);
   assert.equal(t.of('gap').length, 0);
+});
+
+test('curve-only watch can activate and idle preprocessed without losing account subscription', async () => {
+  const t = setup({ watches: [] });
+  const covered = []; t.feeds.callbacks.onCoverage = mint => covered.push(mint);
+  t.feeds.add('m1', CURVE, false);t.feeds.start();
+  const a=t.std()[0];a.open();a.ack('slotSubscribe',9);a.ack('accountSubscribe',21);await settle();
+  assert.equal(t.pre().length,0);assert.equal(t.feeds.isReady(),true);
+  t.feeds.setPreprocessed('m1',true);t.advance(100);
+  const b=t.pre()[0];b.open();assert.equal(t.feeds.covers('m1'),false);
+  b.ack('preprocessedSubscribe',3);assert.equal(t.feeds.covers('m1'),true);
+  assert.deepEqual(covered,['m1']);
+  t.feeds.setPreprocessed('m1',false);assert.equal(t.feeds.covers('m1'),false);t.advance(100);
+  assert.equal(b.readyState,3);assert.equal(a.readyState,1);
+  assert.equal(a.find('accountUnsubscribe'),undefined);
+  a.text({method:'accountNotification',params:{subscription:21,result:{context:{slot:60},value:{lamports:2}}}});
+  assert.equal(t.of('account').at(-1)[2],60);
+  t.feeds.setPreprocessed('m1',true);t.advance(100);
+  const b2=t.pre()[1];b2.open();b2.ack('preprocessedSubscribe',4);
+  assert.deepEqual(covered,['m1','m1']);await t.feeds.stop();
+});
+
+test('handover dropping a reactivated mint resets only its interrupted coverage', async () => {
+  const t = setup({ watches: [['m1', CURVE], ['m2', C2]] });
+  const [a] = await t.bringUp();
+  t.feeds.setPreprocessed('m1', false); t.advance(100);
+  const removal = t.pre()[1]; removal.open();
+  a.terminate(); t.advance(1000);
+  const a2 = t.std()[1]; a2.open();
+  t.feeds.setPreprocessed('m1', true);
+  a2.ack('slotSubscribe', 10); // recovery acknowledges coverage on the old filter
+  assert.equal(t.feeds.covers('m1'), true);
+  assert.deepEqual(t.of('coverage'), [
+    ['coverage', 'm1'], ['coverage', 'm2'], ['coverage', 'm1'], ['coverage', 'm2'],
+  ]);
+  removal.ack('preprocessedSubscribe', 4); // the in-flight filter still excludes m1
+  assert.equal(t.feeds.covers('m1'), false);
+  assert.equal(t.feeds.watches.get('m1').covered, false);
+  assert.equal(t.feeds.covers('m2'), true);
+  t.advance(100);
+  const restored = t.pre()[2]; restored.open(); restored.ack('preprocessedSubscribe', 5);
+  assert.equal(t.feeds.covers('m1'), true);
+  assert.deepEqual(t.of('coverage').slice(4), [['coverage', 'm1']]);
+  assert.equal(t.of('gap').length, 1); // no global gap for the continuously covered mint
+  await t.feeds.stop();
 });
 
 test('preprocessedSubscribe params is an object, not an array', async () => {

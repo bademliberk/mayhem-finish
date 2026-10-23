@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { Store } from '../src/store.js';
 import { PaperStore, paperConfig } from '../src/paper-store.js';
 import { PaperEngine } from '../src/paper-engine.js';
+import { PaperFeeds } from '../src/paper-feeds.js';
 import { buyBudget, buyTokens, sell, entryQuote, exitQuote, profitable, meetsDrop, reserves } from '../src/paper-math.js';
 import { PUMP } from '../src/config.js';
 import { PublicKey } from '@solana/web3.js';
@@ -31,7 +32,8 @@ function setup(options={}) {
     accounts:async()=>({context:{slot:15},value:[account()]})};
   const engine=new PaperEngine(store,rpc,{...pc,...options},{now:()=>now,project:raw=>raw});
   const removed=[],added=[];
-  engine.attach({add:(...args)=>added.push(args),remove:key=>removed.push(key),start:()=>{},stop:async()=>{},resync:()=>{}});
+  engine.attach({add:(...args)=>added.push(args),remove:key=>removed.push(key),start:()=>{},stop:async()=>{},resync:()=>{},
+    setPreprocessed:()=>{},covers:()=>true});
   engine.add(mint);engine.onReady();engine.onSlot(15);
   engine.onAccount(mint,11,account(1));engine.onAccount(mint,14,account(1));
   return {store,rpc,engine,removed,added,setNow:n=>{now=n;},close:()=>store.close(),
@@ -78,6 +80,96 @@ test('five-slot window excludes old peak and exact MC bounds are not eligible',(
   // Remove the newer high; a peak at slot 11 is outside [12,16].
   s.engine.states.get(mint).history=s.engine.states.get(mint).history.filter(h=>h.slot!==14);
   s.engine.signal(s.signal('sig',16,0.2));assert.equal(s.engine.paper.pending().length,0);s.close();
+});
+test('recovered coverage restarts entry warm-up regardless of baseline ordering',()=>{
+  for(const baselineFirst of [true,false]) {
+    const s=setup();s.engine.gap('preprocessed_disconnected');
+    s.engine.onSlot(20);
+    if(baselineFirst) s.engine.onAccount(mint,16,account(1));
+    s.engine.coverage(mint);
+    if(!baselineFirst) s.engine.onAccount(mint,16,account(1));
+    s.engine.onReady();
+    assert.equal(s.engine.states.get(mint).since,20);
+    s.engine.signal(s.signal('too-early',20));
+    assert.equal(s.engine.paper.pending().length,0);
+    s.engine.onAccount(mint,23,account(1));s.engine.onSlot(24);
+    s.engine.signal(s.signal('warmed-up',24));
+    assert.equal(s.engine.paper.pending().length,1);s.close();
+  }
+});
+test('restored filter coverage blocks entry until its new five-slot window completes',async()=>{
+  const s=setup();s.rpc.wsUrl='wss://example.test/?api-key=test';
+  const feeds=new PaperFeeds(s.store,s.rpc,{
+    onCoverage:key=>s.engine.coverage(key),setTimer:()=>1,clearTimer:()=>{},
+  });
+  s.engine.attach(feeds);
+  const curve=s.engine.paper.watch(mint).curve_address;
+  feeds.add(mint,curve,true);
+  const conn=(curves,request)=>({curves,key:curves.join(','),request,acked:false,socket:{terminate(){}}});
+  feeds.preprocessed.conn=conn([curve,'other-curve'],1);
+  s.engine.onSlot(20);feeds.notifyCoverage();
+  const removal=conn(['other-curve'],2);feeds.preprocessed.next=removal;
+  s.engine.onSlot(22);
+  feeds.preprocessedMessage(removal,Buffer.from(JSON.stringify({id:2,result:2})),false);
+  s.engine.onAccount(mint,23,account(1));s.engine.onSlot(24);
+  const restored=conn([curve,'other-curve'],3);feeds.preprocessed.next=restored;
+  feeds.preprocessedMessage(restored,Buffer.from(JSON.stringify({id:3,result:3})),false);
+  assert.equal(s.engine.states.get(mint).since,24);
+  s.engine.signal(s.signal('restored-too-early',24));assert.equal(s.engine.paper.pending().length,0);
+  s.engine.onAccount(mint,26,account(1));s.engine.onSlot(27);
+  s.engine.signal(s.signal('still-warming',27));assert.equal(s.engine.paper.pending().length,0);
+  s.engine.onSlot(28);s.engine.signal(s.signal('warmed-up',28));
+  assert.equal(s.engine.paper.pending().length,1);
+  await feeds.stop();s.close();
+});
+test('coverage acknowledged before the first slot waits for a fresh five-slot window',()=>{
+  for(const baselineTiming of ['before-ack','after-ack','after-slot']) {
+    const s=setup();s.engine.gap('preprocessed_disconnected');
+    if(baselineTiming==='before-ack') s.engine.onAccount(mint,16,account(1));
+    s.engine.coverage(mint);s.engine.onReady();
+    if(baselineTiming==='after-ack') s.engine.onAccount(mint,16,account(1));
+    assert.equal(s.engine.coverageSlots.get(mint),Infinity);
+    if(baselineTiming!=='after-slot') assert.equal(s.engine.states.get(mint).since,Infinity);
+    s.engine.signal(s.signal('before-slot',20));
+    assert.equal(s.engine.paper.pending().length,0);
+    s.engine.onSlot(20);
+    if(baselineTiming==='after-slot') s.engine.onAccount(mint,16,account(1));
+    assert.equal(s.engine.coverageSlots.get(mint),20);
+    assert.equal(s.engine.states.get(mint).since,20);
+    s.engine.signal(s.signal('first-slot',20));
+    assert.equal(s.engine.paper.pending().length,0);
+    s.engine.onAccount(mint,22,account(1));s.engine.onSlot(23);
+    s.engine.signal(s.signal('still-warming',23));
+    assert.equal(s.engine.paper.pending().length,0);
+    s.engine.onSlot(24);s.engine.signal(s.signal('warmed-up',24));
+    assert.equal(s.engine.paper.pending().length,1);s.close();
+  }
+});
+test('failed first preprocessed connection restores quiet engine reserves before recovery',async()=>{
+  const s=setup();let refreshes=0;
+  s.rpc.wsUrl='wss://example.test/?api-key=test';
+  s.rpc.accounts=async()=>{refreshes++;return {context:{slot:16},value:[account(1)]};};
+  const feeds=new PaperFeeds(s.store,s.rpc,{
+    onGap:reason=>s.engine.gap(reason),onAccount:(...args)=>s.engine.onAccount(...args),
+    onCoverage:key=>s.engine.coverage(key),onReady:()=>s.engine.onReady(),
+    setTimer:()=>1,clearTimer:()=>{},
+  });
+  s.engine.attach(feeds);
+  feeds.add(mint,s.engine.paper.watch(mint).curve_address,true);
+  feeds.standard.socket={terminate(){}};feeds.standard.acked=true;
+  feeds.watches.get(mint).subscription=21;
+  const conn={socket:{terminate(){}},curves:feeds.curves()};feeds.preprocessed.next=conn;
+  feeds.connFailed(conn,'preprocessed_disconnected');
+  assert.equal(s.engine.states.size,0);
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(refreshes,1);assert.equal(s.engine.states.size,1);
+  feeds.connFailed(null,'preprocessed_connect_failed');
+  assert.equal(refreshes,1);
+  s.engine.onSlot(20);
+  feeds.preprocessed.conn={...conn};feeds.notifyCoverage();feeds.checkReady();
+  assert.equal(s.engine.ready,true);assert.equal(s.engine.states.get(mint).since,20);
+  s.engine.signal(s.signal('too-early',20));assert.equal(s.engine.paper.pending().length,0);
+  await feeds.stop();s.close();
 });
 test('failed, unknown, expired and changed-slot triggers never fill',async()=>{
   for(const status of [null,{slot:15,err:{error:1},confirmationStatus:'confirmed'},
@@ -178,6 +270,73 @@ test('invalid account resynchronization clears all history and cancels pending o
 test('terminal watch removes cached reserve history',()=>{
   const s=setup();s.engine.onAccount(mint,15,account(0.1));
   assert.equal(s.engine.states.has(mint),false);s.close();
+});
+test('creation enrollment does not require candidate screening and survives restart handoff',()=>{
+  const store=new Store(':memory:',cfg);
+  const engine=new PaperEngine(store,{},pc);
+  const added=[];
+  engine.attach({add:(...args)=>added.push(args),start:()=>{}});
+  store.apply('creation',1,[{type:'create',mint,timestamp:100}]);
+  assert.equal(store.get('SELECT COUNT(*) n FROM candidates').n,0);
+  engine.start();
+  assert.equal(engine.paper.watch(mint).status,'watching');
+  assert.equal(added.length,1);assert.equal(added[0][2],false);
+  store.onDiscovery=()=>engine.discover();
+  store.apply('creation',1,[{type:'create',mint,timestamp:100}]);
+  assert.equal(added.length,1);
+  const second=new PublicKey(Buffer.alloc(32,4)).toBase58();
+  store.apply('creation2',2,[{type:'create',mint:second,timestamp:101}]);
+  assert.equal(added.length,2);assert.equal(engine.paper.watch(second).status,'watching');
+  store.close();
+  const monitor=new Store(':memory:',{...cfg,paperMode:false});
+  monitor.apply('creation',1,[{type:'create',mint,timestamp:100}]);
+  assert.equal(monitor.get('SELECT COUNT(*) n FROM paper_discoveries').n,0);monitor.close();
+});
+test('strict 2 SOL activation, 60 second idle boundary, unchanged notifications and resume',async()=>{
+  const s=setup();
+  s.engine.membership(mint,false);
+  s.engine.onAccount(mint,15,account(2));assert.equal(s.engine.paper.watch(mint).preprocessed,0);
+  s.engine.onAccount(mint,16,account(1.99));assert.equal(s.engine.paper.watch(mint).preprocessed,1);
+  s.setNow(159999);await s.engine.tick();assert.equal(s.engine.paper.watch(mint).preprocessed,1);
+  s.engine.onAccount(mint,17,account(1.99)); // identical bytes do not reset idle
+  s.setNow(160000);await s.engine.tick();assert.equal(s.engine.paper.watch(mint).preprocessed,0);
+  assert.equal(s.removed.length,0);assert.ok(s.engine.states.has(mint));
+  s.engine.gap('test');s.engine.onReady();s.engine.onAccount(mint,18,account(1.99));
+  assert.equal(s.engine.paper.watch(mint).preprocessed,0); // unchanged reconnect baseline
+  s.engine.onAccount(mint,19,account(1.98));assert.equal(s.engine.paper.watch(mint).preprocessed,1);
+  s.engine.coverage(mint);assert.equal(s.engine.states.get(mint).since,Infinity);
+  s.engine.onSlot(19);assert.equal(s.engine.states.get(mint).since,19);
+  s.close();
+});
+test('idle cancels pending entry; unacknowledged membership cannot signal',async()=>{
+  const s=setup();s.engine.signal(s.signal());assert.equal(s.engine.paper.pending().length,1);
+  s.setNow(160000);await s.engine.tick();
+  assert.equal(s.store.get('SELECT error FROM paper_orders').error,'preprocessed_idle');
+  s.close();
+  const a=setup();a.engine.feeds.covers=()=>false;a.engine.signal(a.signal());
+  assert.equal(a.engine.paper.pending().length,0);a.close();
+});
+test('held positions keep preprocessed coverage through inactivity and restart',async()=>{
+  const s=setup();s.engine.signal(s.signal());await s.engine.tick();
+  s.setNow(200000);await s.engine.tick();assert.equal(s.engine.paper.watch(mint).preprocessed,1);
+  s.engine.start();assert.equal(s.added.at(-1)[2],true);s.close();
+});
+test('legacy candidate-parent migration preserves populated paper records and child references',()=>{
+  const s=setup();s.engine.signal(s.signal());
+  const order=s.engine.paper.pending()[0];s.engine.paper.fill(order,{tokens:'100',cost:'1000'},100001);
+  const orders=s.store.all('SELECT * FROM paper_orders'),positions=s.store.all('SELECT * FROM paper_positions');
+  s.store.db.exec(`PRAGMA foreign_keys=OFF;
+    CREATE TABLE old_watches (mint TEXT PRIMARY KEY REFERENCES candidates(mint),curve_address TEXT NOT NULL,
+      enrolled_at_ms INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'watching',reason TEXT,last_slot INTEGER,last_cap REAL);
+    INSERT INTO old_watches SELECT mint,curve_address,enrolled_at_ms,status,reason,last_slot,last_cap FROM paper_watches;
+    DROP TABLE paper_watches; ALTER TABLE old_watches RENAME TO paper_watches; PRAGMA foreign_keys=ON;`);
+  const paper=new PaperStore(s.store,pc);
+  assert.deepEqual(s.store.all('SELECT * FROM paper_orders'),orders);
+  assert.deepEqual(s.store.all('SELECT * FROM paper_positions'),positions);
+  assert.deepEqual(s.store.all('PRAGMA foreign_key_check'),[]);
+  assert.equal(s.store.get('PRAGMA integrity_check').integrity_check,'ok');
+  const second=new PublicKey(Buffer.alloc(32,5)).toBase58();s.store.addMint({mint:second,timestamp:100});
+  assert.equal(paper.enroll(second,100002),true);s.close();
 });
 test('stop while reconciliation awaits RPC ignores response and makes no paper fill',async()=>{
   const s=setup();let resolve;s.rpc.call=()=>new Promise(r=>{resolve=r;});s.engine.signal(s.signal());

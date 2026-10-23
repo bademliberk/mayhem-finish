@@ -1,3 +1,4 @@
+import { LookupCache } from './paper-lookups.js';
 import { PaperStore } from './paper-store.js';
 import { reserves, cap, entryQuote, exitQuote, profitable, meetsDrop, higher } from './paper-math.js';
 
@@ -5,26 +6,61 @@ export class PaperEngine {
   constructor(store, rpc, cfg, { now = Date.now, project } = {}) {
     this.store = store; this.rpc = rpc; this.cfg = cfg; this.now = now; this.project = project;
     this.paper = new PaperStore(store, cfg); this.states = new Map(); this.ready = false;
+    this.coverageSlots = new Map();
+    this.lookups = new LookupCache(rpc, name => this.paper.count(name), now);
     this.slot = 0; this.slotAt = 0; this.epoch = 0; this.queue = []; this.working = false; this.stopped = false;
   }
   attach(feeds) { this.feeds = feeds; }
-  unwatch(mint) { this.states.delete(mint); this.feeds.remove(mint); }
+  unwatch(mint) {
+    this.states.delete(mint); this.coverageSlots.delete(mint); this.feeds.remove(mint);
+    this.store.run('UPDATE paper_watches SET preprocessed=0 WHERE mint=?', mint);
+  }
+  discover() {
+    if (this.stopped) return;
+    for (const row of this.store.all('SELECT mint FROM paper_discoveries WHERE handled=0')) {
+      this.add(row.mint);
+      this.store.run('UPDATE paper_discoveries SET handled=1 WHERE mint=?', row.mint);
+    }
+  }
+  coverage(mint) {
+    // An acknowledgment without a current slot must wait for the first slot notification.
+    const since = this.slot || Infinity;
+    this.coverageSlots.set(mint, since);
+    const row = this.states.get(mint);
+    if (row) { row.since = Math.max(row.slot, since); row.history = [{ state: row.state, slot: row.slot }]; }
+  }
+  membership(mint, enabled) {
+    const watch = this.paper.watch(mint);
+    if (Boolean(watch.preprocessed) === enabled) return;
+    this.store.run('UPDATE paper_watches SET preprocessed=? WHERE mint=?', Number(enabled), mint);
+    this.feeds.setPreprocessed(mint, enabled);
+    this.paper.count(enabled ? 'preprocessed_activated' : 'preprocessed_idle');
+    if (!enabled) {
+      for (const order of this.paper.pending().filter(order => order.mint === mint && order.side === 'buy')) {
+        this.paper.cancel(order.id, this.now(), 'preprocessed_idle');
+      }
+    }
+  }
   start() {
     // Unknown pending fills are canceled on restart, not assumed to have happened.
     for (const order of this.paper.pending()) this.paper.cancel(order.id, this.now(), 'restart_unreconciled');
     for (const row of this.paper.active()) {
-      if (row.reason !== 'graduated_no_amm_exit') this.feeds.add(row.mint, row.curve_address);
+      const held = Boolean(this.paper.position(row.mint));
+      const enabled = row.reason !== 'graduated_no_amm_exit' &&
+        (held || Boolean(row.preprocessed && this.now() - row.last_change_ms < this.cfg.idleMs));
+      this.store.run('UPDATE paper_watches SET preprocessed=? WHERE mint=?', Number(enabled), row.mint);
+      if (row.reason !== 'graduated_no_amm_exit') this.feeds.add(row.mint, row.curve_address, enabled);
     }
-    for (const row of this.store.all(`SELECT mint FROM candidate_observations WHERE status='paper_watch'
-      AND mint NOT IN (SELECT mint FROM paper_watches)`)) this.add(row.mint);
+    this.discover();
     this.feeds.start();
   }
   add(mint) {
     if (this.stopped) return;
-    if (this.paper.enroll(mint, this.now())) this.feeds.add(mint, this.paper.watch(mint).curve_address);
+    if (this.paper.enroll(mint, this.now())) this.feeds.add(mint, this.paper.watch(mint).curve_address, false);
   }
   gap(reason) {
     this.ready = false; this.epoch++; this.slot = 0; this.slotAt = 0; this.states.clear(); this.queue = [];
+    this.coverageSlots.clear(); this.lookups.clear();
     this.paper.count(`gap:${reason}`);
     for (const order of this.paper.pending()) this.paper.cancel(order.id, this.now(), 'feed_gap');
   }
@@ -36,6 +72,11 @@ export class PaperEngine {
     }
     if (slot < this.slot) return;
     this.slot = slot; this.slotAt = this.now();
+    if (slot) {
+      for (const [mint, since] of this.coverageSlots) {
+        if (since === Infinity) this.coverage(mint);
+      }
+    }
   }
   onAccount(mint, slot, account) {
     if (this.stopped || !Number.isSafeInteger(slot) || slot < 0) return;
@@ -46,13 +87,18 @@ export class PaperEngine {
       if (old && slot < old.slot) {
         this.paper.count('out_of_order_account'); return;
       }
-      const row = { state, slot, at: this.now(), since: old?.since ?? slot, history: old?.history ?? [] };
+      const row = { state, slot, at: this.now(), since: old?.since ?? Math.max(slot, this.coverageSlots.get(mint) ?? slot), history: old?.history ?? [] };
       row.history = row.history.filter(item => item.slot >= slot - this.cfg.windowSlots + 1);
       if (!state.complete) row.history.push({ state, slot });
       // Several writes in one slot have no transaction index; retain their observed peak only.
       if (row.history.length > 1000) { this.paper.count('history_overflow'); row.history = []; row.since = slot; }
       this.states.set(mint, row);
       this.store.run('UPDATE paper_watches SET last_slot=?,last_cap=? WHERE mint=?', slot, state.complete ? null : cap(state), mint);
+      const fingerprint = account.data[0];
+      const changed = fingerprint !== watch.fingerprint;
+      if (changed) this.store.run('UPDATE paper_watches SET fingerprint=?,last_change_ms=? WHERE mint=?', fingerprint, this.now(), mint);
+      if (!state.complete && cap(state) > this.cfg.floorCap &&
+          (this.paper.position(mint) || (changed && cap(state) < this.cfg.activationCap))) this.membership(mint, true);
       if (state.complete) {
         for (const order of this.paper.pending().filter(o => o.mint === mint)) this.paper.cancel(order.id, this.now(), 'graduated');
         this.store.run('UPDATE paper_watches SET status=?,reason=? WHERE mint=?', this.paper.position(mint) ? 'exit_blocked' : 'stopped', 'graduated_no_amm_exit', mint);
@@ -100,6 +146,11 @@ export class PaperEngine {
     if (this.working || this.stopped) return;
     this.working = true;
     try {
+      this.discover();
+      for (const watch of this.paper.active()) {
+        if (watch.preprocessed && !this.paper.position(watch.mint) &&
+            this.now() - (watch.last_change_ms ?? watch.enrolled_at_ms) >= this.cfg.idleMs) this.membership(watch.mint, false);
+      }
       for (let i = 0; i < 100 && this.queue.length && !this.stopped; i++) this.signal(this.queue.shift());
       for (const watch of this.paper.active()) {
         if (watch.status === 'watching' && this.paper.capacity().successfulBuys >= this.cfg.maxTrades &&
@@ -119,13 +170,16 @@ export class PaperEngine {
   }
   signal(raw) {
     let prediction;
-    try { prediction = this.project(raw, this.states, this.cfg); }
-    catch (error) { this.paper.count(`decode:${error.code ?? 'unsupported'}`); return; }
+    this.paper.count('frames_processed');
+    try { prediction = this.project(raw, this.states, this.cfg, (...args) => this.lookups.resolve(...args)); }
+    catch (error) { this.paper.rejection(error.code ?? 'unsupported', error.details, this.now()); return; }
+    this.paper.count('projections_decoded');
     const { signature, slot, mint, state: projected } = prediction;
     if (!this.paper.seen(signature, slot, this.now())) { this.paper.count('duplicate_signal'); return; }
     const reject = reason => this.paper.signal(signature, mint, reason);
     const row = this.states.get(mint), watch = this.paper.watch(mint);
     if (!row || !watch || !this.ready) return reject('not_ready');
+    if (!watch.preprocessed || !this.feeds.covers(mint)) return reject('preprocessed_not_active');
     if (slot < this.slot - 1 || slot > this.slot + 2 || this.now() - this.slotAt > this.cfg.maxStateAgeMs ||
         this.now() - row.at > this.cfg.maxStateAgeMs || row.slot >= slot) return reject('stale_or_already_executed');
     const position = this.paper.position(mint);
@@ -193,7 +247,7 @@ export class PaperEngine {
       const predicted = JSON.parse(order.quote_json);
       let quote;
       if (order.side === 'buy') {
-        if (!this.ready || !this.cfg.entriesEnabled || watch.status !== 'watching') { this.paper.cancel(order.id, this.now(), 'entries_paused'); return; }
+        if (!this.ready || !this.cfg.entriesEnabled || watch.status !== 'watching' || !watch.preprocessed || !this.feeds.covers(order.mint)) { this.paper.cancel(order.id, this.now(), 'entries_paused'); return; }
         const reference = { virtualSol: BigInt(predicted.reference.virtualSol), virtualTokens: BigInt(predicted.reference.virtualTokens) };
         if (!(mc > this.cfg.floorCap && mc < this.cfg.ceilingCap) || !meetsDrop(state, reference, this.cfg)) {
           this.paper.cancel(order.id, this.now(), 'entry_condition_changed'); return;
@@ -222,6 +276,6 @@ export class PaperEngine {
   }
   async stop() {
     this.stopped = true; this.queue = [];
-    await this.feeds.stop();
+    await Promise.all([this.feeds.stop(), this.lookups.stop()]);
   }
 }

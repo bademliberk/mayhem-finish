@@ -83,6 +83,9 @@ export class Store {
         PRIMARY KEY(day,source,method)
       );
       CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS paper_discoveries (
+        mint TEXT PRIMARY KEY REFERENCES mints(mint), handled INTEGER NOT NULL DEFAULT 0
+      );
     `);
     this.atomic(() => {
       this.run(`INSERT OR IGNORE INTO quarantined_transactions
@@ -146,9 +149,12 @@ export class Store {
   }
   addMint(event) {
     const { state, curve } = addresses(event.mint);
-    this.run(`INSERT OR IGNORE INTO mints(mint,state_address,curve_address,created_at,last_check_at,next_check,deadline,name,symbol)
+    const inserted = this.run(`INSERT OR IGNORE INTO mints(mint,state_address,curve_address,created_at,last_check_at,next_check,deadline,name,symbol)
       VALUES(?,?,?,?,?,?,?,?,?)`, event.mint, state, curve, event.timestamp, event.timestamp,
     event.timestamp + this.cfg.firstCheck, event.timestamp + this.cfg.horizon, event.name ?? '', event.symbol ?? '');
+    if (this.cfg.paperMode && inserted.changes) {
+      this.run('INSERT OR IGNORE INTO paper_discoveries(mint) VALUES(?)', event.mint);
+    }
     this.run('INSERT OR IGNORE INTO mayhem_activity(mint,created_at,first_trade_at) VALUES(?,?,?)', event.mint, event.timestamp, event.timestamp);
     this.refreshActivity(event.mint);
   }
@@ -180,6 +186,7 @@ export class Store {
       this.run('DELETE FROM queue WHERE signature=?', signature);
       this.run('DELETE FROM quarantined_transactions WHERE signature=?', signature);
     });
+    this.onDiscovery?.();
   }
   quarantine(signature, slot, now, reason) {
     this.atomic(() => {
