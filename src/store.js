@@ -63,6 +63,14 @@ export class Store {
         signature TEXT PRIMARY KEY, slot INTEGER NOT NULL, queued_at INTEGER NOT NULL,
         attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0, last_error TEXT
       );
+      CREATE TABLE IF NOT EXISTS quarantined_transactions (
+        signature TEXT PRIMARY KEY, slot INTEGER NOT NULL, queued_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL, reason TEXT NOT NULL, quarantined_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS graduations (
+        mint TEXT PRIMARY KEY REFERENCES mints(mint), detected_at INTEGER NOT NULL,
+        slot INTEGER NOT NULL, state_base64 TEXT, curve_base64 TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS processed (signature TEXT PRIMARY KEY, slot INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS cursors (address TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS coverage (
@@ -75,6 +83,12 @@ export class Store {
       );
       CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     `);
+    this.atomic(() => {
+      this.run(`INSERT OR IGNORE INTO quarantined_transactions
+        SELECT signature,slot,queued_at,attempts,last_error,unixepoch() FROM queue
+        WHERE last_error='Transaction logs truncated; history remains incomplete'`);
+      this.run('DELETE FROM queue WHERE signature IN (SELECT signature FROM quarantined_transactions)');
+    });
     if (!this.all('PRAGMA table_info(evaluations)').some(column => column.name === 'history_scope')) {
       this.db.exec("ALTER TABLE evaluations ADD COLUMN history_scope TEXT NOT NULL DEFAULT 'legacy'");
     }
@@ -151,10 +165,27 @@ export class Store {
         this.run('INSERT INTO processed VALUES(?,?)', signature, slot);
       }
       this.run('DELETE FROM queue WHERE signature=?', signature);
+      this.run('DELETE FROM quarantined_transactions WHERE signature=?', signature);
+    });
+  }
+  quarantine(signature, slot, now, reason) {
+    this.atomic(() => {
+      const queued = this.get('SELECT * FROM queue WHERE signature=?', signature);
+      this.run('INSERT OR IGNORE INTO quarantined_transactions VALUES(?,?,?,?,?,?)',
+        signature, slot, queued?.queued_at ?? now, (queued?.attempts ?? 0) + 1, reason, now);
+      this.run('DELETE FROM queue WHERE signature=?', signature);
+    });
+  }
+  graduate(mint, now, slot, state, curve) {
+    this.atomic(() => {
+      this.run('INSERT OR IGNORE INTO graduations VALUES(?,?,?,?,?)', mint, now, slot, state, curve);
+      this.run('UPDATE mints SET last_check_at=?,initial_state_base64=COALESCE(initial_state_base64,?) WHERE mint=?', now, state, mint);
+      this.finish(mint, now, 'graduated');
     });
   }
   enqueue(signature, slot, now) {
-    if (!this.get('SELECT 1 FROM processed WHERE signature=?', signature)) {
+    if (!this.get('SELECT 1 FROM processed WHERE signature=?', signature) &&
+        !this.get('SELECT 1 FROM quarantined_transactions WHERE signature=?', signature)) {
       this.run('INSERT OR IGNORE INTO queue(signature,slot,queued_at) VALUES(?,?,?)', signature, slot, now);
     }
   }

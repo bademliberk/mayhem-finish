@@ -7,6 +7,7 @@ import { Stream } from './stream.js';
 import { decodeCurve, transactionEvents, classify } from './chain.js';
 import { report } from './report.js';
 import { checkLoop } from './worker.js';
+import { Recovery } from './recovery.js';
 
 const cfg = config();
 const command = process.argv[2] ?? 'start';
@@ -44,22 +45,15 @@ async function start(rpc) {
   const session = store.coverage('session', now, 'Collector process heartbeat; not a guarantee of complete event coverage');
   const collector = new Collector(store, rpc, cfg);
   let stopping = false;
-  let backfillNeeded = true;
-  let backfillCutoff = Math.max(0, lastHeartbeat - 10);
   let lastConnected = lastHeartbeat;
-  const stream = new Stream(store, rpc, () => {
-    backfillNeeded = true;
-    backfillCutoff = Math.min(backfillCutoff, lastConnected - 10);
-  });
-  let recovery = store.coverage('backfill', now, 'Startup/reconnection reconciliation');
-  // Persist unfinished recovery across restarts; never jump its lower bound forward.
-  const pending = store.get("SELECT value FROM metadata WHERE key='backfill_cutoff'");
-  if (pending) backfillCutoff = Math.min(backfillCutoff, Number(pending.value));
-  for (const program of [MINT_AUTHORITY]) store.setCursor(program, {});
+  const recovery = new Recovery({ store, collector, programs: [MINT_AUTHORITY], retrySeconds: cfg.backfillSeconds });
+  // onReady fires on first connect and every reconnect; recovery derives the cutoff from the
+  // actual disconnect (websocket_gap start) / last connected time, never from a prior recovery.
+  const stream = new Stream(store, rpc, () => recovery.reconnected(lastConnected));
+  recovery.begin({ lastHeartbeat, now });
   const stop = () => { stopping = true; stream.stop(); };
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
   stream.start();
-  let nextBackfill = 0;
   console.log(JSON.stringify({ event: 'started', database: cfg.db, firstCheckSeconds: cfg.firstCheck,
     recheckSeconds: cfg.recheck, horizonSeconds: cfg.horizon, note: 'Read-only collector; no trading' }));
   let workerError;
@@ -74,27 +68,8 @@ async function start(rpc) {
       store.run('UPDATE coverage SET ended_at=? WHERE id=?', tick, session);
       stream.flushUsage();
       if (stream.subscriptions.size === 1 && stream.socket?.readyState === 1) lastConnected = tick;
-      if (backfillNeeded && tick >= nextBackfill) {
-        store.run("INSERT INTO metadata VALUES('backfill_cutoff',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", String(backfillCutoff));
-        try {
-          const results = [];
-          for (const program of [MINT_AUTHORITY]) results.push(await collector.scan(program, backfillCutoff));
-          if (results.every(Boolean)) {
-            backfillNeeded = false;
-            store.run('UPDATE coverage SET ended_at=? WHERE id=?', nowSeconds(), recovery);
-            store.run("DELETE FROM metadata WHERE key='backfill_cutoff'");
-            store.run("UPDATE coverage SET ended_at=? WHERE kind='process_gap' AND ended_at IS NULL", nowSeconds());
-            backfillCutoff = nowSeconds();
-            // The next reconnect needs only the disconnected interval, not all live traffic.
-            for (const program of [MINT_AUTHORITY]) store.setCursor(program, {});
-          }
-        } catch (error) { console.error(`Backfill deferred: ${error.message}`); }
-        nextBackfill = tick + cfg.backfillSeconds;
-      }
-      if (!backfillNeeded && stream.gap !== null) {
-        backfillNeeded = true; backfillCutoff = lastConnected - 10;
-        recovery = store.coverage('backfill', tick, 'Reconnection reconciliation');
-      }
+      else recovery.disconnected(lastConnected, tick);
+      await recovery.run(tick);
       await collector.drain();
       if (!stopping) await sleep(1000);
     }

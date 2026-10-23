@@ -56,6 +56,8 @@ Default: **one database**, `data/collector.sqlite`, WAL mode. All categories bel
 | `no_trades` | Terminal no-successful-trade observation and evaluation reference |
 | `unqualified` | Terminal financial-filter failure, evaluation reference and JSON reason list |
 | `long_inactive` | Unique mint's first/latest stale observation and last recovery time |
+| `graduations` | Detection timestamp/slot and raw curve/state snapshots; no invented market cap for zeroed reserves |
+| `quarantined_transactions` | Unresolved truncated RPC transactions, original queue time, failed attempts and reason; excluded from routine retries |
 | `queue`, `processed`, `cursors` | Durable event ingestion, replay deduplication and pagination checkpoints |
 | `coverage` | Process sessions, disconnects and backfill records |
 | `usage` | RPC attempts by method/day and received WebSocket payload bytes |
@@ -67,6 +69,12 @@ The long-inactive table is a per-mint summary, not a complete pause-episode ledg
 Durations use **creation as the assumed activation/first-trade time**: `first_trade_at = created_at`; `observed_first_trade_at` preserves the earliest successful bot trade actually collected, **not necessarily the bot's true first trade**. `trade_count` is the number of stored observed events, not total lifetime trades. `trading_span_seconds` and `last_trade_age_from_creation_seconds` both equal `last_trade_at - created_at`. This is a sampled, assumed-baseline activity span, not cumulative uptime. The baseline does not increment trade count or invent a last trade. With no trade ever collected, duration stays null; an older stored trade can leave a historical duration even when the current window yields `no_trades`. Evaluation decisions use only the current window, not that aggregate. Legacy `history_complete` flags are retained but are not set by bounded checks or treated as coverage failures. Reports group evaluations by `history_scope`; pre-upgrade evaluations are labeled `legacy`. The 24-hour horizon is a research cutoff, not a verified bot shutdown flag.
 
 ## Recovery and coverage
+
+RPC transactions with truncated logs are **quarantined**, not repeatedly downloaded. Existing queued truncation failures migrate automatically while retaining their original queue time and attempt counts. Missing transactions and network failures still retry. Quarantined signatures cannot be re-enqueued by discovery/backfill; a valid complete live replay can resolve them. If a bounded evaluation encounters one, it remains unresolved rather than becoming `no_trades`. Reports distinguish active backlog from quarantine; unresolved quarantine conservatively excludes affected and subsequent days from clean-day averages. Quarantine does not recover missing creations.
+
+Completed curves are recognized before reserve division and before transaction decoding. Graduation is recorded separately without fabricating a market cap from zero reserves, then polling stops. The deadline is checked before RPC, so permanently unavailable history cannot keep a mint alive past its observation horizon.
+
+Fresh reconnect recovery uses the disconnected interval rather than time since the prior recovery. Pending recovery retains its earliest cutoff across restarts; another reconnect during a scan requires a follow-up head scan. A completed signature scan does not mean all queued or quarantined transactions were successfully decoded.
 
 One enhanced creation-discovery subscription delivers transaction logs. Successful Mayhem creation events are committed using on-chain event timestamps. A bounded recent-transaction search runs through RPC when a mint is due. Malformed/truncated discovery notifications enter a retry queue. After the account snapshot, the collector checks the latest signature again; a changed head defers classification to avoid using an outdated trade. Errors within the sampled window are not interpreted as inactivity; trades outside it are deliberately not searched.
 
@@ -100,7 +108,7 @@ The current discovery-only smoke test received **230,804 bytes over ~12 seconds*
 
 ### Estimate formula
 
-A stable completed evaluation uses **3 base RPC requests**: one signature list (`limit: 20`), one account snapshot and one latest-signature race check (`limit: 1`). Add **0–20 `getTransaction` requests**, stopping at the first verified bot trade and reusing cached transactions. Thus the evaluation costs approximately **3–23 credits before retries** under the pricing assumption above. If the newest transaction is an uncached successful bot trade, it costs **4 credits**. Successful complete creation notifications are decoded directly.
+A stable completed non-graduation evaluation uses **3 base RPC requests**: one signature list (`limit: 20`), one account snapshot and one latest-signature race check (`limit: 1`). Add **0–20 `getTransaction` requests**, stopping at the first verified bot trade and reusing cached transactions. Thus the evaluation costs approximately **3–23 credits before retries** under the pricing assumption above. If the newest transaction is an uncached successful bot trade, it costs **4 credits**. Successful complete creation notifications are decoded directly. Graduation detection uses two requests (signature list and accounts), with no transaction fetches; an already-expired observation uses none. Truncated transactions are fetched at most once after upgrade before quarantine, unless a complete replay resolves them; quarantined entries retained from the old run require no migration fetch.
 
 ```text
 RPC requests/day ≈ 3 × completed evaluations/day

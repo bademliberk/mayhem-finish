@@ -7,9 +7,19 @@ export class Collector {
   constructor(store, rpc, cfg) { this.store = store; this.rpc = rpc; this.cfg = cfg; }
   async ingest(signature) {
     if (this.store.get('SELECT 1 FROM processed WHERE signature=?', signature)) return;
+    if (this.store.get('SELECT 1 FROM quarantined_transactions WHERE signature=?', signature)) {
+      throw new Error('Quarantined transaction: unresolved truncated logs');
+    }
     const tx = await this.rpc.transaction(signature);
+    // A complete live notification may have resolved this signature while RPC was pending.
+    if (this.store.get('SELECT 1 FROM processed WHERE signature=?', signature)) return;
     if (!tx) throw new Error('Transaction unavailable; retry required');
-    this.store.apply(signature, tx.slot, transactionEvents(tx));
+    try {
+      this.store.apply(signature, tx.slot, transactionEvents(tx));
+    } catch (error) {
+      if (error.code === 'TRUNCATED_LOGS') this.store.quarantine(signature, tx.slot, nowSeconds(), error.message);
+      throw error;
+    }
   }
   // A scan advances its durable page cursor only after every item is handled.
   // Revisit the previous checkpoint's slot to avoid skipping same-slot transactions.
@@ -68,8 +78,8 @@ export class Collector {
     }
     return window;
   }
-  async recentTrade(row) {
-    const entries = await this.recentSignatures(row.state_address, 20);
+  async recentTrade(row, entries = null) {
+    entries ??= await this.recentSignatures(row.state_address, 20);
     for (const entry of entries) {
       if (entry.err) continue;
       await this.ingest(entry.signature);
@@ -81,23 +91,28 @@ export class Collector {
     return { lastTrade: null, head: entries[0]?.signature };
   }
   async evaluate(row) {
-    const { lastTrade, head } = await this.recentTrade(row);
+    if (nowSeconds() >= row.deadline) {
+      this.store.finish(row.mint, row.deadline, 'deadline');
+      return { mint: row.mint, category: 'deadline' };
+    }
+    const entries = await this.recentSignatures(row.state_address, 20);
     const snapshot = await this.rpc.accounts([row.state_address, row.curve_address]);
     const [state, curveAccount] = snapshot.value;
-    if (!state || state.owner !== MAYHEM) throw new Error('Missing or wrong-owner Mayhem state');
     const curve = decodeCurve(curveAccount);
     if (!curve.mayhem) throw new Error('Curve is not Mayhem-enabled');
+    if (curve.complete) {
+      // Graduation detection does not depend on available transaction logs or a defined price.
+      this.store.graduate(row.mint, nowSeconds(), snapshot.context.slot,
+        state?.owner === MAYHEM ? state.data[0] : null, curveAccount.data[0]);
+      return { mint: row.mint, category: 'graduated' };
+    }
+    if (!state || state.owner !== MAYHEM) throw new Error('Missing or wrong-owner Mayhem state');
+    const { lastTrade, head } = await this.recentTrade(row, entries);
     // Close a race between history scanning and the account snapshot: if a new
     // signature arrived, retry rather than classify using an out-of-date last trade.
     const latest = await this.recentSignatures(row.state_address, 1);
     if (latest[0]?.signature !== head) throw new Error('Mayhem history changed during evaluation; retry');
     const checkedAt = nowSeconds();
-    if (curve.complete) {
-      // Graduation time is bounded by detection, not claimed as its exact block time.
-      this.store.evaluate(row.mint, checkedAt, snapshot.context.slot, state.data[0], curve,
-        { ...classify(lastTrade, checkedAt, curve, this.cfg), historyScope: 'latest_20_transactions' }, lastTrade);
-      return { mint: row.mint, category: 'graduated' };
-    }
     if (checkedAt >= row.deadline) {
       this.store.finish(row.mint, row.deadline, 'deadline');
       return { mint: row.mint, category: 'deadline' };

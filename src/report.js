@@ -15,6 +15,7 @@ export function report(store, now = Math.floor(Date.now() / 1000)) {
     }
     const scalar = (sql, ...args) => store.get(sql, ...args).n;
     const unresolved = scalar(`SELECT COUNT(*) n FROM queue WHERE queued_at<?`, end);
+    const quarantined = scalar('SELECT COUNT(*) n FROM quarantined_transactions WHERE queued_at<?', end);
     const gaps = scalar(`SELECT COUNT(*) n FROM coverage WHERE kind!='session'
       AND started_at<? AND COALESCE(ended_at,?)>?`, end, now, day);
     const lateChecks = scalar(`SELECT COUNT(*) n FROM mints WHERE status='monitoring' AND next_check<?`, now - store.cfg.recheck);
@@ -32,9 +33,10 @@ export function report(store, now = Math.floor(Date.now() / 1000)) {
       cohortMatured: end + store.cfg.horizon <= now,
       sessionCoverageSeconds: covered,
       pendingTransactions: unresolved,
+      quarantinedTransactions: quarantined,
       coverageGaps: gaps,
       overdueChecksNow: lateChecks,
-      fullObservedDay: end <= now && covered === DAY && unresolved === 0 && gaps === 0 && lateChecks === 0,
+      fullObservedDay: end <= now && covered === DAY && unresolved === 0 && quarantined === 0 && gaps === 0 && lateChecks === 0,
     });
   }
   const counts = daily.filter(d => d.fullObservedDay).map(d => d.uniqueCandidates).sort((a, b) => a - b);
@@ -52,10 +54,12 @@ export function report(store, now = Math.floor(Date.now() / 1000)) {
       median: counts.length % 2 ? counts[middle] : (counts[middle - 1] + counts[middle]) / 2,
       min: counts[0], max: counts.at(-1),
     } : null,
-    caveat: 'Counts are observed, not guaranteed exhaustive. Trade searches use at most the latest 20 state-account transactions, not full histories. No-trades means no matching trade in that window. Activity counts and first observed trades are sampled. Inspect coverage gaps, backlog and late detections. Only fully covered session days without queued transactions enter the average; creation cohorts remain provisional through the observation horizon.',
+    caveat: 'Counts are observed, not guaranteed exhaustive. Trade searches use at most the latest 20 state-account transactions, not full histories. No-trades means no matching trade in that window. Activity counts and first observed trades are sampled. Inspect coverage gaps, backlog, quarantine and late detections. Only fully covered session days without queued or quarantined transactions enter the average; creation cohorts remain provisional through the observation horizon.',
     monitoring: store.all('SELECT status,COUNT(*) count FROM mints GROUP BY status'),
     evaluationHistoryScopes: store.all('SELECT history_scope,COUNT(*) count FROM evaluations GROUP BY history_scope'),
     backlog: store.get('SELECT COUNT(*) count FROM queue').count,
+    quarantine: store.get('SELECT COUNT(*) count,SUM(attempts) failedAttempts FROM quarantined_transactions'),
+    graduations: store.all('SELECT mint,detected_at,slot FROM graduations ORDER BY detected_at'),
     coverage: store.all('SELECT * FROM coverage ORDER BY started_at'),
     overlap: store.get('SELECT COUNT(*) count FROM candidates JOIN long_inactive USING(mint)').count,
     candidates: store.all(`SELECT c.mint,m.created_at,c.first_seen,e.market_cap_sol,e.liquidity_sol,e.last_trade_at,

@@ -69,7 +69,7 @@ export function transactionEvents(tx) {
       !Number.isSafeInteger(tx.slot)) throw new Error('Malformed transaction metadata');
   if (tx.meta.err !== null) return [];
   if (tx.meta.logMessages?.some(line => line.includes('Log truncated'))) {
-    throw new Error('Transaction logs truncated; history remains incomplete');
+    throw Object.assign(new Error('Transaction logs truncated; history remains incomplete'), { code: 'TRUNCATED_LOGS' });
   }
   if (!Array.isArray(tx.meta.logMessages) || !Number.isSafeInteger(tx.blockTime)) {
     throw new Error('Missing logs or on-chain block time');
@@ -85,6 +85,9 @@ export function decodeCurve(account) {
   if (bytes.length >= 115 && bytes.subarray(83, 115).some(byte => byte !== 0)) {
     throw new Error('Unsupported non-native-SOL quote');
   }
+  if (bytes[48] > 1 || bytes[81] > 1) throw new Error('Invalid curve flags');
+  if (bytes[48] === 1) return { complete: true, mayhem: bytes[81] === 1, marketCap: null,
+    liquidity: Number(bytes.readBigUInt64LE(32)) / 1e9 };
   const virtualTokens = bytes.readBigUInt64LE(8);
   const virtualQuote = bytes.readBigUInt64LE(16);
   const supply = bytes.readBigUInt64LE(40);
