@@ -42,8 +42,24 @@ export class PaperEngine {
     }
   }
   start() {
-    // Unknown pending fills are canceled on restart, not assumed to have happened.
-    for (const order of this.paper.pending()) this.paper.cancel(order.id, this.now(), 'restart_unreconciled');
+    const active = this.paper.active();
+    const held = active.filter(row => this.paper.position(row.mint));
+    const monitoredHeld = held.filter(row => row.reason !== 'graduated_no_amm_exit');
+    if (monitoredHeld.length > this.cfg.maxWatches) {
+      throw new Error(`Open paper positions exceed PAPER_MAX_WATCHES (${this.cfg.maxWatches}); manual reconciliation required before startup`);
+    }
+    const heldMints = new Set(held.map(row => row.mint));
+    const unheld = active.filter(row => !heldMints.has(row.mint))
+      .sort((a, b) => b.enrolled_at_ms - a.enrolled_at_ms || a.mint.localeCompare(b.mint));
+    const excess = unheld.slice(this.cfg.maxWatches - monitoredHeld.length);
+    this.store.atomic(() => {
+      // Unknown pending fills are canceled on restart, not assumed to have happened.
+      for (const order of this.paper.pending()) this.paper.cancel(order.id, this.now(), 'restart_unreconciled');
+      for (const row of excess) {
+        this.store.run("UPDATE paper_watches SET status='stopped',reason='subscription_cap',preprocessed=0 WHERE mint=?", row.mint);
+        this.paper.count('restart_subscription_cap');
+      }
+    });
     for (const row of this.paper.active()) {
       const held = Boolean(this.paper.position(row.mint));
       const enabled = row.reason !== 'graduated_no_amm_exit' &&
@@ -180,8 +196,20 @@ export class PaperEngine {
     const row = this.states.get(mint), watch = this.paper.watch(mint);
     if (!row || !watch || !this.ready) return reject('not_ready');
     if (!watch.preprocessed || !this.feeds.covers(mint)) return reject('preprocessed_not_active');
-    if (slot < this.slot - 1 || slot > this.slot + 2 || this.now() - this.slotAt > this.cfg.maxStateAgeMs ||
-        this.now() - row.at > this.cfg.maxStateAgeMs || row.slot >= slot) return reject('stale_or_already_executed');
+    const slotAgeMs = this.now() - this.slotAt, reserveAgeMs = this.now() - row.at;
+    const causes = [];
+    if (slot < this.slot - 1) causes.push('slot_behind');
+    if (slot > this.slot + 2) causes.push('slot_ahead');
+    if (slotAgeMs > this.cfg.maxStateAgeMs) causes.push('slot_heartbeat_stale');
+    if (reserveAgeMs > this.cfg.maxStateAgeMs) causes.push('reserve_stale');
+    if (row.slot >= slot) causes.push('already_applied');
+    if (causes.length) {
+      for (const cause of causes) this.paper.count(`stale:${cause}`);
+      this.paper.signal(signature, mint, 'stale_or_already_executed', JSON.stringify({
+        causes, signalSlot: slot, currentSlot: this.slot, reserveSlot: row.slot, slotAgeMs, reserveAgeMs,
+      }));
+      return;
+    }
     const position = this.paper.position(mint);
     if (position) {
       if (watch.reason === 'floor' || watch.reason === 'graduated_no_amm_exit') return reject('mandatory_exit_pending');

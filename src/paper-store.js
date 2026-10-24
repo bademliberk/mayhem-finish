@@ -14,7 +14,7 @@ export function paperConfig(env = process.env) {
     networkFeeLamports: String(number('PAPER_NETWORK_FEE_LAMPORTS', 10000, 0, 10000000)),
     buySlippageBps: number('PAPER_BUY_SLIPPAGE_BPS', 500, 0, 5000),
     sellSlippageBps: number('PAPER_SELL_SLIPPAGE_BPS', 500, 0, 5000),
-    maxWatches: number('PAPER_MAX_WATCHES', 1000, 1, 5000),
+    maxWatches: number('PAPER_MAX_WATCHES', 10, 1, 10),
     queueLimit: number('PAPER_QUEUE_LIMIT', 1000, 1, 4000),
     maxStateAgeMs: number('PAPER_MAX_STATE_AGE_MS', 5000, 100, 60000),
     orderTtlMs: number('PAPER_ORDER_TTL_MS', 10000, 1000, 60000),
@@ -85,6 +85,9 @@ export class PaperStore {
         program: key(ix.program), discriminator: /^[a-f0-9]{0,16}$/.test(ix.discriminator) ? ix.discriminator : null,
         accounts: Number.isSafeInteger(ix.accounts) ? ix.accounts : null, bytes: Number.isSafeInteger(ix.bytes) ? ix.bytes : null,
       })) };
+    if (['slotSubscribe', 'accountSubscribe', 'preprocessedSubscribe'].includes(details?.method)) {
+      safe.method = details.method; safe.code = Number.isSafeInteger(details.code) ? details.code : null;
+    }
     this.store.run('INSERT INTO paper_rejections(reason,at_ms,detail) VALUES(?,?,?)', reason, now, JSON.stringify(safe));
     this.store.run('DELETE FROM paper_rejections WHERE id NOT IN (SELECT id FROM paper_rejections ORDER BY id DESC LIMIT 100)');
   }

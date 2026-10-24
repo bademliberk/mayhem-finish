@@ -41,12 +41,12 @@ const newPreprocessed = () => ({
 // Decoding, paper accounting and gap policy live in the caller.
 export class PaperFeeds {
   constructor(store, rpc, {
-    onAccount = noop, onTransaction = noop, onGap = noop, onReady = noop, onSlot = noop, onCoverage = noop,
+    onAccount = noop, onTransaction = noop, onGap = noop, onReady = noop, onSlot = noop, onCoverage = noop, onSubscriptionError = noop,
     socketFactory = url => new WebSocket(url, { handshakeTimeout: 10000, maxPayload: MAX_FRAME_BYTES }),
     setTimer = setTimeout, clearTimer = clearTimeout,
   } = {}) {
     this.store = store; this.rpc = rpc;
-    this.callbacks = { onAccount, onTransaction, onGap, onReady, onSlot, onCoverage };
+    this.callbacks = { onAccount, onTransaction, onGap, onReady, onSlot, onCoverage, onSubscriptionError };
     this.socketFactory = socketFactory; this.setTimer = setTimer; this.clearTimer = clearTimer;
     this.preprocessedUrl = preprocessedUrl(rpc.wsUrl);
     this.standard = newLink('standard');
@@ -95,6 +95,7 @@ export class PaperFeeds {
   remove(mint) {
     const watch = this.watches.get(mint);
     if (!watch) return;
+    watch.baseline?.abort();
     this.watches.delete(mint);
     // A still-pending request stays in this.requests so a late acknowledgment is unsubscribed.
     if (watch.subscription != null) {
@@ -148,6 +149,9 @@ export class PaperFeeds {
   safe(name, ...args) {
     try { this.callbacks[name](...args); }
     catch { console.error(`PaperFeeds ${name} callback failed (details suppressed)`); }
+  }
+  subscriptionError(method, error) {
+    this.safe('onSubscriptionError', { method, code: Number.isSafeInteger(error?.code) ? error.code : null });
   }
   markGap(reason) {
     this.ready = false;
@@ -212,7 +216,8 @@ export class PaperFeeds {
   // Fails a connection whose subscription is never acknowledged.
   armAck(link) {
     this.clearTimer(link.ackTimer); link.ackTimer = null;
-    if (!link.socket || !this.pending(link)) return;
+    if (!link.socket) return;
+    if (!this.pending(link)) { link.attempts = 0; return; }
     const socket = link.socket;
     link.ackTimer = this.setTimer(() => {
       link.ackTimer = null;
@@ -234,7 +239,10 @@ export class PaperFeeds {
     this.requests.clear(); this.subscriptions.clear();
     this.slotRequest = null; this.slotSubscription = null;
     // lastSlot resets so the baseline after resubscription is always delivered.
-    for (const watch of this.watches.values()) { watch.request = null; watch.subscription = null; watch.lastSlot = -1; }
+    for (const watch of this.watches.values()) {
+      watch.baseline?.abort();
+      watch.request = null; watch.subscription = null; watch.lastSlot = -1;
+    }
     this.ready = false;
     if (!this.stopped) this.schedule(link);
   }
@@ -258,15 +266,19 @@ export class PaperFeeds {
     if (message.id != null) {
       if (message.id === this.slotRequest) {
         this.slotRequest = null;
-        if (message.error || !Number.isSafeInteger(message.result)) { this.fail(link, 'slot_subscribe_failed'); return; }
-        this.slotSubscription = message.result; link.acked = true; link.attempts = 0;
+        if (message.error || !Number.isSafeInteger(message.result)) {
+          this.subscriptionError('slotSubscribe', message.error); this.fail(link, 'slot_subscribe_failed'); return;
+        }
+        this.slotSubscription = message.result; link.acked = true;
         this.armAck(link); this.checkReady();
         return;
       }
       const watch = this.requests.get(message.id);
       if (!watch) return;
       this.requests.delete(message.id);
-      if (message.error || !Number.isSafeInteger(message.result)) { this.fail(link, 'account_subscribe_failed'); return; }
+      if (message.error || !Number.isSafeInteger(message.result)) {
+        this.subscriptionError('accountSubscribe', message.error); this.fail(link, 'account_subscribe_failed'); return;
+      }
       if (this.watches.get(watch.mint) !== watch || watch.request !== message.id) {
         this.send(link, 'accountUnsubscribe', [message.result]); // removed or replaced while the ack was in flight
         this.armAck(link);
@@ -368,7 +380,10 @@ export class PaperFeeds {
       return;
     }
     const message = JSON.parse(buffer.toString());
-    if (message.error) throw new Error('Preprocessed stream error');
+    if (message.error) {
+      this.subscriptionError('preprocessedSubscribe', message.error);
+      throw new Error('Preprocessed stream error');
+    }
     if (message.id == null || message.id !== conn.request || conn.acked) return;
     if (typeof message.result !== 'number' && typeof message.result !== 'string') throw new Error('Malformed ack');
     conn.acked = true; pre.attempts = 0;
@@ -418,20 +433,26 @@ export class PaperFeeds {
   }
   // One baseline fetch per account acknowledgment (never per notification).
   snapshot(watch) {
+    watch.baseline?.abort();
+    const controller = new AbortController(); watch.baseline = controller;
     const link = this.standard;
     const generation = link.generation, subscription = watch.subscription, seq = watch.seq = (watch.seq ?? 0) + 1;
     const current = () => !this.stopped && link.generation === generation && watch.seq === seq
       && this.watches.get(watch.mint) === watch && watch.subscription === subscription;
     const task = (async () => {
       try {
-        const result = await this.rpc.accounts([watch.curve], { commitment: 'processed' });
+        const result = await this.rpc.accounts([watch.curve], {
+          commitment: 'processed', deadlineMs: Date.now() + 5000, signal: controller.signal,
+        });
         const slot = result?.context?.slot;
         if (!Number.isSafeInteger(slot) || !Array.isArray(result.value)) throw new Error('Malformed snapshot');
         if (!current() || slot <= watch.lastSlot) return; // stale generation, or a newer notification already won
         watch.lastSlot = slot;
         this.safe('onAccount', watch.mint, slot, result.value[0] ?? null);
       } catch {
-        if (current()) this.fail(link, 'snapshot_failed');
+        if (current() && !controller.signal.aborted) this.fail(link, 'snapshot_failed');
+      } finally {
+        if (watch.baseline === controller) watch.baseline = null;
       }
     })();
     this.tasks.add(task);

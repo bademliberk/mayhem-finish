@@ -42,8 +42,88 @@ function setup(options={}) {
 test('paper defaults are fixed strategy with validated configurable cap and cost assumptions',()=>{
   assert.equal(pc.maxTrades,25);assert.equal(pc.buyLamports,'10000000');assert.equal(pc.windowSlots,5);
   assert.equal(pc.dropBps,6000);assert.equal(pc.mode,'paper');
+  assert.equal(pc.maxWatches,10);
+  assert.equal(paperConfig({PAPER_MAX_WATCHES:'3'}).maxWatches,3);
+  for(const value of ['0','11','1000','2.5','NaN']) assert.throws(()=>paperConfig({PAPER_MAX_WATCHES:value}));
   for(const value of ['0','-1','NaN','2.5']) assert.throws(()=>paperConfig({MAX_TRADE_COUNT:value}));
   assert.equal(paperConfig({PAPER_ENTRIES_ENABLED:'false'}).entriesEnabled,false);
+});
+test('ten concurrent watches reject the eleventh until a watch becomes terminal',()=>{
+  const s=setup();
+  const keys=Array.from({length:10},(_,i)=>new PublicKey(Buffer.alloc(32,i+1)).toBase58());
+  for(const key of keys) {candidate(s.store,key);s.engine.add(key);}
+  assert.equal(s.engine.paper.active().length,10);assert.equal(s.added.length,10);
+  assert.equal(s.engine.paper.watch(keys[9]),undefined);
+  s.engine.onAccount(mint,16,account(0.1));
+  s.engine.add(keys[9]);assert.equal(s.engine.paper.active().length,10);
+  assert.ok(s.engine.paper.watch(keys[9]));s.close();
+});
+test('restart caps saved watches, prioritizes positions and preserves historical records',()=>{
+  const s=setup({maxWatches:30});
+  s.engine.signal(s.signal());s.engine.paper.fill(s.engine.paper.pending()[0],{tokens:'100',cost:'1000'},100001);
+  const keys=Array.from({length:12},(_,i)=>new PublicKey(Buffer.alloc(32,i+1)).toBase58());
+  for(const [i,key] of keys.entries()) {candidate(s.store,key);s.engine.paper.enroll(key,200000+i);}
+  s.engine.cfg.maxWatches=10;s.added.length=0;s.engine.start();
+  const expected=[mint,...keys.slice(3)].sort();
+  assert.deepEqual(s.added.map(args=>args[0]).sort(),expected);
+  assert.equal(s.engine.paper.active().length,10);
+  assert.equal(s.store.get('SELECT count(*) n FROM paper_watches').n,13);
+  for(const key of keys.slice(0,3)) {
+    assert.equal(s.engine.paper.watch(key).reason,'subscription_cap');
+    assert.equal(s.engine.paper.watch(key).status,'stopped');
+    assert.equal(s.engine.paper.watch(key).preprocessed,0);
+  }
+  assert.ok(s.engine.paper.position(mint));assert.equal(s.engine.paper.capacity().successfulBuys,1);
+  s.added.length=0;s.engine.start();
+  assert.deepEqual(s.added.map(args=>args[0]).sort(),expected);
+  assert.equal(s.store.get("SELECT count FROM paper_counters WHERE name='restart_subscription_cap'").count,3);
+  s.close();
+});
+test('startup refuses excess held positions before subscribing or canceling pending orders',()=>{
+  const s=setup();s.engine.signal(s.signal());
+  s.engine.paper.fill(s.engine.paper.pending()[0],{tokens:'100',cost:'1000'},100001);
+  const second=new PublicKey(Buffer.alloc(32,2)).toBase58();candidate(s.store,second);s.engine.add(second);
+  s.engine.paper.request(second,'buy','dump',{tokens:'100',cost:'1000'},null,100002);
+  s.engine.paper.fill(s.engine.paper.pending()[0],{tokens:'100',cost:'1000'},100003);
+  s.engine.paper.request(mint,'sell','profit',{net:'1500'},null,100004);
+  s.engine.cfg.maxWatches=1;s.added.length=0;
+  assert.throws(()=>s.engine.start(),/manual reconciliation required/);
+  assert.equal(s.added.length,0);assert.equal(s.engine.paper.pending().length,1);
+  assert.equal(s.engine.paper.active().length,2);assert.ok(s.engine.paper.position(second));s.close();
+});
+test('graduated blocked positions remain recorded without consuming a restart subscription',()=>{
+  const s=setup();s.engine.signal(s.signal());
+  s.engine.paper.fill(s.engine.paper.pending()[0],{tokens:'100',cost:'1000'},100001);
+  s.engine.onAccount(mint,16,account(1,1,true));
+  const second=new PublicKey(Buffer.alloc(32,2)).toBase58();candidate(s.store,second);s.engine.add(second);
+  s.engine.cfg.maxWatches=1;s.added.length=0;s.engine.start();
+  assert.deepEqual(s.added.map(args=>args[0]),[second]);
+  assert.ok(s.engine.paper.position(mint));assert.equal(s.engine.paper.watch(mint).reason,'graduated_no_amm_exit');s.close();
+});
+test('stale signal diagnostics separate causes without weakening entry guards',()=>{
+  for(const [cause,change,slot] of [
+    ['slot_behind',s=>{},13],['slot_ahead',s=>{},18],
+    ['slot_heartbeat_stale',s=>{s.engine.slotAt=0;},15],
+    ['reserve_stale',s=>{s.engine.states.get(mint).at=0;},15],
+    ['already_applied',s=>{s.engine.onAccount(mint,15,account(1));},15],
+  ]) {
+    const s=setup();change(s);s.engine.signal(s.signal('diagnostic',slot));
+    assert.equal(s.engine.paper.pending().length,0);
+    assert.equal(s.store.get('SELECT count FROM paper_counters WHERE name=?',`stale:${cause}`).count,1);
+    const signal=s.store.get("SELECT * FROM paper_signals WHERE signature='diagnostic'");
+    assert.equal(signal.outcome,'stale_or_already_executed');
+    assert.ok(JSON.parse(signal.detail).causes.includes(cause));s.close();
+  }
+});
+test('subscription error samples retain only allowed method and numeric code',()=>{
+  const s=setup();
+  for(let i=0;i<110;i++) s.engine.paper.rejection('subscription_error',{
+    method:'accountSubscribe',code:-32005,message:'secret-key',url:'https://secret-key',
+  },100000+i);
+  const rows=s.store.all('SELECT detail FROM paper_rejections');assert.equal(rows.length,100);
+  assert.equal(JSON.parse(rows[0].detail).code,-32005);
+  assert.equal(JSON.parse(rows[0].detail).method,'accountSubscribe');
+  assert.ok(!JSON.stringify(rows).includes('secret-key'));s.close();
 });
 test('BigInt buy budgets include swap fee, own impact, reserve caps and network cost',()=>{
   const state=reserves(account()),budget=10000000n;
@@ -188,7 +268,8 @@ test('entry rechecks actual later range, slippage and drop instead of filling pr
 test('25-entry cap is atomic, persists after restart and pending reservations release',()=>{
   const dir=mkdtempSync(join(tmpdir(),'paper-cap-')),path=join(dir,'db.sqlite');let store;
   try {
-    store=new Store(path,cfg);let paper=new PaperStore(store,pc);
+    // Isolate cumulative trade accounting from the production concurrent-watch limit.
+    store=new Store(path,cfg);let paper=new PaperStore(store,{...pc,maxWatches:26});
     const keys=Array.from({length:26},(_,i)=>new PublicKey(Buffer.alloc(32,i+1)).toBase58());
     for(const key of keys) {candidate(store,key);paper.enroll(key,1000);}
     for(const key of keys.slice(0,25)) assert.ok(paper.request(key,'buy','dump',{tokens:'1',cost:'100'},null,1000));

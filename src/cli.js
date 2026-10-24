@@ -50,6 +50,7 @@ async function start(rpc) {
       onAccount: (...args) => tracker.onAccount(...args), onTransaction: raw => tracker.enqueue(raw),
       onGap: reason => tracker.gap(reason), onReady: () => tracker.onReady(), onSlot: slot => tracker.onSlot(slot),
       onCoverage: mint => tracker.coverage(mint),
+      onSubscriptionError: detail => tracker.paper.rejection('subscription_error', detail, Date.now()),
     }));
     store.onDiscovery = () => tracker.discover();
     tracker.start();

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PaperFeeds, preprocessedUrl, MAX_FRAME_BYTES } from '../src/paper-feeds.js';
+import { Rpc } from '../src/rpc.js';
 import { PUMP } from '../src/config.js';
 
 const KEY = 'secret-key-123';
@@ -113,7 +114,10 @@ test('ack fetches exactly one processed snapshot; notifications and slots need n
   const t = setup({ watches: [['m1', CURVE]] });
   const [a] = await t.bringUp();
   assert.equal(t.rpcCalls.length, 1);
-  assert.deepEqual(t.rpcCalls[0], [[CURVE], { commitment: 'processed' }]);
+  assert.deepEqual(t.rpcCalls[0][0], [CURVE]);
+  assert.equal(t.rpcCalls[0][1].commitment, 'processed');
+  assert.ok(t.rpcCalls[0][1].signal instanceof AbortSignal);
+  assert.ok(t.rpcCalls[0][1].deadlineMs > Date.now());
   assert.deepEqual(t.of('account'), [['account', 'm1', 50, { lamports: 1 }]]);
   for (const slot of [51, 52, 53]) {
     a.text({ method: 'accountNotification', params: { subscription: 21, result: { context: { slot }, value: { lamports: slot } } } });
@@ -319,10 +323,56 @@ test('repeated gaps while not ready are reported once; backoff grows and resets 
   assert.equal(t.of('gap').length, 1);
   t.advance(1999); assert.equal(t.std().length, 2);
   t.advance(1); assert.equal(t.std().length, 3);
-  const a = t.std()[2]; a.open(); a.ack('slotSubscribe', 1);
+  const a = t.std()[2]; a.open(); a.ack('slotSubscribe', 1); a.ack('accountSubscribe', 21);
   a.terminate();
   t.advance(1000); assert.equal(t.std().length, 4); // reset after ack
   await t.feeds.stop();
+});
+
+test('account subscription rejection preserves backoff despite successful slot acknowledgments', async () => {
+  const t=setup();const errors=[];t.feeds.callbacks.onSubscriptionError=detail=>errors.push(detail);
+  t.feeds.start();
+  for(const delay of [1000,2000,4000]) {
+    const a=t.std().at(-1);a.open();a.ack('slotSubscribe',9);
+    a.text({id:a.find('accountSubscribe').id,error:{code:-32005,message:STD}});
+    const count=t.std().length;t.advance(delay-1);assert.equal(t.std().length,count);
+    t.advance(1);assert.equal(t.std().length,count+1);
+  }
+  assert.deepEqual(errors,Array(3).fill({method:'accountSubscribe',code:-32005}));
+  assert.ok(!JSON.stringify(errors).includes(KEY));await t.feeds.stop();
+});
+
+test('baseline cancellation reaches RPC on replacement, removal and shutdown', async () => {
+  const signals=[];
+  const t=setup({accounts:(addresses,{signal})=>new Promise((resolve,reject)=>{
+    signals.push(signal);signal.addEventListener('abort',()=>reject(new Error('aborted')),{once:true});
+  })});
+  await t.bringUp();
+  t.feeds.snapshot(t.feeds.watches.get('m1'));await settle();
+  assert.equal(signals[0].aborted,true);assert.equal(t.feeds.tasks.size,1);
+  t.feeds.remove('m1');await settle();assert.equal(signals[1].aborted,true);
+  assert.equal(t.of('gap').length,0);assert.equal(t.feeds.tasks.size,0);
+  await t.feeds.stop();
+});
+
+test('reconnect churn removes obsolete baselines from the real RPC queue', async context => {
+  let release;
+  context.mock.method(globalThis,'fetch',async()=>new Promise(resolve=>{
+    release=()=>resolve({ok:true,status:200,json:async()=>({result:{}})});
+  }));
+  const rpc=new Rpc({key:'test',rpcInterval:0},{usage:()=>{}});
+  const blocking=rpc.accounts(['blocker']);
+  const t=setup({accounts:(...args)=>rpc.accounts(...args)});
+  await t.bringUp();
+  for(let i=0;i<30;i++) {
+    assert.equal(rpc.queue.length,1);
+    t.std().at(-1).terminate();await settle();assert.equal(rpc.queue.length,0);
+    t.advance(1000);
+    const a=t.std().at(-1);a.open();a.ack('slotSubscribe',9);a.ack('accountSubscribe',21);await settle();
+    assert.equal(t.feeds.tasks.size,1);
+  }
+  await t.feeds.stop();assert.equal(rpc.queue.length,0);assert.equal(t.feeds.tasks.size,0);
+  release();await blocking;
 });
 
 test('stale snapshot from an old connection generation is discarded', async () => {
