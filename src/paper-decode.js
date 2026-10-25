@@ -15,16 +15,16 @@ const COMPUTE = 'ComputeBudget111111111111111111111111111111';
 const ATA = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
 const SYSTEM = '11111111111111111111111111111111';
 
-export function projectTransaction(raw, states, cfg, resolveLookup) {
+export function projectTransaction(raw, states, cfg, resolveLookup, now = Date.now()) {
   const frame = decodeFrame(raw, resolveLookup);
-  try { return projectFrame(frame, states, cfg); }
+  try { return projectFrame(frame, states, cfg, now); }
   catch (error) {
     error.details = { slot: frame.slot, signature: frame.signature, version: frame.version,
       instructions: frame.instructions.slice(0,8).map(ix => ({ program: ix.program, discriminator: ix.data.subarray(0,8).toString('hex'), accounts: ix.accounts.length, bytes: ix.data.length })) };
     throw error;
   }
 }
-function projectFrame(frame, states, cfg) {
+function projectFrame(frame, states, cfg, now) {
   const pumps = frame.instructions.filter(ix => ix.program === PUMP);
   if (pumps.length !== 1) throw unsupported('cpi_or_multi_swap');
   const ix = pumps[0], disc = ix.data.subarray(0, 8);
@@ -40,8 +40,15 @@ function projectFrame(frame, states, cfg) {
     if (flags.some(flag => flag > 1) || (v3 ? flags[0] : flags[1]) === 1) throw unsupported('partial_fill');
   }
   const mint = ix.accounts[v3 ? 1 : 2], curve = ix.accounts[v3 ? 5 : 3];
-  const row = states.get(mint);
-  if (!row) throw unsupported('unwatched_mint');
+  const latest = states.get(mint);
+  if (!latest) throw unsupported('unwatched_mint');
+  if (!Number.isSafeInteger(latest.slot) || latest.slot > frame.slot) throw unsupported('reserve_after_signal');
+  const fallback = latest.slot === frame.slot;
+  const row = fallback ? (latest.history ?? []).filter(sample => Number.isSafeInteger(sample.slot) &&
+    sample.slot < frame.slot && sample.slot >= frame.slot - cfg.windowSlots + 1)
+    .reduce((best, sample) => !best || sample.slot >= best.slot ? sample : best, null) : latest;
+  if (!row || !Number.isFinite(row.at) || row.at > now || now - row.at > cfg.maxStateAgeMs ||
+      row.slot < frame.slot - cfg.windowSlots + 1) throw unsupported('no_fresh_prior_slot_reserves');
   if (curve !== addresses(mint).curve || ix.accounts[v3 ? 16 : 11] !== PUMP) throw unsupported('curve_accounts');
   const tokenProgram = ix.accounts[v3 ? 3 : buy ? 8 : 9];
   if (!TOKEN.has(tokenProgram)) throw unsupported('token_program');
@@ -73,5 +80,6 @@ function projectFrame(frame, states, cfg) {
   catch { throw unsupported('reserve_or_amount_limit'); }
   if (buy && projected.tokens >= row.state.realTokens) throw unsupported('inventory_exhaustion');
   if ((exact && projected.tokens < limit) || (buy && !exact && projected.cost > limit) || (!buy && projected.net < limit)) throw unsupported('modeled_instruction_slippage');
-  return { signature: frame.signature, slot: frame.slot, mint, state: projected.state, side: buy ? 'buy' : 'sell' };
+  return { signature: frame.signature, slot: frame.slot, mint, state: projected.state, side: buy ? 'buy' : 'sell',
+    base: { slot: row.slot, at: row.at, model: fallback ? 'isolated_prior_slot' : 'latest_prior_slot' } };
 }

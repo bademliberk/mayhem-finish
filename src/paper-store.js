@@ -6,7 +6,7 @@ export function paperConfig(env = process.env) {
   };
   return {
     mode: 'paper', version: 'creation_staged_v2', buyLamports: '10000000',
-    activationCap: 2, idleMs: 60000,
+    activationCap: 2, idleMs: 10000, rotationIdleMs: 60000,
     maxTrades: number('MAX_TRADE_COUNT', 25, 1, 100000),
     windowSlots: 5, dropBps: 6000, floorCap: 0.1, ceilingCap: 0.5, profitBps: 3000,
     // Simulation assumptions, not authoritative on-chain fee or fill guarantees.
@@ -96,14 +96,30 @@ export class PaperStore {
     const bought = this.store.get("SELECT COUNT(*) n FROM paper_orders WHERE side='buy' AND status='filled'").n;
     return { max: this.cfg.maxTrades, successfulBuys: bought, pendingBuys: used - bought, remaining: Math.max(0, this.cfg.maxTrades - used) };
   }
-  enroll(mint, now) {
-    if (this.store.get('SELECT 1 FROM paper_watches WHERE mint=?', mint)) return false;
-    if (!this.cfg.entriesEnabled || !this.capacity().remaining) { this.count('enrollment_entry_cap'); return false; }
-    if (this.active().length >= this.cfg.maxWatches) { this.count('enrollment_watch_cap'); return false; }
-    const row = this.store.get('SELECT curve_address FROM mints WHERE mint=?', mint);
-    if (!row) return false;
-    this.store.run('INSERT INTO paper_watches(mint,curve_address,enrolled_at_ms) VALUES(?,?,?)', mint, row.curve_address, now);
-    return true;
+  enroll(mint, now) { return this.admit(mint, now).enrolled; }
+  admit(mint, now, rotate = false) {
+    return this.store.atomic(() => {
+      const skipped = { enrolled: false, evicted: null };
+      if (this.watch(mint)) return skipped;
+      if (!this.cfg.entriesEnabled || !this.capacity().remaining) { this.count('enrollment_entry_cap'); return skipped; }
+      const row = this.store.get('SELECT curve_address FROM mints WHERE mint=?', mint);
+      if (!row) return skipped;
+      let evicted = null;
+      if (this.active().length >= this.cfg.maxWatches) {
+        const pending = new Set(this.pending().map(order => order.mint));
+        const eligible = rotate ? this.active().filter(watch => watch.status === 'watching' &&
+          !this.position(watch.mint) && !pending.has(watch.mint) &&
+          now - (watch.last_change_ms ?? watch.enrolled_at_ms) >= this.cfg.rotationIdleMs)
+          .sort((a, b) => (a.last_change_ms ?? a.enrolled_at_ms) - (b.last_change_ms ?? b.enrolled_at_ms) ||
+            a.enrolled_at_ms - b.enrolled_at_ms || a.mint.localeCompare(b.mint)) : [];
+        if (!eligible.length) { this.count('enrollment_watch_cap'); return skipped; }
+        evicted = eligible[0].mint;
+        this.store.run("UPDATE paper_watches SET status='stopped',reason='idle_rotation',preprocessed=0 WHERE mint=?", evicted);
+        this.count('idle_rotation');
+      }
+      this.store.run('INSERT INTO paper_watches(mint,curve_address,enrolled_at_ms) VALUES(?,?,?)', mint, row.curve_address, now);
+      return { enrolled: true, evicted };
+    });
   }
   active() {
     return this.store.all("SELECT * FROM paper_watches WHERE status IN ('watching','holding','exit_blocked')");

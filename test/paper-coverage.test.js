@@ -24,7 +24,7 @@ test('public confirmed legacy nonce/close and v1 sells decode and project (not h
     const ix=frame.instructions.find(ix=>ix.program===PUMP);
     assert.equal(ix.accounts[3],'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
     const state={virtualTokens:1000000000000000n,virtualSol:100000000000n,realTokens:900000000000000n,realSol:90000000000n,supply:1000000000000000n,complete:false};
-    const result=projectTransaction(raw,new Map([[ix.accounts[1],{state}]]),paperConfig({}));
+    const result=projectTransaction(raw,new Map([[ix.accounts[1],{state,slot:row.slot-1,at:Date.now()}]]),paperConfig({}));
     assert.equal(result.side,'sell');assert.ok(result.state.virtualSol<state.virtualSol);
     const truncated=raw.subarray(0,raw.length-1);assert.throws(()=>decodeFrame(truncated));
     assert.throws(()=>decodeFrame(Buffer.concat([raw,Buffer.from([0])])),/wire_version_or_layout/);

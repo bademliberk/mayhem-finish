@@ -43,6 +43,7 @@ test('paper defaults are fixed strategy with validated configurable cap and cost
   assert.equal(pc.maxTrades,25);assert.equal(pc.buyLamports,'10000000');assert.equal(pc.windowSlots,5);
   assert.equal(pc.dropBps,6000);assert.equal(pc.mode,'paper');
   assert.equal(pc.maxWatches,10);
+  assert.equal(pc.rotationIdleMs,60000);assert.equal(pc.idleMs,10000);
   assert.equal(paperConfig({PAPER_MAX_WATCHES:'3'}).maxWatches,3);
   for(const value of ['0','11','1000','2.5','NaN']) assert.throws(()=>paperConfig({PAPER_MAX_WATCHES:value}));
   for(const value of ['0','-1','NaN','2.5']) assert.throws(()=>paperConfig({MAX_TRADE_COUNT:value}));
@@ -124,6 +125,74 @@ test('subscription error samples retain only allowed method and numeric code',()
   assert.equal(JSON.parse(rows[0].detail).code,-32005);
   assert.equal(JSON.parse(rows[0].detail).method,'accountSubscribe');
   assert.ok(!JSON.stringify(rows).includes('secret-key'));s.close();
+});
+test('new discovery rotates an idle watch at 60 seconds and removes it before subscribing',()=>{
+  const s=setup({maxWatches:1});
+  const second=new PublicKey(Buffer.alloc(32,2)).toBase58();candidate(s.store,second);
+  s.setNow(159999);s.engine.add(second);assert.equal(s.engine.paper.watch(second),undefined);
+  const operations=[];s.engine.feeds.remove=key=>operations.push(['remove',key]);
+  s.engine.feeds.add=key=>operations.push(['add',key]);
+  s.setNow(160000);s.engine.add(second);
+  assert.deepEqual(operations,[['remove',mint],['add',second]]);
+  assert.equal(s.engine.paper.watch(mint).reason,'idle_rotation');
+  assert.equal(s.engine.paper.watch(mint).preprocessed,0);assert.equal(s.engine.states.has(mint),false);
+  assert.equal(s.engine.paper.active().length,1);assert.equal(s.store.get('SELECT count(*) n FROM paper_watches').n,2);
+  operations.length=0;s.engine.start();assert.deepEqual(operations,[['add',second]]);s.close();
+});
+test('rotation protects held and pending watches and does not evict for ineligible enrollment',()=>{
+  for(const mode of ['held','pending','disabled','trade-cap','duplicate','unknown']) {
+    const s=setup({maxWatches:1});
+    const second=new PublicKey(Buffer.alloc(32,2)).toBase58();candidate(s.store,second);
+    if(mode==='held'||mode==='pending') {
+      s.engine.signal(s.signal());
+      if(mode==='held') s.engine.paper.fill(s.engine.paper.pending()[0],{tokens:'100',cost:'1000'},100001);
+    }
+    if(mode==='disabled') s.engine.cfg.entriesEnabled=false;
+    if(mode==='trade-cap') s.engine.cfg.maxTrades=0;
+    s.setNow(160000);
+    s.engine.add(mode==='duplicate'?mint:mode==='unknown'?new PublicKey(Buffer.alloc(32,3)).toBase58():second);
+    assert.notEqual(s.engine.paper.watch(mint).reason,'idle_rotation');
+    assert.equal(s.engine.paper.watch(second),undefined);assert.equal(s.removed.length,0);s.close();
+  }
+});
+test('rotation chooses the oldest idle watch and uses enrollment when never sampled',()=>{
+  const s=setup({maxWatches:2});
+  const second=new PublicKey(Buffer.alloc(32,2)).toBase58(),third=new PublicKey(Buffer.alloc(32,3)).toBase58();
+  candidate(s.store,second);s.engine.paper.enroll(second,90000);candidate(s.store,third);
+  s.setNow(160000);s.engine.add(third);
+  assert.equal(s.engine.paper.watch(second).reason,'idle_rotation');
+  assert.equal(s.engine.paper.watch(mint).status,'watching');assert.equal(s.engine.paper.active().length,2);s.close();
+});
+test('prior-slot fallback requires warm-up, excludes same-slot peaks and remains confirmation-gated',async()=>{
+  for(const mode of ['valid','same-slot-peak','warmup','failed-trigger']) {
+    const s=setup();
+    if(mode==='same-slot-peak') {
+      const row=s.engine.states.get(mint);row.history=row.history.map(h=>({...h,state:reserves(account(.3))}));
+    }
+    s.engine.onAccount(mint,15,account(mode==='same-slot-peak'?10:.2));
+    if(mode==='warmup') s.engine.coverage(mint);
+    const signal={...s.signal(),base:{slot:14,at:100000,model:'isolated_prior_slot'}};
+    s.engine.signal(signal);
+    const eligible=mode==='valid'||mode==='failed-trigger';
+    assert.equal(s.engine.paper.pending().length,eligible?1:0);
+    if(eligible) {
+      assert.deepEqual(JSON.parse(s.engine.paper.pending()[0].quote_json).projectionBase,signal.base);
+      if(mode==='failed-trigger') s.rpc.call=async()=>({value:[{slot:15,err:{failed:true},confirmationStatus:'confirmed'}]});
+      await s.engine.tick();assert.equal(Boolean(s.engine.paper.position(mint)),mode==='valid');
+    }
+    s.close();
+  }
+});
+test('same-slot fallback rejects missing, stale, future and invalid projection bases',()=>{
+  for(const base of [undefined,{slot:15,at:100000,model:'isolated_prior_slot'},
+    {slot:14,at:94999,model:'isolated_prior_slot'},{slot:14,at:100001,model:'isolated_prior_slot'},
+    {slot:10,at:100000,model:'isolated_prior_slot'},{slot:14,at:100000,model:'latest_prior_slot'}]) {
+    const s=setup();s.engine.onAccount(mint,15,account(.2));
+    s.engine.signal({...s.signal(),base});assert.equal(s.engine.paper.pending().length,0);s.close();
+  }
+  const s=setup();s.engine.onAccount(mint,16,account(.2));
+  s.engine.signal({...s.signal(),base:{slot:14,at:100000,model:'isolated_prior_slot'}});
+  assert.equal(s.engine.paper.pending().length,0);s.close();
 });
 test('BigInt buy budgets include swap fee, own impact, reserve caps and network cost',()=>{
   const state=reserves(account()),budget=10000000n;
@@ -373,14 +442,14 @@ test('creation enrollment does not require candidate screening and survives rest
   monitor.apply('creation',1,[{type:'create',mint,timestamp:100}]);
   assert.equal(monitor.get('SELECT COUNT(*) n FROM paper_discoveries').n,0);monitor.close();
 });
-test('strict 2 SOL activation, 60 second idle boundary, unchanged notifications and resume',async()=>{
+test('strict 2 SOL activation, 10 second idle boundary, unchanged notifications and resume',async()=>{
   const s=setup();
   s.engine.membership(mint,false);
   s.engine.onAccount(mint,15,account(2));assert.equal(s.engine.paper.watch(mint).preprocessed,0);
   s.engine.onAccount(mint,16,account(1.99));assert.equal(s.engine.paper.watch(mint).preprocessed,1);
-  s.setNow(159999);await s.engine.tick();assert.equal(s.engine.paper.watch(mint).preprocessed,1);
+  s.setNow(109999);await s.engine.tick();assert.equal(s.engine.paper.watch(mint).preprocessed,1);
   s.engine.onAccount(mint,17,account(1.99)); // identical bytes do not reset idle
-  s.setNow(160000);await s.engine.tick();assert.equal(s.engine.paper.watch(mint).preprocessed,0);
+  s.setNow(110000);await s.engine.tick();assert.equal(s.engine.paper.watch(mint).preprocessed,0);
   assert.equal(s.removed.length,0);assert.ok(s.engine.states.has(mint));
   s.engine.gap('test');s.engine.onReady();s.engine.onAccount(mint,18,account(1.99));
   assert.equal(s.engine.paper.watch(mint).preprocessed,0); // unchanged reconnect baseline
@@ -391,7 +460,7 @@ test('strict 2 SOL activation, 60 second idle boundary, unchanged notifications 
 });
 test('idle cancels pending entry; unacknowledged membership cannot signal',async()=>{
   const s=setup();s.engine.signal(s.signal());assert.equal(s.engine.paper.pending().length,1);
-  s.setNow(160000);await s.engine.tick();
+  s.setNow(110000);await s.engine.tick();
   assert.equal(s.store.get('SELECT error FROM paper_orders').error,'preprocessed_idle');
   s.close();
   const a=setup();a.engine.feeds.covers=()=>false;a.engine.signal(a.signal());

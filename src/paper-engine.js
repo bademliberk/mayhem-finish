@@ -27,7 +27,7 @@ export class PaperEngine {
     const since = this.slot || Infinity;
     this.coverageSlots.set(mint, since);
     const row = this.states.get(mint);
-    if (row) { row.since = Math.max(row.slot, since); row.history = [{ state: row.state, slot: row.slot }]; }
+    if (row) { row.since = Math.max(row.slot, since); row.history = [{ state: row.state, slot: row.slot, at: row.at }]; }
   }
   membership(mint, enabled) {
     const watch = this.paper.watch(mint);
@@ -72,7 +72,9 @@ export class PaperEngine {
   }
   add(mint) {
     if (this.stopped) return;
-    if (this.paper.enroll(mint, this.now())) this.feeds.add(mint, this.paper.watch(mint).curve_address, false);
+    const admission = this.paper.admit(mint, this.now(), true);
+    if (admission.evicted) this.unwatch(admission.evicted);
+    if (admission.enrolled) this.feeds.add(mint, this.paper.watch(mint).curve_address, false);
   }
   gap(reason) {
     this.ready = false; this.epoch++; this.slot = 0; this.slotAt = 0; this.states.clear(); this.queue = [];
@@ -105,7 +107,7 @@ export class PaperEngine {
       }
       const row = { state, slot, at: this.now(), since: old?.since ?? Math.max(slot, this.coverageSlots.get(mint) ?? slot), history: old?.history ?? [] };
       row.history = row.history.filter(item => item.slot >= slot - this.cfg.windowSlots + 1);
-      if (!state.complete) row.history.push({ state, slot });
+      if (!state.complete) row.history.push({ state, slot, at: row.at });
       // Several writes in one slot have no transaction index; retain their observed peak only.
       if (row.history.length > 1000) { this.paper.count('history_overflow'); row.history = []; row.since = slot; }
       this.states.set(mint, row);
@@ -146,6 +148,7 @@ export class PaperEngine {
     try {
       const quote = exitQuote(state, position, this.cfg);
       if (reason === 'profit' && !profitable(quote, position, this.cfg)) return;
+      if (signal?.base) quote.projectionBase = signal.base;
       this.paper.request(mint, 'sell', reason, quote, signal, this.now());
       if (reason === 'floor') this.store.run("UPDATE paper_watches SET status='exit_blocked',reason='floor' WHERE mint=?", mint);
     } catch {
@@ -187,7 +190,7 @@ export class PaperEngine {
   signal(raw) {
     let prediction;
     this.paper.count('frames_processed');
-    try { prediction = this.project(raw, this.states, this.cfg, (...args) => this.lookups.resolve(...args)); }
+    try { prediction = this.project(raw, this.states, this.cfg, (...args) => this.lookups.resolve(...args), this.now()); }
     catch (error) { this.paper.rejection(error.code ?? 'unsupported', error.details, this.now()); return; }
     this.paper.count('projections_decoded');
     const { signature, slot, mint, state: projected } = prediction;
@@ -202,7 +205,11 @@ export class PaperEngine {
     if (slot > this.slot + 2) causes.push('slot_ahead');
     if (slotAgeMs > this.cfg.maxStateAgeMs) causes.push('slot_heartbeat_stale');
     if (reserveAgeMs > this.cfg.maxStateAgeMs) causes.push('reserve_stale');
-    if (row.slot >= slot) causes.push('already_applied');
+    const { base } = prediction;
+    const fallback = row.slot === slot && base?.model === 'isolated_prior_slot' &&
+      Number.isSafeInteger(base.slot) && base.slot < slot && base.slot >= slot - this.cfg.windowSlots + 1 &&
+      Number.isFinite(base.at) && base.at <= this.now() && this.now() - base.at <= this.cfg.maxStateAgeMs;
+    if (row.slot >= slot && !fallback) causes.push('already_applied');
     if (causes.length) {
       for (const cause of causes) this.paper.count(`stale:${cause}`);
       this.paper.signal(signature, mint, 'stale_or_already_executed', JSON.stringify({
@@ -210,15 +217,16 @@ export class PaperEngine {
       }));
       return;
     }
+    if (fallback) this.paper.count('projection_prior_slot_fallback');
     const position = this.paper.position(mint);
     if (position) {
       if (watch.reason === 'floor' || watch.reason === 'graduated_no_amm_exit') return reject('mandatory_exit_pending');
-      this.requestExit(mint, projected, 'profit', {signature, slot});
+      this.requestExit(mint, projected, 'profit', {signature, slot, base});
       return reject('exit_prediction_checked');
     }
     if (watch.status !== 'watching' || !this.cfg.entriesEnabled || !this.paper.capacity().remaining) return reject('entries_disabled_or_cap');
     if (row.since > slot - this.cfg.windowSlots + 1) return reject('insufficient_five_slot_history');
-    const history = row.history.filter(h => h.slot >= slot - this.cfg.windowSlots + 1 && h.slot <= slot);
+    const history = row.history.filter(h => h.slot >= slot - this.cfg.windowSlots + 1 && (fallback ? h.slot < slot : h.slot <= slot));
     if (!history.length) return reject('no_observed_peak');
     const high = history.reduce((a, b) => higher(a.state, b.state) ? a : b).state;
     const mc = cap(projected);
@@ -226,6 +234,7 @@ export class PaperEngine {
     if (!meetsDrop(projected, high, this.cfg)) return reject('drop_below_threshold');
     try {
       const quote = entryQuote(projected, this.cfg);
+      if (base) quote.projectionBase = base;
       quote.reference = { slot: slot - this.cfg.windowSlots + 1, virtualSol: high.virtualSol.toString(), virtualTokens: high.virtualTokens.toString() };
       const id = this.paper.request(mint, 'buy', 'dump', quote, {signature, slot}, this.now());
       reject(id ? 'buy_pending' : 'entry_blocked');

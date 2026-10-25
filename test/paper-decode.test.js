@@ -12,7 +12,7 @@ const token = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 const spl = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const state = { virtualTokens: 1000000000000n, virtualSol: 1000000000n,
   realTokens: 900000000000n, realSol: 900000000n, supply: 1000000000000n, complete: false };
-const states = new Map([[mint, { state }]]);
+const states = new Map([[mint, { state, slot: 14, at: Date.now() }]]);
 const discriminators = {
   buy: [102,6,61,18,1,218,235,234], sell: [51,230,133,164,1,127,131,173],
   buy_v3: [7,5,29,196,245,23,101,80], sell_v3: [28,146,222,119,38,196,105,213],
@@ -55,11 +55,30 @@ test('direct legacy/v3 exact-token buys and sells project isolated BigInt reserv
     }
   }
 });
+test('same-slot projection uses only the latest prior-slot observation without mutating reserves',()=>{
+  const now=100000,raw=frame([instruction('sell')]);
+  const current={...state,virtualSol:2000000000n};
+  const history=[{state:{...state,virtualSol:500000000n},slot:13,at:now-200},
+    {state,slot:14,at:now-100},{state:current,slot:15,at:now}];
+  const rows=new Map([[mint,{state:current,slot:15,at:now,history}]]);
+  const result=projectTransaction(raw,rows,cfg,undefined,now);
+  assert.deepEqual(result.state,sell(state,100000000000n,cfg.swapFeeBps).state);
+  assert.deepEqual(result.base,{slot:14,at:now-100,model:'isolated_prior_slot'});
+  assert.equal(rows.get(mint).state,current);assert.equal(history.length,3);
+  assert.deepEqual(projectTransaction(raw,rows,cfg,undefined,now),result);
+  for(const samples of [[],[{state,slot:10,at:now}],[{state,slot:14,at:now-5001}],
+    [{state,slot:14,at:now+1}],[{state,slot:15,at:now}]]) {
+    rows.get(mint).history=samples;
+    assert.throws(()=>projectTransaction(raw,rows,cfg,undefined,now),/no_fresh_prior_slot_reserves/);
+  }
+  rows.get(mint).slot=16;rows.get(mint).history=history;
+  assert.throws(()=>projectTransaction(raw,rows,cfg,undefined,now),/reserve_after_signal/);
+});
 test('instruction slippage limits, zero amounts and real-liquidity shortages are rejected', () => {
   assert.throws(() => project(instruction('buy', (_, data) => data.writeBigUInt64LE(1n, 16))), /modeled_instruction_slippage/);
   assert.throws(() => project(instruction('sell', (_, data) => data.writeBigUInt64LE(999999999n, 16))), /modeled_instruction_slippage/);
   assert.throws(() => project(instruction('sell', (_, data) => data.writeBigUInt64LE(0n, 8))), /reserve_or_amount_limit/);
-  const thin = new Map([[mint, { state: { ...state, realSol: 1n } }]]);
+  const thin = new Map([[mint, { slot: 14, at: Date.now(), state: { ...state, realSol: 1n } }]]);
   assert.throws(() => projectTransaction(frame([instruction()]), thin, cfg), /reserve_or_amount_limit/);
 });
 test('unknown variants, partial fills, malformed flags and account layouts fail closed', () => {
@@ -77,7 +96,7 @@ test('mint/curve pairing, program and native quote are validated', () => {
   assert.throws(() => project(instruction('sell', keys => { keys[9] = mint; })), /token_program/);
   assert.throws(() => project(instruction('sell_v3', keys => { keys[2] = mint; })), /non_sol_quote/);
   assert.throws(() => projectTransaction(frame([instruction()]), new Map(), cfg), /unwatched_mint/);
-  assert.throws(() => projectTransaction(frame([instruction('sell_v3')]), new Map([[mint, { state: { ...state, cashback: true } }]]), cfg), /v3_cashback/);
+  assert.throws(() => projectTransaction(frame([instruction('sell_v3')]), new Map([[mint, { slot: 14, at: Date.now(), state: { ...state, cashback: true } }]]), cfg), /v3_cashback/);
 });
 test('exact-input legacy/v3 variants enforce output minimums and partial-fill rejection', () => {
   for (const [kind, disc] of [['buy',[56,252,116,8,158,223,205,95]],['buy_v3',[225,247,80,30,213,179,132,136]]]) {
