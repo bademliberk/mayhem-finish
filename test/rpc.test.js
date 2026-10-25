@@ -4,11 +4,70 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { Rpc, MAX_RPC_QUEUE } from '../src/rpc.js';
 
 const response = result => ({ ok: true, status: 200, json: async () => ({ result }) });
-const setup = () => {
+const setup = (options = {}) => {
   const usage = [];
-  const rpc = new Rpc({ key: 'test', rpcInterval: 0 }, { usage: (...args) => usage.push(args) });
+  const rpc = new Rpc({ key: 'test', rpcInterval: 0, ...options }, { usage: (...args) => usage.push(args) });
   return { rpc, usage };
 };
+test('uncooperative fetch and body cannot block later work after the default deadline', async t => {
+  for (const phase of ['fetch', 'body']) {
+    const {rpc}=setup({requestTimeoutMs:30});let late,calls=0;
+    t.mock.method(globalThis,'fetch',()=>{
+      if (++calls>1) return Promise.resolve(response(9));
+      const blocked=new Promise((resolve,reject)=>{late=()=>reject(new Error('secret URL'));});
+      return phase==='fetch'?blocked:Promise.resolve({ok:true,status:200,json:()=>blocked});
+    });
+    await assert.rejects(rpc.transaction('first'),/deadline reached/);
+    assert.equal(await rpc.transaction('next'),9);
+    late();await sleep(5);assert.equal(calls,2);
+    t.mock.restoreAll();
+  }
+});
+test('caller cancellation releases a transport that ignores abort', async t => {
+  const {rpc}=setup();let calls=0,late;
+  t.mock.method(globalThis,'fetch',()=>++calls===1?new Promise(resolve=>{late=resolve;}):Promise.resolve(response(8)));
+  const controller=new AbortController();
+  const first=rpc.accounts(['first'],{signal:controller.signal});
+  const rejected=assert.rejects(first,/canceled/);controller.abort();await rejected;
+  assert.equal(await rpc.accounts(['next']),8);
+  late(response(1));await sleep(5);assert.equal(calls,2);
+});
+test('earlier caller deadline wins and stalled error-body cancellation is best effort', async t => {
+  const {rpc}=setup({requestTimeoutMs:1000});
+  t.mock.method(globalThis,'fetch',()=>new Promise(()=>{}));
+  await assert.rejects(rpc.accounts(['first'],{deadlineMs:Date.now()+20}),/deadline reached/);
+  t.mock.method(globalThis,'fetch',async()=>({ok:false,status:403,body:{cancel:()=>new Promise(()=>{})}}));
+  await assert.rejects(rpc.transaction('error'),/HTTP 403/);
+  t.mock.method(globalThis,'fetch',async()=>response(7));
+  assert.equal(await rpc.transaction('next'),7);
+});
+test('attempt timeout covers an uncooperative body and leaves retry sleep cancelable', async t => {
+  const {rpc,usage}=setup({attemptTimeoutMs:10,requestTimeoutMs:40});
+  t.mock.method(globalThis,'fetch',async()=>({ok:true,status:200,json:()=>new Promise(()=>{})}));
+  await assert.rejects(rpc.transaction('body'),/deadline reached/);
+  assert.ok(usage.some(u=>u[1]==='attempt_timeout'));
+  t.mock.method(globalThis,'fetch',async()=>response(6));
+  assert.equal(await rpc.transaction('next'),6);
+});
+test('stop rejects active and queued work without awaiting an uncooperative transport',async t=>{
+  const {rpc}=setup();t.mock.method(globalThis,'fetch',()=>new Promise(()=>{}));
+  const jobs=[rpc.transaction('active'),rpc.transaction('queued')];
+  const rejected=Promise.all(jobs.map(job=>assert.rejects(job,/RPC stopped/)));
+  rpc.stop();await rejected;await sleep(5);
+  assert.equal(rpc.running,false);assert.equal(rpc.queue.length,0);
+  await assert.rejects(rpc.transaction('later'),/RPC stopped/);
+});
+
+test('queued discovery requests receive the same finite default deadline',async t=>{
+  const {rpc}=setup({requestTimeoutMs:25});
+  t.mock.method(globalThis,'fetch',()=>new Promise(()=>{}));
+  const first=rpc.transaction('first'),queued=rpc.signatures('address');
+  await Promise.all([assert.rejects(first,/deadline reached/),assert.rejects(queued,/deadline reached/)]);
+  assert.equal(rpc.queue.length,0);
+  t.mock.method(globalThis,'fetch',async()=>response(5));
+  assert.equal(await rpc.transaction('next'),5);
+});
+
 test('queue is bounded and canceled waiting requests free capacity without RPC usage', async t => {
   const { rpc, usage } = setup();let release;
   t.mock.method(globalThis, 'fetch', async () => new Promise(resolve => { release = () => resolve(response(1)); }));

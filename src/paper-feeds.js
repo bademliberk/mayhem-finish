@@ -95,7 +95,7 @@ export class PaperFeeds {
   remove(mint) {
     const watch = this.watches.get(mint);
     if (!watch) return;
-    watch.baseline?.abort();
+    this.cancelBaseline(watch);
     this.watches.delete(mint);
     // A still-pending request stays in this.requests so a late acknowledgment is unsubscribed.
     if (watch.subscription != null) {
@@ -240,7 +240,7 @@ export class PaperFeeds {
     this.slotRequest = null; this.slotSubscription = null;
     // lastSlot resets so the baseline after resubscription is always delivered.
     for (const watch of this.watches.values()) {
-      watch.baseline?.abort();
+      this.cancelBaseline(watch);
       watch.request = null; watch.subscription = null; watch.lastSlot = -1;
     }
     this.ready = false;
@@ -304,6 +304,8 @@ export class PaperFeeds {
     const slot = result?.context?.slot;
     if (!Number.isSafeInteger(slot) || result.value === undefined) throw new Error('Malformed account notification');
     watch.lastSlot = Math.max(watch.lastSlot, slot);
+    // A live valid notification is a full account state: it satisfies the baseline and ends any request or retry.
+    this.cancelBaseline(watch);
     this.safe('onAccount', watch.mint, slot, result.value);
   }
   // ---- preprocessed stream: one candidate-only filtered connection, replaced make-before-break ----
@@ -431,12 +433,24 @@ export class PaperFeeds {
     pre.attempts++;
     pre.retry = this.setTimer(() => { pre.retry = null; this.reconcile(); }, delay);
   }
-  // One baseline fetch per account acknowledgment (never per notification).
-  snapshot(watch) {
-    watch.baseline?.abort();
+  // Aborts the in-flight baseline request and its retry timer and invalidates any late result.
+  cancelBaseline(watch) {
+    watch.baseline?.abort(); watch.baseline = null;
+    if (watch.baselineRetry != null) this.clearTimer(watch.baselineRetry);
+    watch.baselineRetry = null; watch.attempts = 0; watch.seq = (watch.seq ?? 0) + 1;
+  }
+  // Sanitized counters only (no error text, no URLs).
+  baselineUsage(method) {
+    try { this.store.usage('paper_baseline', method); } catch { /* store may already be closed */ }
+  }
+  // One baseline fetch per account acknowledgment (never per notification). A failed fetch retries this watch alone
+  // with bounded backoff, at most one request or retry timer at a time; it never drops the healthy socket.
+  snapshot(watch, attempts = 0) {
+    this.cancelBaseline(watch);
+    watch.attempts = attempts;
     const controller = new AbortController(); watch.baseline = controller;
     const link = this.standard;
-    const generation = link.generation, subscription = watch.subscription, seq = watch.seq = (watch.seq ?? 0) + 1;
+    const generation = link.generation, subscription = watch.subscription, seq = watch.seq;
     const current = () => !this.stopped && link.generation === generation && watch.seq === seq
       && this.watches.get(watch.mint) === watch && watch.subscription === subscription;
     const task = (async () => {
@@ -446,11 +460,23 @@ export class PaperFeeds {
         });
         const slot = result?.context?.slot;
         if (!Number.isSafeInteger(slot) || !Array.isArray(result.value)) throw new Error('Malformed snapshot');
-        if (!current() || slot <= watch.lastSlot) return; // stale generation, or a newer notification already won
-        watch.lastSlot = slot;
-        this.safe('onAccount', watch.mint, slot, result.value[0] ?? null);
+        if (!current() || controller.signal.aborted) return; // stale generation, or cancelled by a newer state
+        if (slot > watch.lastSlot) {
+          watch.lastSlot = slot;
+          this.safe('onAccount', watch.mint, slot, result.value[0] ?? null);
+        }
+        watch.attempts = 0;
       } catch {
-        if (current() && !controller.signal.aborted) this.fail(link, 'snapshot_failed');
+        if (!current() || controller.signal.aborted) return;
+        this.baselineUsage('failed');
+        const retries = watch.attempts;
+        const delay = Math.min(RETRY_MAX_MS, RETRY_MIN_MS * 2 ** retries);
+        const timer = this.setTimer(() => {
+          if (watch.baselineRetry !== timer) return; // superseded or cancelled
+          watch.baselineRetry = null;
+          if (current()) this.snapshot(watch, retries + 1);
+        }, delay);
+        watch.baselineRetry = timer;
       } finally {
         if (watch.baseline === controller) watch.baseline = null;
       }

@@ -8,6 +8,7 @@ import { decodeCurve, classify } from './chain.js';
 import { report } from './report.js';
 import { checkLoop } from './worker.js';
 import { Recovery } from './recovery.js';
+import { startHousekeeping } from './housekeeping.js';
 import { CandidateTracker } from './tracker.js';
 import { PaperEngine } from './paper-engine.js';
 import { paperConfig, PaperStore } from './paper-store.js';
@@ -57,14 +58,14 @@ async function start(rpc) {
   } else tracker.recover();
   const collector = new Collector(store, rpc, cfg, mint => tracker.add(mint));
   let stopping = false;
-  let lastConnected = lastHeartbeat;
+  const lastConnected = { value: lastHeartbeat };
   const recovery = new Recovery({ store, collector, programs: [MINT_AUTHORITY], retrySeconds: cfg.backfillSeconds });
   // onReady fires on first connect and every reconnect; recovery derives the cutoff from the
   // actual disconnect (websocket_gap start) / last connected time, never from a prior recovery.
-  const stream = new Stream(store, rpc, () => recovery.reconnected(lastConnected));
+  const stream = new Stream(store, rpc, () => recovery.reconnected(lastConnected.value));
   recovery.begin({ lastHeartbeat, now });
   let trackerStopped;
-  const stop = () => { stopping = true; stream.stop(); trackerStopped ??= tracker.stop(); };
+  const stop = () => { stopping = true; stream.stop(); trackerStopped ??= tracker.stop(); rpc.stop(); };
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
   stream.start();
   console.log(JSON.stringify({ event: 'started', database: cfg.db, firstCheckSeconds: cfg.firstCheck,
@@ -79,28 +80,32 @@ async function start(rpc) {
     workerError = error;
     stop();
   });
+  let housekeepingError;
+  const stopHousekeeping = startHousekeeping({ store, session, stream, tracker, recovery,
+    paperMode: cfg.paperMode, lastConnected, onError: error => { housekeepingError = error; stop(); } });
   try {
     while (!stopping) {
       const tick = nowSeconds();
-      store.run("INSERT INTO metadata VALUES('heartbeat',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", String(tick));
-      store.run('UPDATE coverage SET ended_at=? WHERE id=?', tick, session);
-      stream.flushUsage();
-      if (cfg.paperMode) tracker.feeds.flushUsage();
-      else tracker.flushUsage();
-      if (stream.subscriptions.size === 1 && stream.socket?.readyState === 1) lastConnected = tick;
-      else recovery.disconnected(lastConnected, tick);
+      store.run("INSERT INTO metadata VALUES('discovery_started_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", String(tick));
       await recovery.run(tick);
-      await collector.drain();
+      if (!stopping) await collector.drain();
+      if (!stopping) store.run("INSERT INTO metadata VALUES('discovery_completed_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", String(nowSeconds()));
       if (!stopping) await sleep(1000);
     }
   } finally {
     stop();
-    await worker;
-    await paperWorker;
-    await trackerStopped;
+    try { stopHousekeeping(); }
+    finally {
+      await worker;
+      await paperWorker;
+      await trackerStopped;
+    }
+    stream.flushUsage();
+    if (cfg.paperMode) tracker.feeds.flushUsage(); else tracker.flushUsage();
     store.run('UPDATE coverage SET ended_at=? WHERE id=?', nowSeconds(), session);
     process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
   }
+  if (housekeepingError) throw housekeepingError;
   if (workerError) throw workerError;
   if (paperError) throw paperError;
 }

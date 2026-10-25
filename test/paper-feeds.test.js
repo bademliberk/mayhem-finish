@@ -393,17 +393,174 @@ test('stale snapshot from an old connection generation is discarded', async () =
   await t.feeds.stop();
 });
 
-test('snapshot failure is a gap that reconnects without leaking the error', async () => {
+test('snapshot failure retries that watch only, without gap, reconnect or leaking the error', async () => {
   const logged = [];
   const original = console.error; console.error = (...args) => logged.push(args.join(' '));
   try {
     const t = setup({ watches: [['m1', CURVE]], accounts: async () => { throw new Error(`boom ${STD}`); } });
     const [a] = await t.bringUp();
-    assert.deepEqual(t.of('gap').map(e => e[1]), ['snapshot_failed']);
-    assert.equal(a.readyState, 3);
-    assert.ok(!JSON.stringify(t.events).includes(KEY) && !logged.join().includes(KEY));
+    assert.deepEqual(t.of('gap'), []);
+    assert.equal(a.readyState, 1);
+    assert.equal(t.std().length, 1);
+    assert.equal(t.feeds.isReady(), true);
+    assert.deepEqual(t.usage.filter(u => u[0] === 'paper_baseline'), [['paper_baseline', 'failed', 1]]);
+    assert.ok(!JSON.stringify([t.events, t.usage]).includes(KEY) && !logged.join().includes(KEY));
     await t.feeds.stop();
   } finally { console.error = original; }
+});
+
+const retryTimer = (t, mint = 'm1') => t.timers.get(t.feeds.watches.get(mint).baselineRetry);
+
+test('baseline retry uses bounded per-watch backoff and recovers on success', async () => {
+  let calls = 0;
+  const t = setup({ accounts: async () => {
+    if (++calls <= 6) throw new Error('rpc down');
+    return { context: { slot: 77 }, value: [{ lamports: 7 }] };
+  } });
+  const [a] = await t.bringUp();
+  const watch = t.feeds.watches.get('m1');
+  for (let i = 0; i < 6; i++) {
+    assert.equal(t.rpcCalls.length, i + 1);
+    assert.ok(retryTimer(t)); // exactly one retry timer, no request in flight
+    assert.equal(watch.baseline, null);
+    t.advance(15000); await settle();
+  }
+  assert.equal(t.rpcCalls.length, 7);
+  assert.deepEqual(t.of('account'), [['account', 'm1', 77, { lamports: 7 }]]);
+  assert.equal(watch.baselineRetry, null); assert.equal(watch.baseline, null); assert.equal(watch.attempts, 0);
+  assert.deepEqual(t.of('gap'), []); assert.equal(t.std().length, 1); assert.equal(a.readyState, 1);
+  await t.feeds.stop();
+});
+
+test('baseline retry delay doubles up to the cap', async () => {
+  const t = setup({ accounts: async () => { throw new Error('rpc down'); } });
+  await t.bringUp();
+  const expected = [1000, 2000, 4000, 8000, 15000, 15000];
+  for (let i = 0; i < expected.length; i++) {
+    const timer = retryTimer(t);
+    assert.ok(timer, `retry ${i} armed`);
+    assert.equal(t.rpcCalls.length, i + 1);
+    t.advance(expected[i] - 1); await settle();
+    assert.equal(t.rpcCalls.length, i + 1); // not early
+    t.advance(1); await settle();
+    assert.equal(t.rpcCalls.length, i + 2);
+  }
+  assert.deepEqual(t.of('gap'), []);
+  await t.feeds.stop();
+});
+
+test('baseline failures are isolated per watch', async () => {
+  const t = setup({
+    watches: [['m1', CURVE], ['m2', C2]],
+    accounts: async addresses => {
+      if (addresses[0] === CURVE) throw new Error('rpc down');
+      return { context: { slot: 12 }, value: [{ ok: true }] };
+    },
+  });
+  const [a] = await t.bringUp({ account: false });
+  a.ack('accountSubscribe', 21, 0); a.ack('accountSubscribe', 22, 1); await settle();
+  assert.ok(retryTimer(t, 'm1')); assert.equal(retryTimer(t, 'm2'), undefined);
+  assert.deepEqual(t.of('account'), [['account', 'm2', 12, { ok: true }]]);
+  assert.equal(a.readyState, 1); assert.deepEqual(t.of('gap'), []);
+  await t.feeds.stop();
+});
+
+test('a live valid notification satisfies the baseline and cancels the retry timer', async () => {
+  const t = setup({ accounts: async () => { throw new Error('rpc down'); } });
+  const [a] = await t.bringUp();
+  const watch = t.feeds.watches.get('m1');
+  assert.ok(retryTimer(t));
+  a.text({ method: 'accountNotification', params: { subscription: 21, result: { context: { slot: 90 }, value: { live: 1 } } } });
+  assert.equal(watch.baselineRetry, null); assert.equal(watch.attempts, 0);
+  t.advance(60000); await settle();
+  assert.equal(t.rpcCalls.length, 1); // never retried
+  assert.deepEqual(t.of('account'), [['account', 'm1', 90, { live: 1 }]]);
+  assert.deepEqual(t.of('gap'), []);
+  await t.feeds.stop();
+});
+
+test('a live valid notification aborts the in-flight baseline request and discards its late result', async () => {
+  let signal, release;
+  const t = setup({ accounts: (addresses, options) => new Promise(resolve => { signal = options.signal; release = resolve; }) });
+  const [a] = await t.bringUp();
+  assert.equal(signal.aborted, false);
+  a.text({ method: 'accountNotification', params: { subscription: 21, result: { context: { slot: 40 }, value: { live: 1 } } } });
+  assert.equal(signal.aborted, true);
+  release({ context: { slot: 500 }, value: [{ late: true }] }); await settle();
+  assert.deepEqual(t.of('account'), [['account', 'm1', 40, { live: 1 }]]);
+  assert.equal(t.feeds.watches.get('m1').baselineRetry, null);
+  assert.equal(t.feeds.tasks.size, 0);
+  await t.feeds.stop();
+});
+
+test('baseline retry timer is cancelled on remove, standard drop, resync and stop', async () => {
+  // remove
+  let t = setup({ accounts: async () => { throw new Error('rpc down'); } });
+  await t.bringUp();
+  let id = t.feeds.watches.get('m1').baselineRetry;
+  assert.ok(t.timers.has(id));
+  t.feeds.remove('m1');
+  assert.equal(t.timers.has(id), false);
+  t.advance(60000); await settle();
+  assert.equal(t.rpcCalls.length, 1);
+  await t.feeds.stop();
+
+  // standard socket drop: retry cancelled, fresh baseline only after resubscription
+  t = setup({ accounts: async () => { throw new Error('rpc down'); } });
+  const [a] = await t.bringUp();
+  id = t.feeds.watches.get('m1').baselineRetry;
+  a.terminate();
+  assert.equal(t.timers.has(id), false);
+  assert.equal(t.feeds.watches.get('m1').baselineRetry, null);
+  assert.equal(t.rpcCalls.length, 1);
+  await t.feeds.stop();
+
+  // resync
+  t = setup({ accounts: async () => { throw new Error('rpc down'); } });
+  await t.bringUp();
+  id = t.feeds.watches.get('m1').baselineRetry;
+  t.feeds.resync();
+  assert.equal(t.timers.has(id), false);
+  assert.equal(t.rpcCalls.length, 1);
+  await t.feeds.stop();
+
+  // stop
+  t = setup({ accounts: async () => { throw new Error('rpc down'); } });
+  const watch = t.feeds.watches.get('m1');
+  await t.bringUp();
+  id = watch.baselineRetry;
+  assert.ok(t.timers.has(id));
+  await t.feeds.stop();
+  assert.equal(t.timers.has(id), false);
+  assert.equal(t.timers.size, 0);
+});
+
+test('a stale retry timer after a reconnect never fires an old-generation request', async () => {
+  const t = setup({ accounts: async () => { throw new Error('rpc down'); } });
+  const [a] = await t.bringUp();
+  const watch = t.feeds.watches.get('m1');
+  const stale = retryTimer(t).fn; // simulate a timer that already left the queue
+  a.terminate();
+  t.advance(1000);
+  const a2 = t.std()[1]; a2.open(); a2.ack('slotSubscribe', 10); a2.ack('accountSubscribe', 22); await settle();
+  assert.equal(t.rpcCalls.length, 2);
+  stale(); await settle();
+  assert.equal(t.rpcCalls.length, 2); // generation/seq checks reject it
+  assert.ok(watch.baselineRetry); // only the new generation's single timer remains
+  await t.feeds.stop();
+});
+
+test('at most one baseline request or retry timer per watch under repeated snapshots', async () => {
+  const t = setup({ accounts: async () => { throw new Error('rpc down'); } });
+  await t.bringUp();
+  const watch = t.feeds.watches.get('m1');
+  const before = t.timers.size;
+  for (let i = 0; i < 5; i++) { t.feeds.snapshot(watch); await settle(); }
+  assert.ok(retryTimer(t));
+  assert.equal(watch.baseline, null);
+  assert.equal(t.timers.size, before); // each snapshot replaced the previous retry timer
+  assert.equal(t.rpcCalls.length, 6);
+  await t.feeds.stop();
 });
 
 test('remove before ack: late acknowledgment is unsubscribed and never baselined', async () => {
