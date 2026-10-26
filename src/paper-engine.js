@@ -1,3 +1,4 @@
+import { PUMP } from './config.js';
 import { LookupCache } from './paper-lookups.js';
 import { PaperStore } from './paper-store.js';
 import { reserves, cap, entryQuote, exitQuote, profitable, meetsDrop, higher } from './paper-math.js';
@@ -96,22 +97,42 @@ export class PaperEngine {
       }
     }
   }
+  invalidateAccount(mint, slot, account, code) {
+    this.states.delete(mint);
+    this.coverageSlots.set(mint, Math.max(slot, this.slot) || Infinity);
+    for (const order of this.paper.pending().filter(order => order.mint === mint)) {
+      this.paper.cancel(order.id, this.now(), 'invalid_account');
+    }
+    this.store.run('UPDATE paper_watches SET last_slot=?,account_error=? WHERE mint=?', slot, code, mint);
+    this.paper.count('invalid_account');
+    this.paper.accountFault(mint, slot, account, code, this.now());
+  }
   onAccount(mint, slot, account) {
     if (this.stopped || !Number.isSafeInteger(slot) || slot < 0) return;
     const watch = this.paper.watch(mint);
     if (!watch || !['watching', 'holding', 'exit_blocked'].includes(watch.status)) return;
+    const old = this.states.get(mint);
+    if (slot < (old?.slot ?? watch.last_slot ?? -1)) {
+      this.paper.count('out_of_order_account'); return;
+    }
+    let state, code;
+    if (!account) code = 'missing_account';
+    else if (account.owner !== PUMP) code = 'wrong_owner';
+    else if (!Array.isArray(account.data) || account.data[1] !== 'base64' || typeof account.data[0] !== 'string' ||
+        !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(account.data[0])) code = 'invalid_data';
+    else {
+      try { state = reserves(account); }
+      catch (error) { code = error.message === 'not_mayhem' ? 'not_mayhem' : 'invalid_curve'; }
+    }
+    if (code) { this.invalidateAccount(mint, slot, account, code); return; }
     try {
-      const state = reserves(account), old = this.states.get(mint);
-      if (old && slot < old.slot) {
-        this.paper.count('out_of_order_account'); return;
-      }
       const row = { state, slot, at: this.now(), since: old?.since ?? Math.max(slot, this.coverageSlots.get(mint) ?? slot), history: old?.history ?? [] };
       row.history = row.history.filter(item => item.slot >= slot - this.cfg.windowSlots + 1);
       if (!state.complete) row.history.push({ state, slot, at: row.at });
       // Several writes in one slot have no transaction index; retain their observed peak only.
       if (row.history.length > 1000) { this.paper.count('history_overflow'); row.history = []; row.since = slot; }
       this.states.set(mint, row);
-      this.store.run('UPDATE paper_watches SET last_slot=?,last_cap=? WHERE mint=?', slot, state.complete ? null : cap(state), mint);
+      this.store.run('UPDATE paper_watches SET last_slot=?,last_cap=?,account_error=NULL,last_observed_ms=? WHERE mint=?', slot, state.complete ? null : cap(state), this.now(), mint);
       const fingerprint = account.data[0];
       const changed = fingerprint !== watch.fingerprint;
       if (changed) this.store.run('UPDATE paper_watches SET fingerprint=?,last_change_ms=? WHERE mint=?', fingerprint, this.now(), mint);
@@ -137,9 +158,7 @@ export class PaperEngine {
         this.requestExit(mint, state, 'floor', null);
       }
     } catch {
-      this.paper.count('invalid_account');
-      this.gap('invalid_account');
-      this.feeds.resync?.();
+      this.invalidateAccount(mint, slot, account, 'processing_error');
     }
   }
   requestExit(mint, state, reason, signal) {

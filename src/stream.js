@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 import { MINT_AUTHORITY, MAYHEM } from './config.js';
-import { decodeLogs } from './chain.js';
+import { decodeLogs, recoverableCreations } from './chain.js';
 import { nowSeconds } from './collector.js';
 
 export const discoveryParams = () => [
@@ -19,6 +19,13 @@ export function discoveryEvents(result) {
   const events = decodeLogs(meta.logMessages).map(event => ({ ...event, slot: result.slot }));
   // Address filters narrow discovery, but the event flag is still authoritative.
   return events.some(event => event.type === 'create') ? events : [];
+}
+
+// Separate from discoveryEvents (which still throws on truncation): proven creations
+// that precede the first truncation marker. Empty when nothing is provable.
+export function discoveryRecovery(result) {
+  if (!result || typeof result.signature !== 'string' || !Number.isSafeInteger(result.slot)) return [];
+  return recoverableCreations({ slot: result.slot, meta: result.transaction?.meta });
 }
 
 export class Stream {
@@ -54,6 +61,11 @@ export class Stream {
           const events = discoveryEvents(notification);
           if (events.length) this.store.apply(notification.signature, notification.slot, events);
         } catch {
+          const partial = discoveryRecovery(notification);
+          if (partial.length) {
+            this.store.quarantinePartial(notification.signature, notification.slot, nowSeconds(), partial);
+            return;
+          }
           if (typeof notification?.signature !== 'string' || !Number.isSafeInteger(notification.slot)) throw new Error('Missing discovery identity');
           this.store.enqueue(notification.signature, notification.slot, nowSeconds());
         }

@@ -23,6 +23,19 @@ class Reader {
   string() { return this.take(this.take(4).readUInt32LE()).toString('utf8'); }
 }
 
+// Decode one Pump creation event; null for legacy or non-Mayhem creations. Throws if truncated.
+function createEvent(data, index) {
+  const r = new Reader(data);
+  const name = r.string(), symbol = r.string(); r.string();
+  const mint = r.key(), curve = r.key(); r.key(); r.key();
+  const timestamp = r.i64();
+  r.take(32); // Four u64 reserve/supply fields.
+  // Legacy creation events have no token_program / Mayhem extension.
+  if (data.length === r.offset) return null;
+  r.key();
+  return r.bool() ? { type: 'create', index, mint, curve, timestamp, name, symbol } : null;
+}
+
 // Attribute events by invocation ancestry, not by transaction-wide program presence.
 export function decodeLogs(logs) {
   const stack = [];
@@ -42,18 +55,11 @@ export function decodeLogs(logs) {
     }
     if (!line.startsWith('Program data: ') || stack.at(-1) !== PUMP) continue;
     const data = Buffer.from(line.slice(14), 'base64');
-    const r = new Reader(data);
     if (data.subarray(0, 8).equals(CREATE)) {
-      const name = r.string(), symbol = r.string(); r.string();
-      const mint = r.key(), curve = r.key(); r.key(); r.key();
-      const timestamp = r.i64();
-      r.take(32); // Four u64 reserve/supply fields.
-      // Legacy creation events have no token_program / Mayhem extension.
-      if (data.length === r.offset) continue;
-      r.key();
-      const mayhem = r.bool();
-      if (mayhem) events.push({ type: 'create', index, mint, curve, timestamp, name, symbol });
+      const created = createEvent(data, index);
+      if (created) events.push(created);
     } else if (data.subarray(0, 8).equals(TRADE) && stack.includes(MAYHEM)) {
+      const r = new Reader(data);
       const mint = r.key();
       const solAmount = r.u64().toString(), tokenAmount = r.u64().toString();
       const buy = r.bool(), user = r.key(), timestamp = r.i64();
@@ -62,6 +68,60 @@ export function decodeLogs(logs) {
     }
   }
   return events;
+}
+
+const TRUNCATION_MARKER = 'Log truncated';
+
+// Conservative decode of the log prefix before the first truncation marker. A creation is
+// returned only when the Pump invocation that emitted it and EVERY ancestor invocation closed
+// with success before the marker. Open or failed scopes discard their pending events;
+// malformed nesting rejects the whole prefix. Trades are never recovered from partial logs.
+// Returns { ok, events, reason }; reason is set when ok is false.
+export function decodeCreationsBeforeTruncation(logs) {
+  const reject = reason => ({ ok: false, events: [], reason });
+  if (!Array.isArray(logs)) return reject('missing_logs');
+  const marker = logs.findIndex(line => typeof line === 'string' && line.includes(TRUNCATION_MARKER));
+  if (marker < 0) return reject('no_truncation_marker');
+  const frames = [];
+  const proven = [];
+  for (let index = 0; index < marker; index++) {
+    const line = logs[index];
+    if (typeof line !== 'string') return reject('malformed_scope');
+    const invoke = /^Program (\w+) invoke \[(\d+)\]$/.exec(line);
+    if (invoke) {
+      if (Number(invoke[2]) !== frames.length + 1) return reject('malformed_scope');
+      frames.push({ program: invoke[1], events: [] });
+      continue;
+    }
+    const close = /^Program (\w+) (success|failed: .*)$/.exec(line);
+    if (close) {
+      const frame = frames.pop();
+      if (!frame || frame.program !== close[1]) return reject('malformed_scope');
+      // A failed invocation discards its own and its descendants' pending events.
+      if (close[2] !== 'success') continue;
+      (frames.length ? frames.at(-1).events : proven).push(...frame.events);
+      continue;
+    }
+    if (/^Program \S+ (?:invoke\b|success\b|failed:)/.test(line)) return reject('malformed_scope');
+    if (!line.startsWith('Program data: ') || frames.at(-1)?.program !== PUMP) continue;
+    const encoded = line.slice(14);
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) return reject('malformed_event');
+    const data = Buffer.from(encoded, 'base64');
+    if (data.length < 8 || !data.subarray(0, 8).equals(CREATE)) continue;
+    try {
+      const created = createEvent(data, index);
+      if (created) frames.at(-1).events.push(created);
+    } catch { return reject('malformed_event'); }
+  }
+  // Frames still open at the marker are never proven.
+  return { ok: true, events: proven, reason: null };
+}
+
+// Proven pre-truncation creations of a truncated, successful transaction (empty otherwise).
+export function recoverableCreations(tx) {
+  const meta = tx?.meta;
+  if (!meta || meta.err !== null || !Number.isSafeInteger(tx.slot)) return [];
+  return decodeCreationsBeforeTruncation(meta.logMessages).events.map(event => ({ ...event, slot: tx.slot }));
 }
 
 export function transactionEvents(tx) {

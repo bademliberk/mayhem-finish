@@ -68,6 +68,11 @@ export class Store {
         signature TEXT PRIMARY KEY, slot INTEGER NOT NULL, queued_at INTEGER NOT NULL,
         attempts INTEGER NOT NULL, reason TEXT NOT NULL, quarantined_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS partial_creations (
+        signature TEXT NOT NULL, event_index INTEGER NOT NULL, mint TEXT NOT NULL, slot INTEGER NOT NULL,
+        recovered_at INTEGER NOT NULL, new_mint INTEGER NOT NULL, resolved_at INTEGER,
+        PRIMARY KEY(signature,event_index)
+      );
       CREATE TABLE IF NOT EXISTS graduations (
         mint TEXT PRIMARY KEY REFERENCES mints(mint), detected_at INTEGER NOT NULL,
         slot INTEGER NOT NULL, state_base64 TEXT, curve_base64 TEXT NOT NULL
@@ -185,8 +190,37 @@ export class Store {
       }
       this.run('DELETE FROM queue WHERE signature=?', signature);
       this.run('DELETE FROM quarantined_transactions WHERE signature=?', signature);
+      this.run('UPDATE partial_creations SET resolved_at=unixepoch() WHERE signature=? AND resolved_at IS NULL', signature);
     });
     this.onDiscovery?.();
+  }
+  // Atomically enroll proven pre-truncation creations and quarantine the signature. The
+  // signature is NOT marked processed, so a complete replay still applies every event, dedups
+  // the mints and clears the quarantine. Creations only; never trades.
+  quarantinePartial(signature, slot, now, events, reason = 'Transaction logs truncated; history remains incomplete') {
+    let fresh = 0;
+    const recovered = this.atomic(() => {
+      if (this.get('SELECT 1 FROM processed WHERE signature=?', signature)) return false;
+      for (const event of events) {
+        if (event.type !== 'create') continue;
+        const known = this.get('SELECT 1 FROM mints WHERE mint=?', event.mint);
+        this.addMint(event);
+        const isNew = known ? 0 : 1;
+        fresh += isNew;
+        this.run('INSERT OR IGNORE INTO partial_creations VALUES(?,?,?,?,?,?,NULL)',
+          signature, event.index, event.mint, slot, now, isNew);
+      }
+      const queued = this.get('SELECT * FROM queue WHERE signature=?', signature);
+      this.run('INSERT OR IGNORE INTO quarantined_transactions VALUES(?,?,?,?,?,?)',
+        signature, slot, queued?.queued_at ?? now, (queued?.attempts ?? 0) + 1, reason, now);
+      this.run('DELETE FROM queue WHERE signature=?', signature);
+      return true;
+    });
+    if (!recovered) return { recovered: false, newMints: 0 };
+    if (fresh) this.usage('recovery', 'partial_creations_new', fresh);
+    if (events.length > fresh) this.usage('recovery', 'partial_creations_duplicate', events.length - fresh);
+    if (fresh) this.onDiscovery?.();
+    return { recovered: true, newMints: fresh };
   }
   quarantine(signature, slot, now, reason) {
     this.atomic(() => {

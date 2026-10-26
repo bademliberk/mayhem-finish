@@ -1,3 +1,6 @@
+import { PUMP } from './config.js';
+import { reserves, exitQuote } from './paper-math.js';
+
 export function paperConfig(env = process.env) {
   const number = (name, fallback, min, max, integer = true) => {
     const value = Number(env[name] ?? fallback);
@@ -69,7 +72,7 @@ export class PaperStore {
       } finally { store.db.exec('PRAGMA foreign_keys=ON'); }
     }
     const columns = store.all('PRAGMA table_info(paper_watches)').map(row => row.name);
-    for (const [name, type] of [['fingerprint', 'TEXT'], ['last_change_ms', 'INTEGER'], ['preprocessed', 'INTEGER NOT NULL DEFAULT 0']]) {
+    for (const [name, type] of [['fingerprint', 'TEXT'], ['last_change_ms', 'INTEGER'], ['preprocessed', 'INTEGER NOT NULL DEFAULT 0'], ['account_error', 'TEXT'], ['last_observed_ms', 'INTEGER']]) {
       if (!columns.includes(name)) store.db.exec(`ALTER TABLE paper_watches ADD COLUMN ${name} ${type}`);
     }
   }
@@ -89,6 +92,19 @@ export class PaperStore {
       safe.method = details.method; safe.code = Number.isSafeInteger(details.code) ? details.code : null;
     }
     this.store.run('INSERT INTO paper_rejections(reason,at_ms,detail) VALUES(?,?,?)', reason, now, JSON.stringify(safe));
+    this.store.run('DELETE FROM paper_rejections WHERE id NOT IN (SELECT id FROM paper_rejections ORDER BY id DESC LIMIT 100)');
+  }
+  accountFault(mint, slot, account, code, now) {
+    const codes = ['missing_account','wrong_owner','invalid_data','invalid_curve','not_mayhem','processing_error'];
+    const safeCode = codes.includes(code) ? code : 'processing_error';
+    const data = account?.data;
+    const detail = { mint: /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint) ? mint : null,
+      slot: Number.isSafeInteger(slot) ? slot : null, code: safeCode,
+      present: account != null, ownerMatches: account?.owner === PUMP,
+      base64: Array.isArray(data) && data[1] === 'base64',
+      bytes: Array.isArray(data) && typeof data[0] === 'string' ? Buffer.byteLength(data[0], 'base64') : null };
+    this.count(`account:${safeCode}`);
+    this.store.run('INSERT INTO paper_rejections(reason,at_ms,detail) VALUES(?,?,?)', 'invalid_account', now, JSON.stringify(detail));
     this.store.run('DELETE FROM paper_rejections WHERE id NOT IN (SELECT id FROM paper_rejections ORDER BY id DESC LIMIT 100)');
   }
   capacity() {
@@ -168,16 +184,38 @@ export class PaperStore {
       }
     });
   }
-  report() {
+  positionHealth(position, now) {
+    const watch = this.watch(position.mint);
+    const health = { mint: position.mint, model: 'saved_curve_observation_not_live_quote',
+      lastObservedMs: watch?.last_observed_ms ?? null, lastChangeMs: watch?.last_change_ms ?? null,
+      observationAgeMs: watch?.last_observed_ms == null ? null : Math.max(0, now - watch.last_observed_ms),
+      unchangedMs: watch?.last_change_ms == null ? null : Math.max(0, now - watch.last_change_ms),
+      lastMarketCapSol: watch?.last_cap ?? null, accountError: watch?.account_error ?? null,
+      realSolLamports: null, fullExitSupported: null, modeledExitNetLamports: null, exitStatus: 'no_saved_state' };
+    if (watch?.account_error) { health.exitStatus = 'invalid_latest_account'; return health; }
+    if (!watch?.fingerprint) return health;
+    let state;
+    try { state = reserves({ owner: PUMP, data: [watch.fingerprint, 'base64'] }); }
+    catch { health.exitStatus = 'invalid_saved_state'; return health; }
+    health.realSolLamports = state.realSol.toString();
+    if (state.complete) { health.exitStatus = 'graduated'; health.fullExitSupported = false; return health; }
+    try {
+      health.modeledExitNetLamports = exitQuote(state, position, this.cfg).net;
+      health.fullExitSupported = true; health.exitStatus = 'modeled_exit_available';
+    } catch { health.fullExitSupported = false; health.exitStatus = 'insufficient_liquidity_or_invalid_amount'; }
+    return health;
+  }
+  report(now = Date.now()) {
     const positions = this.store.all('SELECT * FROM paper_positions ORDER BY opened_at_ms');
     return {
       mode: 'paper', assumptions: this.cfg, capacity: this.capacity(),
-      coverage: this.store.all(`SELECT mint,status,last_cap,last_change_ms,preprocessed FROM paper_watches
+      coverage: this.store.all(`SELECT mint,status,last_cap,last_change_ms,last_observed_ms,account_error,preprocessed FROM paper_watches
         WHERE status IN ('watching','holding','exit_blocked')`),
       realizedPnlLamports: positions.reduce((sum, row) => sum + BigInt(row.pnl_lamports ?? '0'), 0n).toString(),
       watches: this.store.all('SELECT status,COUNT(*) count FROM paper_watches GROUP BY status'),
       orders: this.store.all('SELECT side,status,COUNT(*) count FROM paper_orders GROUP BY side,status'),
       positions,
+      openPositionHealth: positions.filter(row => row.status === 'open').map(row => this.positionHealth(row, now)),
       recentOrders: this.store.all('SELECT * FROM paper_orders ORDER BY id DESC LIMIT 25'),
       recentSignals: this.store.all('SELECT * FROM paper_signals ORDER BY received_at_ms DESC LIMIT 25'),
       recentRejections: this.store.all('SELECT * FROM paper_rejections ORDER BY id DESC LIMIT 25'),

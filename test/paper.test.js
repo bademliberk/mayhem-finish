@@ -412,10 +412,103 @@ test('overflow invalidates entry state and does not grow queue without bound',()
   assert.equal(s.engine.queue.length,0);assert.equal(s.engine.ready,false);s.close();
 });
 
-test('invalid account resynchronization clears all history and cancels pending orders',()=>{
-  const s=setup();s.engine.signal(s.signal());s.engine.onAccount(mint,15,null);
-  assert.equal(s.engine.ready,false);assert.equal(s.engine.states.size,0);
-  assert.equal(s.engine.paper.pending().length,0);s.close();
+test('invalid account isolates its mint without resetting other watches or pending orders',()=>{
+  const s=setup();s.engine.signal(s.signal());
+  const second=new PublicKey(Buffer.alloc(32,2)).toBase58();candidate(s.store,second);s.engine.add(second);
+  s.engine.onAccount(second,11,account(1));s.engine.onAccount(second,14,account(1));
+  s.engine.signal({...s.signal('second'),mint:second});
+  const other=s.engine.states.get(second),epoch=s.engine.epoch;
+  s.engine.feeds.resync=()=>assert.fail('no global reconnect');
+  s.engine.onAccount(mint,15,null);
+  assert.equal(s.engine.ready,true);assert.equal(s.engine.states.has(mint),false);
+  assert.equal(s.engine.states.get(second),other);assert.equal(s.engine.epoch,epoch);
+  assert.equal(s.engine.paper.pending().length,1);assert.equal(s.engine.paper.pending()[0].mint,second);
+  assert.equal(s.engine.paper.watch(mint).account_error,'missing_account');
+  assert.equal(s.removed.length,0);
+  s.engine.onAccount(mint,16,account(1));
+  assert.equal(s.engine.paper.watch(mint).account_error,null);assert.equal(s.engine.states.get(mint).since,16);
+  s.engine.signal(s.signal('too-early',17));
+  assert.equal(s.store.get("SELECT outcome FROM paper_signals WHERE signature='too-early'").outcome,'insufficient_five_slot_history');
+  s.engine.onSlot(20);s.engine.onAccount(mint,19,account(1));
+  s.engine.signal(s.signal('recovered',20));
+  assert.equal(s.store.get("SELECT outcome FROM paper_signals WHERE signature='recovered'").outcome,'buy_pending');
+  s.close();
+});
+test('older malformed notifications are ignored and fault diagnostics cannot leak payloads',()=>{
+  const s=setup();const old=s.engine.states.get(mint);
+  s.engine.onAccount(mint,13,null);assert.equal(s.engine.states.get(mint),old);
+  for(const [value,code] of [[null,'missing_account'],[{owner:'secret-url',data:['secret-key','base64']},'wrong_owner'],
+    [{owner:PUMP,data:['secret-key','base64']},'invalid_data'],[{owner:PUMP,data:['AA==','base64']},'invalid_curve']]) {
+    s.engine.onAccount(mint,15,value);
+    assert.equal(s.engine.paper.watch(mint).account_error,code);
+  }
+  const rows=s.store.all('SELECT detail FROM paper_rejections');
+  assert.ok(!JSON.stringify(rows).includes('secret'));
+  assert.equal(JSON.parse(rows.at(-1).detail).bytes,1);
+  s.engine.onAccount(mint,14,account(1));assert.equal(s.engine.states.has(mint),false);
+  s.close();
+});
+test('non-Mayhem and invalid flag states fail closed with bounded account diagnostics',()=>{
+  const s=setup();
+  const nonMayhem=account();const bytes=Buffer.from(nonMayhem.data[0],'base64');bytes[81]=0;nonMayhem.data[0]=bytes.toString('base64');
+  s.engine.onAccount(mint,15,nonMayhem);assert.equal(s.engine.paper.watch(mint).account_error,'not_mayhem');
+  bytes[81]=2;nonMayhem.data[0]=bytes.toString('base64');
+  for(let i=0;i<105;i++)s.engine.onAccount(mint,16+i,nonMayhem);
+  assert.equal(s.engine.paper.watch(mint).account_error,'invalid_curve');
+  assert.equal(s.store.get('SELECT count(*) n FROM paper_rejections').n,100);
+  assert.equal(s.engine.states.has(mint),false);s.close();
+});
+test('invalid held curve preserves the position and desired exit coverage',async()=>{
+  const s=setup();s.engine.signal(s.signal());await s.engine.tick();
+  s.engine.onAccount(mint,16,null);
+  assert.ok(s.engine.paper.position(mint));assert.equal(s.engine.paper.watch(mint).preprocessed,1);
+  assert.equal(s.engine.paper.watch(mint).status,'holding');
+  assert.equal(s.engine.paper.report(100000).openPositionHealth[0].exitStatus,'invalid_latest_account');
+  s.engine.onAccount(mint,17,account(.09));
+  assert.equal(s.engine.paper.pending()[0].reason,'floor');s.close();
+});
+test('account-fault metadata survives restart without discarding valid position history',async()=>{
+  const s=setup();s.engine.signal(s.signal());await s.engine.tick();
+  s.engine.onAccount(mint,16,null);
+  const paper=new PaperStore(s.store,pc);
+  assert.equal(paper.watch(mint).account_error,'missing_account');
+  assert.equal(paper.watch(mint).last_observed_ms,100000);
+  assert.ok(paper.position(mint));assert.equal(paper.capacity().successfulBuys,1);
+  s.engine.start();assert.equal(s.added.at(-1)[2],true);
+  s.engine.onAccount(mint,17,account(.2));
+  assert.equal(paper.watch(mint).account_error,null);assert.ok(paper.position(mint));s.close();
+});
+test('saved position health reports illiquidity without a fabricated exit',async()=>{
+  const s=setup();s.engine.signal(s.signal());await s.engine.tick();
+  const before=s.engine.paper.report(100000).openPositionHealth[0];
+  assert.equal(before.fullExitSupported,true);assert.ok(BigInt(before.modeledExitNetLamports)>0n);
+  s.setNow(101000);s.engine.onAccount(mint,16,account(.2,.0003));
+  const health=s.engine.paper.report(111000).openPositionHealth[0];
+  assert.equal(health.realSolLamports,'300000');assert.equal(health.fullExitSupported,false);
+  assert.equal(health.unchangedMs,10000);assert.equal(health.observationAgeMs,10000);
+  assert.equal(health.modeledExitNetLamports,null);assert.ok(s.engine.paper.position(mint));
+  s.store.run('UPDATE paper_watches SET fingerprint=NULL WHERE mint=?',mint);
+  assert.equal(s.engine.paper.report().openPositionHealth[0].exitStatus,'no_saved_state');
+  s.store.run("UPDATE paper_watches SET fingerprint='AA==' WHERE mint=?",mint);
+  assert.equal(s.engine.paper.report().openPositionHealth[0].exitStatus,'invalid_saved_state');s.close();
+});
+test('an account fault during confirmation cancels the order before it can fill',async()=>{
+  const s=setup();s.engine.signal(s.signal());
+  let release;s.rpc.accounts=()=>new Promise(resolve=>{release=resolve;});
+  const order=s.engine.paper.pending()[0];const reconciling=s.engine.reconcile(order);
+  await Promise.resolve();s.engine.onAccount(mint,15,null);
+  release({context:{slot:15},value:[account()]});await reconciling;
+  assert.equal(s.engine.paper.position(mint),undefined);
+  assert.equal(s.store.get('SELECT error FROM paper_orders WHERE id=?',order.id).error,'invalid_account');s.close();
+});
+test('processing exceptions are labeled separately without exposing error text',()=>{
+  const s=setup();s.engine.membership(mint,false);
+  s.engine.feeds.setPreprocessed=()=>{throw new Error('secret-url');};
+  s.engine.onAccount(mint,15,account(.8));
+  assert.equal(s.engine.paper.watch(mint).account_error,'processing_error');
+  assert.equal(s.engine.states.has(mint),false);assert.equal(s.engine.ready,true);
+  assert.ok(!JSON.stringify(s.store.all('SELECT detail FROM paper_rejections')).includes('secret-url'));
+  s.close();
 });
 test('terminal watch removes cached reserve history',()=>{
   const s=setup();s.engine.onAccount(mint,15,account(0.1));

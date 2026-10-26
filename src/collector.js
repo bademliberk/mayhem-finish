@@ -1,4 +1,4 @@
-import { transactionEvents, decodeCurve, classify } from './chain.js';
+import { transactionEvents, recoverableCreations, decodeCurve, classify } from './chain.js';
 import { MAYHEM } from './config.js';
 
 export const nowSeconds = () => Math.floor(Date.now() / 1000);
@@ -19,7 +19,12 @@ export class Collector {
     try {
       this.store.apply(signature, tx.slot, transactionEvents(tx));
     } catch (error) {
-      if (error.code === 'TRUNCATED_LOGS') this.store.quarantine(signature, tx.slot, nowSeconds(), error.message);
+      if (error.code === 'TRUNCATED_LOGS') {
+        // Proven pre-truncation creations are stored with the quarantine; history stays incomplete.
+        const partial = recoverableCreations(tx);
+        if (partial.length) this.store.quarantinePartial(signature, tx.slot, nowSeconds(), partial, error.message);
+        else this.store.quarantine(signature, tx.slot, nowSeconds(), error.message);
+      }
       throw error;
     }
   }
