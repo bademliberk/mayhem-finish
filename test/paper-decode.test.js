@@ -70,6 +70,7 @@ test('same-slot projection uses only the latest prior-slot observation without m
     [{state,slot:14,at:now+1}],[{state,slot:15,at:now}]]) {
     rows.get(mint).history=samples;
     assert.throws(()=>projectTransaction(raw,rows,cfg,undefined,now),/no_fresh_prior_slot_reserves/);
+    assert.throws(()=>projectTransaction(raw,rows,paperConfig({},'window8'),undefined,now),/no_fresh_prior_slot_reserves/);
   }
   rows.get(mint).slot=16;rows.get(mint).history=history;
   assert.throws(()=>projectTransaction(raw,rows,cfg,undefined,now),/reserve_after_signal/);

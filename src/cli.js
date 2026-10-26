@@ -14,11 +14,16 @@ import { PaperEngine } from './paper-engine.js';
 import { paperConfig, PaperStore } from './paper-store.js';
 import { PaperFeeds } from './paper-feeds.js';
 import { projectTransaction } from './paper-decode.js';
+import { trialPath, bindTrial, preflightTrial } from './paper-profiles.js';
 
 const cfg = config();
 const command = process.argv[2] ?? 'start';
-cfg.paperMode = command === 'paper';
-const paperCfg = ['paper', 'paper-report'].includes(command) ? paperConfig() : null;
+const trial = command === 'paper-trial';
+const profile = trial ? process.argv[3] : null;
+if (trial) cfg.db = trialPath(profile, process.env.PAPER_TRIAL_DIR, cfg.db);
+cfg.paperMode = command === 'paper' || trial;
+const paperCfg = cfg.paperMode || command === 'paper-report' ? paperConfig(process.env, profile) : null;
+if (trial) preflightTrial(cfg.db, paperCfg);
 const store = new Store(cfg.db, cfg);
 
 async function inspect(rpc, mint) {
@@ -37,6 +42,10 @@ async function inspect(rpc, mint) {
 }
 
 async function start(rpc) {
+  if (trial) { new PaperStore(store, paperCfg); bindTrial(store, paperCfg); }
+  else if (store.get("SELECT 1 FROM metadata WHERE key='paper_trial_config'")) {
+    throw new Error('Trial database must be resumed with paper-trial and its original profile');
+  }
   const now = nowSeconds();
   store.run("INSERT OR IGNORE INTO metadata VALUES('monitoring_started_at',?)", String(now));
   const lastHeartbeat = Number(store.get("SELECT value FROM metadata WHERE key='heartbeat'")?.value ?? now);
@@ -113,9 +122,12 @@ async function start(rpc) {
 try {
   if (command === 'report') console.log(JSON.stringify(report(store), null, 2));
   else if (command === 'inspect') await inspect(new Rpc(cfg, store), process.argv[3]);
-  else if (command === 'paper-report') console.log(JSON.stringify(new PaperStore(store, paperCfg).report(), null, 2));
-  else if (command === 'start' || command === 'paper') await start(new Rpc(cfg, store));
-  else throw new Error('Commands: start, paper, paper-report, inspect <mint>, report');
+  else if (command === 'paper-report') {
+    const saved = store.get("SELECT value FROM metadata WHERE key='paper_trial_config'")?.value;
+    console.log(JSON.stringify(new PaperStore(store, saved ? JSON.parse(saved) : paperCfg).report(), null, 2));
+  }
+  else if (command === 'start' || command === 'paper' || trial) await start(new Rpc(cfg, store));
+  else throw new Error('Commands: start, paper, paper-trial <profile>, paper-report, inspect <mint>, report');
 } catch (error) {
   console.error(error.message);
   process.exitCode = 1;

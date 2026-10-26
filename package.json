@@ -10,8 +10,12 @@
     "start": "node src/cli.js start",
     "paper": "node src/cli.js paper",
     "paper-report": "node src/cli.js paper-report",
+    "paper:trial": "node src/cli.js paper-trial",
+    "paper:compare": "node src/paper-trial-report.js",
     "inspect": "node src/cli.js inspect",
     "report": "node src/cli.js report",
+    "download:pools": "node src/download-pools-cli.js",
+    "download": "node src/download-cli.js",
     "test": "node --test"
   },
   "dependencies": {

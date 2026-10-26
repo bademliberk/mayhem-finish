@@ -1,7 +1,7 @@
 import { PUMP } from './config.js';
 import { LookupCache } from './paper-lookups.js';
 import { PaperStore } from './paper-store.js';
-import { reserves, cap, entryQuote, exitQuote, profitable, meetsDrop, higher } from './paper-math.js';
+import { reserves, cap, entryQuote, entryQuality, exitQuote, profitable, meetsDrop, higher } from './paper-math.js';
 
 export class PaperEngine {
   constructor(store, rpc, cfg, { now = Date.now, project } = {}) {
@@ -97,7 +97,7 @@ export class PaperEngine {
       }
     }
   }
-  invalidateAccount(mint, slot, account, code) {
+  invalidateAccount(mint, slot, account, code, subtype = null) {
     this.states.delete(mint);
     this.coverageSlots.set(mint, Math.max(slot, this.slot) || Infinity);
     for (const order of this.paper.pending().filter(order => order.mint === mint)) {
@@ -105,7 +105,7 @@ export class PaperEngine {
     }
     this.store.run('UPDATE paper_watches SET last_slot=?,account_error=? WHERE mint=?', slot, code, mint);
     this.paper.count('invalid_account');
-    this.paper.accountFault(mint, slot, account, code, this.now());
+    this.paper.accountFault(mint, slot, account, code, this.now(), subtype);
   }
   onAccount(mint, slot, account) {
     if (this.stopped || !Number.isSafeInteger(slot) || slot < 0) return;
@@ -115,16 +115,19 @@ export class PaperEngine {
     if (slot < (old?.slot ?? watch.last_slot ?? -1)) {
       this.paper.count('out_of_order_account'); return;
     }
-    let state, code;
+    let state, code, subtype = null;
     if (!account) code = 'missing_account';
     else if (account.owner !== PUMP) code = 'wrong_owner';
     else if (!Array.isArray(account.data) || account.data[1] !== 'base64' || typeof account.data[0] !== 'string' ||
         !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(account.data[0])) code = 'invalid_data';
     else {
       try { state = reserves(account); }
-      catch (error) { code = error.message === 'not_mayhem' ? 'not_mayhem' : 'invalid_curve'; }
+      catch (error) {
+        code = error.message === 'not_mayhem' ? 'not_mayhem' : 'invalid_curve';
+        if (code === 'invalid_curve') subtype = error.validation ?? null; // accountFault whitelists it
+      }
     }
-    if (code) { this.invalidateAccount(mint, slot, account, code); return; }
+    if (code) { this.invalidateAccount(mint, slot, account, code, subtype); return; }
     try {
       const row = { state, slot, at: this.now(), since: old?.since ?? Math.max(slot, this.coverageSlots.get(mint) ?? slot), history: old?.history ?? [] };
       row.history = row.history.filter(item => item.slot >= slot - this.cfg.windowSlots + 1);
@@ -226,7 +229,7 @@ export class PaperEngine {
     if (reserveAgeMs > this.cfg.maxStateAgeMs) causes.push('reserve_stale');
     const { base } = prediction;
     const fallback = row.slot === slot && base?.model === 'isolated_prior_slot' &&
-      Number.isSafeInteger(base.slot) && base.slot < slot && base.slot >= slot - this.cfg.windowSlots + 1 &&
+      Number.isSafeInteger(base.slot) && base.slot < slot && base.slot >= slot - (this.cfg.projectionWindowSlots ?? 5) + 1 &&
       Number.isFinite(base.at) && base.at <= this.now() && this.now() - base.at <= this.cfg.maxStateAgeMs;
     if (row.slot >= slot && !fallback) causes.push('already_applied');
     if (causes.length) {
@@ -244,7 +247,7 @@ export class PaperEngine {
       return reject('exit_prediction_checked');
     }
     if (watch.status !== 'watching' || !this.cfg.entriesEnabled || !this.paper.capacity().remaining) return reject('entries_disabled_or_cap');
-    if (row.since > slot - this.cfg.windowSlots + 1) return reject('insufficient_five_slot_history');
+    if (row.since > slot - this.cfg.windowSlots + 1) return reject(this.cfg.windowSlots === 5 ? 'insufficient_five_slot_history' : 'insufficient_window_history');
     const history = row.history.filter(h => h.slot >= slot - this.cfg.windowSlots + 1 && (fallback ? h.slot < slot : h.slot <= slot));
     if (!history.length) return reject('no_observed_peak');
     const high = history.reduce((a, b) => higher(a.state, b.state) ? a : b).state;
@@ -253,6 +256,10 @@ export class PaperEngine {
     if (!meetsDrop(projected, high, this.cfg)) return reject('drop_below_threshold');
     try {
       const quote = entryQuote(projected, this.cfg);
+      quote.entryQuality = entryQuality(projected, this.cfg);
+      if (this.cfg.entryQualityEnabled && quote.entryQuality.rejection) {
+        this.paper.signal(signature, mint, quote.entryQuality.rejection, JSON.stringify(quote.entryQuality)); return;
+      }
       if (base) quote.projectionBase = base;
       quote.reference = { slot: slot - this.cfg.windowSlots + 1, virtualSol: high.virtualSol.toString(), virtualTokens: high.virtualTokens.toString() };
       const id = this.paper.request(mint, 'buy', 'dump', quote, {signature, slot}, this.now());
@@ -261,7 +268,7 @@ export class PaperEngine {
   }
   async reconcile(order) {
     const now = this.now();
-    if (now >= order.expires_at_ms || (order.side === 'buy' && this.slot > order.signal_slot + this.cfg.windowSlots - 1)) {
+    if (now >= order.expires_at_ms || (order.side === 'buy' && this.slot > order.signal_slot + (this.cfg.signalValiditySlots ?? 5) - 1)) {
       this.paper.cancel(order.id, now, 'signal_expired'); return;
     }
     const generation = this.states.get(order.mint), epoch = this.epoch;
@@ -282,7 +289,7 @@ export class PaperEngine {
       const snapshot = await this.rpc.accounts([watch.curve_address], { commitment: 'confirmed', deadlineMs: order.expires_at_ms });
       if (this.stopped || this.now() >= order.expires_at_ms || !this.store.get("SELECT 1 FROM paper_orders WHERE id=? AND status='pending'", order.id)) return;
       if (this.epoch !== epoch || this.states.get(order.mint)?.since !== generation.since) return;
-      if (order.side === 'buy' && this.slot > order.signal_slot + this.cfg.windowSlots - 1) {
+      if (order.side === 'buy' && this.slot > order.signal_slot + (this.cfg.signalValiditySlots ?? 5) - 1) {
         this.paper.cancel(order.id, this.now(), 'signal_expired'); return;
       }
       const slot = snapshot?.context?.slot;
@@ -309,6 +316,10 @@ export class PaperEngine {
           this.paper.cancel(order.id, this.now(), 'entry_condition_changed'); return;
         }
         quote = entryQuote(state, this.cfg);
+        quote.entryQuality = entryQuality(state, this.cfg);
+        if (this.cfg.entryQualityEnabled && quote.entryQuality.rejection) {
+          this.paper.cancel(order.id, this.now(), quote.entryQuality.rejection); return;
+        }
         if (BigInt(quote.tokens) * 10000n < BigInt(predicted.tokens) * BigInt(10000 - this.cfg.buySlippageBps)) {
           this.paper.cancel(order.id, this.now(), 'buy_slippage'); return;
         }

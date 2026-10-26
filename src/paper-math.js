@@ -63,6 +63,30 @@ export function entryQuote(state, cfg) {
   return { tokens: result.tokens.toString(), swapCost: result.cost.toString(),
     cost: (result.cost + BigInt(cfg.networkFeeLamports)).toString(), mc: cap(state) };
 }
+export function entryQuality(state, cfg) {
+  const buy = buyBudget(state, BigInt(cfg.buyLamports), cfg.swapFeeBps);
+  const cost = buy.cost + BigInt(cfg.networkFeeLamports);
+  const quality = { model: 'isolated_post_buy_round_trip', preBuyRealSolLamports: state.realSol.toString(),
+    minimumRealSolLamports: (BigInt(cfg.buyLamports) * BigInt(cfg.minEntryLiquidityMultiple ?? 2)).toString(),
+    postBuyRealSolLamports: buy.state.realSol.toString(), fullExitSupported: false,
+    roundTripNetLamports: null, roundTripLossLamports: null, roundTripLossBps: null,
+    residualRealSolLamports: null, buyImpactBps: Number((buy.state.virtualSol * state.virtualTokens -
+      state.virtualSol * buy.state.virtualTokens) * BPS / (state.virtualSol * buy.state.virtualTokens)),
+    rejection: null };
+  try {
+    const exit = sell(buy.state, buy.tokens, cfg.swapFeeBps);
+    const net = exit.net - BigInt(cfg.networkFeeLamports), loss = cost - net;
+    quality.fullExitSupported = net > 0n;
+    quality.roundTripNetLamports = net.toString();
+    quality.roundTripLossLamports = loss.toString();
+    quality.roundTripLossBps = Number(ceilDiv(loss * BPS, cost));
+    quality.residualRealSolLamports = exit.state.realSol.toString();
+    if (net <= 0n) quality.rejection = 'entry_exit_unavailable';
+    else if (loss * BPS > cost * BigInt(cfg.maxRoundTripLossBps ?? 1000)) quality.rejection = 'entry_round_trip_loss';
+  } catch { quality.rejection = 'entry_exit_unavailable'; }
+  if (state.realSol < BigInt(quality.minimumRealSolLamports)) quality.rejection = 'entry_real_liquidity';
+  return quality;
+}
 export function exitQuote(state, position, cfg) {
   const result = sell(state, BigInt(position.tokens_raw), cfg.swapFeeBps);
   return { tokens: position.tokens_raw, gross: result.gross.toString(),

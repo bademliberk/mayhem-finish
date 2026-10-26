@@ -133,6 +133,34 @@ npm run paper-report
 
 `npm start` remains monitor-only. `npm run paper` uses the same Mayhem creation discovery, but **subscribes to each newly discovered mint's curve immediately after discovery is stored**, without waiting for the 30-second financial screening or requiring a candidate row. Paper mode does not run the financial screening worker. Discovery is confirmed, not instantaneous at transaction submission; RPC-recovered creations are enrolled when recovered. A durable handoff resumes missed enrollments after a crash. Historical mints are not bulk-enrolled. Existing paper watches/positions survive upgrades and restarts. No private key, wallet loading, signing or `sendTransaction` exists in this mode. No live trades are placed.
 
+### Controlled paper trials
+
+Normal `npm run paper` keeps the baseline strategy. Opt-in trials use separate databases under `data/paper-trials/`; they do not reuse `DB_PATH`, reset existing holdings, or replay historical discoveries.
+
+| Profile | Curve watches | Drop / lookback | Entry-quality gate |
+|---|---:|---|---|
+| `baseline` | 10 | 60% / 5 slots | Measurements only |
+| `coverage20` | 20 | 60% / 5 slots | Measurements only |
+| `liquidity20` | 20 | 60% / 5 slots | Enabled |
+| `drop50` | 20 | 50% / 5 slots | Enabled |
+| `window8` | 20 | 60% / 8 slots | Enabled |
+
+```sh
+# Start ONE selected trial (uses the Helius key already in .env).
+npm run paper:trial -- liquidity20
+# Read-only comparison; missing trial databases are reported, not created.
+npm run paper:compare
+npm run paper:compare -- baseline liquidity20 drop50
+# A distinct experiment directory preserves earlier results.
+PAPER_TRIAL_DIR=data/paper-trials-v2 npm run paper:trial -- drop50
+```
+
+Each profile has its own persisted 25-buy cap, positions and usage. Profiles pin their watch limit regardless of `PAPER_MAX_WATCHES`. Full nonsecret configuration is persisted; mismatched resumes or populated non-trial databases are rejected. Use the same `PAPER_TRIAL_DIR` when reporting a custom experiment. Keep only one writer per trial database. Do not stop an existing paper process with open holdings just to switch trials: a separate trial does not monitor those holdings. Starting multiple trials creates **independent paid feeds**, duplicating discovery traffic and potentially overlapping curve/preprocessed deliveries; no shared-feed experiment runner or automatic launching is provided. Sequential runs differ in market conditions, and concurrent runs still have different admission/latency; this is not a randomized same-feed comparison.
+
+All entries record an isolated post-buy/full-sell round-trip model without changing shared reserves. Guarded profiles initially require pre-buy real SOL >= **twice the swap budget** (0.02 SOL with the current 0.01 SOL budget), positive modeled net exit proceeds, and immediate round-trip loss <= **10%**, including modeled swap and network fees both ways. `PAPER_MIN_LIQUIDITY_MULTIPLE` (integer 0–100, default 2) and `PAPER_MAX_ROUND_TRIP_LOSS_BPS` (0–10000, default 1000) can tune those experimental thresholds in a fresh directory. Checks run at signal and confirmed fill; quality rejection reasons are visible in the funnel. These starting thresholds are not empirically optimized and cannot prevent later liquidity depletion. Baseline/coverage20 collect the same measurements without gating entry. Buy budget, profit/floor exits and no-holding-timeout behavior are unchanged. Window8 extends entry history only: projection freshness and signal validity retain five-slot limits.
+
+Reports include closed-only win rate, average wins/losses, realized expectancy and drawdown, open cost basis, an explicitly hypothetical zero-recovery scenario, order/signal funnels and estimated credits per filled buy. Metrics cover the entire database, not only the latest process session; compare observation dates and unresolved positions as well as wins. Realized drawdown is not marked-to-market equity drawdown. Saved quotes are not live executable prices. Synthetic tests establish mechanics, not profitability. Rebound entries, adaptive sizing, profit-target changes and ambiguous CPI/multi-swap decoding are deferred.
+
 ### Partial discovery recovery
 
 For successful transactions with truncated logs, discovery can recover only creation events whose emitting invocation and every ancestor demonstrably completed successfully before the first truncation marker. Failed/open scopes, malformed nesting and partial trades are not inferred. Recovered creations are persisted alongside quarantine rather than marking the transaction fully processed; incomplete history remains visible. A later complete replay deduplicates existing creations and can resolve quarantine. This upgrade does not automatically replay the historical quarantine or bulk-enroll old mints.
@@ -172,7 +200,7 @@ Orders initially stay **pending**, without creating a position. The reconciler w
 
 `.env.example` lists paper settings. Default modeled swap fee is **200 bps**, network cost **10,000 lamports per side**, and buy/sell slippage tolerance **500 bps**. These are configurable **simulation assumptions**, not verified dynamic Pump/Mayhem fee schedules, wallet rent, tips, fee quotes or a live execution recommendation. Each order retains the complete assumption set. Entry budget includes modeled swap fees, so actual modeled reserve input can be below 0.01 SOL.
 
-Concurrent watched mints are capped at **10** by default and at most (`PAPER_MAX_WATCHES=1..10`), including curve-only watches and held positions. Change any existing `.env` value above 10 before launch; larger values are rejected. On restart, open positions needing curve monitoring take priority, followed by the newest enrolled unheld watches. Excess unheld watches are marked `stopped` with reason `subscription_cap`; their records and metrics are retained, not deleted or automatically reenrolled. If held positions needing monitoring alone exceed the limit, startup fails before opening sockets and requires manual reconciliation. Graduated blocked positions remain recorded without curve subscriptions. This limit counts mint curves, not discovery/slot subscriptions or the temporary preprocessed handover connections.
+Concurrent watched mints are capped at **10** by default, configurable up to **20** (`PAPER_MAX_WATCHES=1..20`), including curve-only watches and held positions. Larger values are rejected. On restart, open positions needing curve monitoring take priority, followed by the newest enrolled unheld watches. Excess unheld watches are marked `stopped` with reason `subscription_cap`; their records and metrics are retained, not deleted or automatically reenrolled. If held positions needing monitoring alone exceed the limit, startup fails before opening sockets and requires manual reconciliation. Graduated blocked positions remain recorded without curve subscriptions. This limit counts mint curves, not discovery/slot subscriptions or the temporary preprocessed handover connections.
 
 Defaults cap queued frames at 1,000, state age at 5 seconds and pending-order lifetime at 10 seconds. Creation-time curve subscriptions cover more mints than the former candidate gate; idle preprocessed suspension reduces transaction-delivery costs but does not impose a credit budget. Quiet curve watches count toward the cap until an eligible new discovery rotates them out. Enrollment skipped when no idle unheld slot is replaceable or other limits apply is counted and marked handled (not retried automatically). The persistent trade count limits cumulative modeled entries, not a claim that losses cannot exceed principal once fees are considered. No maximum holding timeout is imposed; positions can remain blocked/open indefinitely when no exit is available.
 
@@ -180,7 +208,7 @@ Preprocessed delivery costs **0.1 credit per delivered transaction** according t
 
 Heartbeat/session updates, WebSocket usage flushing and discovery-connection bookkeeping run independently every second, not behind discovery RPC work. Metadata `discovery_started_at` and `discovery_completed_at` separately track discovery-loop progress (Unix seconds); a fresh `heartbeat` alone does not prove discovery or trading is healthy. Shutdown stops housekeeping and flushes final usage before database closure.
 
-A bad curve payload clears only that mint's cached reserves/history and cancels only its pending orders; other watches are not reset or reconnected. The curve subscription is retained for recovery, held positions are preserved, and a valid observation rebuilds entry warm-up. Older out-of-order payloads are ignored before validation. `account:*` counters and bounded `invalid_account` samples distinguish missing accounts, wrong owners, invalid data/layout, non-Mayhem curves and internal processing errors without retaining raw payloads or error text. `paper_watches.account_error` persists until a valid observation arrives.
+A bad curve payload clears only that mint's cached reserves/history and cancels only its pending orders; other watches are not reset or reconnected. The curve subscription is retained for recovery, held positions are preserved, and a valid observation rebuilds entry warm-up. Older out-of-order payloads are ignored before validation. `account:*` counters and bounded `invalid_account` samples distinguish missing accounts, wrong owners, invalid data/layout, non-Mayhem curves and internal processing errors without retaining raw payloads or error text. `paper_watches.account_error` persists until a valid observation arrives. `paper_account_faults` separately retains the newest 100 sanitized account-fault samples, exposed as `recentAccountFaults`; decoder rejection churn cannot evict them. Fixed validation subtypes distinguish layout/length, unsupported quote mint, invalid flags and zero virtual token reserves. On upgrade, only still-retained safe legacy fault samples are copied once; missing historical details are not reconstructed.
 
 `paper-report` includes `openPositionHealth`: last observation/change times and ages, last observed MC, real SOL reserves and whether a full modeled exit is supported by the saved reserves. These are explicitly saved-state diagnostics, not live quotes. Missing/invalid state or insufficient liquidity is reported rather than assigned fictional exit proceeds; no holding timeout or forced sale is introduced.
 

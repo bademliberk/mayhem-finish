@@ -137,21 +137,26 @@ export function transactionEvents(tx) {
   return decodeLogs(tx.meta.logMessages).map(event => ({ ...event, slot: tx.slot }));
 }
 
+// Fixed, payload-free labels for why a curve account failed validation (diagnostics only).
+export const CURVE_VALIDATION_CODES = Object.freeze(['missing_or_wrong_owner', 'length_or_discriminator',
+  'unsupported_quote', 'invalid_flags', 'zero_reserves']);
+const invalidCurve = (code, message) => Object.assign(new Error(message), { validation: code });
+
 export function decodeCurve(account) {
-  if (!account || account.owner !== PUMP) throw new Error('Missing or wrong-owner curve account');
+  if (!account || account.owner !== PUMP) throw invalidCurve('missing_or_wrong_owner', 'Missing or wrong-owner curve account');
   const bytes = Buffer.from(account.data[0], 'base64');
-  if (bytes.length < 82 || !bytes.subarray(0, 8).equals(CURVE)) throw new Error('Unknown curve layout');
+  if (bytes.length < 82 || !bytes.subarray(0, 8).equals(CURVE)) throw invalidCurve('length_or_discriminator', 'Unknown curve layout');
   // Current IDL appends quote_mint after is_cashback_coin. All-zero means native SOL.
   if (bytes.length >= 115 && bytes.subarray(83, 115).some(byte => byte !== 0)) {
-    throw new Error('Unsupported non-native-SOL quote');
+    throw invalidCurve('unsupported_quote', 'Unsupported non-native-SOL quote');
   }
-  if (bytes[48] > 1 || bytes[81] > 1) throw new Error('Invalid curve flags');
+  if (bytes[48] > 1 || bytes[81] > 1) throw invalidCurve('invalid_flags', 'Invalid curve flags');
   if (bytes[48] === 1) return { complete: true, mayhem: bytes[81] === 1, marketCap: null,
     liquidity: Number(bytes.readBigUInt64LE(32)) / 1e9 };
   const virtualTokens = bytes.readBigUInt64LE(8);
   const virtualQuote = bytes.readBigUInt64LE(16);
   const supply = bytes.readBigUInt64LE(40);
-  if (virtualTokens === 0n) throw new Error('Zero virtual token reserves');
+  if (virtualTokens === 0n) throw invalidCurve('zero_reserves', 'Zero virtual token reserves');
   return {
     complete: bytes[48] === 1,
     mayhem: bytes[81] === 1,

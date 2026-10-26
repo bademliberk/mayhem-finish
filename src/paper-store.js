@@ -1,14 +1,22 @@
 import { PUMP } from './config.js';
+import { CURVE_VALIDATION_CODES } from './chain.js';
 import { reserves, exitQuote } from './paper-math.js';
+import { trialProfiles } from './paper-profiles.js';
+import { paperPerformance } from './paper-performance.js';
 
-export function paperConfig(env = process.env) {
+export function paperConfig(env = process.env, profile = null) {
   const number = (name, fallback, min, max, integer = true) => {
     const value = Number(env[name] ?? fallback);
     if (!Number.isFinite(value) || value < min || value > max || (integer && !Number.isSafeInteger(value))) throw new Error(`Invalid ${name}`);
     return value;
   };
+  if (profile !== null && !Object.hasOwn(trialProfiles, profile)) throw new Error('Unknown paper trial profile');
   return {
     mode: 'paper', version: 'creation_staged_v2', buyLamports: '10000000',
+    profile, entryQualityEnabled: false,
+    minEntryLiquidityMultiple: number('PAPER_MIN_LIQUIDITY_MULTIPLE', 2, 0, 100),
+    maxRoundTripLossBps: number('PAPER_MAX_ROUND_TRIP_LOSS_BPS', 1000, 0, 10000),
+    projectionWindowSlots: 5, signalValiditySlots: 5,
     activationCap: 2, idleMs: 10000, rotationIdleMs: 60000,
     maxTrades: number('MAX_TRADE_COUNT', 25, 1, 100000),
     windowSlots: 5, dropBps: 6000, floorCap: 0.1, ceilingCap: 0.5, profitBps: 3000,
@@ -17,12 +25,28 @@ export function paperConfig(env = process.env) {
     networkFeeLamports: String(number('PAPER_NETWORK_FEE_LAMPORTS', 10000, 0, 10000000)),
     buySlippageBps: number('PAPER_BUY_SLIPPAGE_BPS', 500, 0, 5000),
     sellSlippageBps: number('PAPER_SELL_SLIPPAGE_BPS', 500, 0, 5000),
-    maxWatches: number('PAPER_MAX_WATCHES', 10, 1, 10),
+    maxWatches: number('PAPER_MAX_WATCHES', 10, 1, 20),
     queueLimit: number('PAPER_QUEUE_LIMIT', 1000, 1, 4000),
     maxStateAgeMs: number('PAPER_MAX_STATE_AGE_MS', 5000, 100, 60000),
     orderTtlMs: number('PAPER_ORDER_TTL_MS', 10000, 1000, 60000),
     entriesEnabled: env.PAPER_ENTRIES_ENABLED !== 'false',
+    ...(profile === null ? {} : { maxWatches: 10, ...trialProfiles[profile] }),
   };
+}
+
+const FAULT_CODES = ['missing_account', 'wrong_owner', 'invalid_data', 'invalid_curve', 'not_mayhem', 'processing_error'];
+const FAULT_SAMPLE_LIMIT = 100;
+const BASE58_MINT = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+// Reduce any fault-like input to fixed, bounded, payload-free fields (used for new and backfilled samples).
+function safeFault(input, slot, account) {
+  const data = account?.data;
+  const code = FAULT_CODES.includes(input.code) ? input.code : 'processing_error';
+  return { mint: BASE58_MINT.test(input.mint) ? input.mint : null,
+    slot: Number.isSafeInteger(slot) ? slot : null, code,
+    subtype: code === 'invalid_curve' && CURVE_VALIDATION_CODES.includes(input.subtype) ? input.subtype : null,
+    present: account != null, ownerMatches: account?.owner === PUMP,
+    base64: Array.isArray(data) && data[1] === 'base64',
+    bytes: Array.isArray(data) && typeof data[0] === 'string' ? Buffer.byteLength(data[0], 'base64') : null };
 }
 
 export class PaperStore {
@@ -75,6 +99,28 @@ export class PaperStore {
     for (const [name, type] of [['fingerprint', 'TEXT'], ['last_change_ms', 'INTEGER'], ['preprocessed', 'INTEGER NOT NULL DEFAULT 0'], ['account_error', 'TEXT'], ['last_observed_ms', 'INTEGER']]) {
       if (!columns.includes(name)) store.db.exec(`ALTER TABLE paper_watches ADD COLUMN ${name} ${type}`);
     }
+    // Durable account-fault samples, separate from decoder-rejection churn. A one-time copy of the
+    // existing safe samples happens only when this table is first created (never re-copied after pruning).
+    const faultsExisted = store.get("SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_account_faults'") != null;
+    store.atomic(() => {
+      store.db.exec(`CREATE TABLE IF NOT EXISTS paper_account_faults (
+        id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, mint TEXT, slot INTEGER, code TEXT NOT NULL, subtype TEXT,
+        present INTEGER NOT NULL, owner_matches INTEGER NOT NULL, base64 INTEGER NOT NULL, bytes INTEGER,
+        source_rejection_id INTEGER UNIQUE
+      )`);
+      if (faultsExisted) return;
+      for (const row of store.all("SELECT id,at_ms,detail FROM paper_rejections WHERE reason='invalid_account' ORDER BY id DESC LIMIT ?", FAULT_SAMPLE_LIMIT).reverse()) {
+        let old;
+        try { old = JSON.parse(row.detail); } catch { continue; }
+        if (old === null || typeof old !== 'object' || Array.isArray(old)) continue;
+        // Reconstruct only the safe summary fields; historical subtype detail was never recorded.
+        const fault = safeFault(old, old.slot, null);
+        const bytes = Number.isSafeInteger(old.bytes) && old.bytes >= 0 ? old.bytes : null;
+        store.run(`INSERT OR IGNORE INTO paper_account_faults(at_ms,mint,slot,code,subtype,present,owner_matches,base64,bytes,source_rejection_id)
+          VALUES(?,?,?,?,?,?,?,?,?,?)`, Number.isSafeInteger(row.at_ms) ? row.at_ms : 0, fault.mint, fault.slot, fault.code, null,
+        old.present === true ? 1 : 0, old.ownerMatches === true ? 1 : 0, old.base64 === true ? 1 : 0, bytes, row.id);
+      }
+    });
   }
   count(name) {
     this.store.run('INSERT INTO paper_counters VALUES(?,1) ON CONFLICT(name) DO UPDATE SET count=count+1', name);
@@ -94,18 +140,15 @@ export class PaperStore {
     this.store.run('INSERT INTO paper_rejections(reason,at_ms,detail) VALUES(?,?,?)', reason, now, JSON.stringify(safe));
     this.store.run('DELETE FROM paper_rejections WHERE id NOT IN (SELECT id FROM paper_rejections ORDER BY id DESC LIMIT 100)');
   }
-  accountFault(mint, slot, account, code, now) {
-    const codes = ['missing_account','wrong_owner','invalid_data','invalid_curve','not_mayhem','processing_error'];
-    const safeCode = codes.includes(code) ? code : 'processing_error';
-    const data = account?.data;
-    const detail = { mint: /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint) ? mint : null,
-      slot: Number.isSafeInteger(slot) ? slot : null, code: safeCode,
-      present: account != null, ownerMatches: account?.owner === PUMP,
-      base64: Array.isArray(data) && data[1] === 'base64',
-      bytes: Array.isArray(data) && typeof data[0] === 'string' ? Buffer.byteLength(data[0], 'base64') : null };
-    this.count(`account:${safeCode}`);
+  accountFault(mint, slot, account, code, now, subtype = null) {
+    const detail = safeFault({ mint, code, subtype }, slot, account);
+    this.count(`account:${detail.code}`);
     this.store.run('INSERT INTO paper_rejections(reason,at_ms,detail) VALUES(?,?,?)', 'invalid_account', now, JSON.stringify(detail));
     this.store.run('DELETE FROM paper_rejections WHERE id NOT IN (SELECT id FROM paper_rejections ORDER BY id DESC LIMIT 100)');
+    this.store.run(`INSERT INTO paper_account_faults(at_ms,mint,slot,code,subtype,present,owner_matches,base64,bytes)
+      VALUES(?,?,?,?,?,?,?,?,?)`, Number.isSafeInteger(now) ? now : 0, detail.mint, detail.slot, detail.code, detail.subtype,
+    Number(detail.present), Number(detail.ownerMatches), Number(detail.base64), detail.bytes);
+    this.store.run(`DELETE FROM paper_account_faults WHERE id NOT IN (SELECT id FROM paper_account_faults ORDER BY id DESC LIMIT ${FAULT_SAMPLE_LIMIT})`);
   }
   capacity() {
     const used = this.store.get("SELECT COUNT(*) n FROM paper_orders WHERE side='buy' AND status IN ('pending','filled')").n;
@@ -209,6 +252,7 @@ export class PaperStore {
     const positions = this.store.all('SELECT * FROM paper_positions ORDER BY opened_at_ms');
     return {
       mode: 'paper', assumptions: this.cfg, capacity: this.capacity(),
+      performance: paperPerformance(this.store, positions),
       coverage: this.store.all(`SELECT mint,status,last_cap,last_change_ms,last_observed_ms,account_error,preprocessed FROM paper_watches
         WHERE status IN ('watching','holding','exit_blocked')`),
       realizedPnlLamports: positions.reduce((sum, row) => sum + BigInt(row.pnl_lamports ?? '0'), 0n).toString(),
@@ -219,6 +263,9 @@ export class PaperStore {
       recentOrders: this.store.all('SELECT * FROM paper_orders ORDER BY id DESC LIMIT 25'),
       recentSignals: this.store.all('SELECT * FROM paper_signals ORDER BY received_at_ms DESC LIMIT 25'),
       recentRejections: this.store.all('SELECT * FROM paper_rejections ORDER BY id DESC LIMIT 25'),
+      recentAccountFaults: this.store.all(`SELECT at_ms atMs,mint,slot,code,subtype,present,owner_matches ownerMatches,base64,bytes
+        FROM paper_account_faults ORDER BY id DESC LIMIT ${FAULT_SAMPLE_LIMIT}`).map(row => ({ ...row, present: Boolean(row.present),
+        ownerMatches: Boolean(row.ownerMatches), base64: Boolean(row.base64) })),
       counters: this.store.all('SELECT * FROM paper_counters ORDER BY name'),
       blocked: this.store.all("SELECT * FROM paper_watches WHERE status='exit_blocked'"),
       usage: this.store.all("SELECT * FROM usage WHERE source IN ('preprocessed','preprocessed_bytes') OR method='paper_account_received_bytes' ORDER BY day,source,method"),

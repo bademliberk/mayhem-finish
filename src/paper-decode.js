@@ -45,10 +45,10 @@ function projectFrame(frame, states, cfg, now) {
   if (!Number.isSafeInteger(latest.slot) || latest.slot > frame.slot) throw unsupported('reserve_after_signal');
   const fallback = latest.slot === frame.slot;
   const row = fallback ? (latest.history ?? []).filter(sample => Number.isSafeInteger(sample.slot) &&
-    sample.slot < frame.slot && sample.slot >= frame.slot - cfg.windowSlots + 1)
+    sample.slot < frame.slot && sample.slot >= frame.slot - (cfg.projectionWindowSlots ?? 5) + 1)
     .reduce((best, sample) => !best || sample.slot >= best.slot ? sample : best, null) : latest;
   if (!row || !Number.isFinite(row.at) || row.at > now || now - row.at > cfg.maxStateAgeMs ||
-      row.slot < frame.slot - cfg.windowSlots + 1) throw unsupported('no_fresh_prior_slot_reserves');
+      row.slot < frame.slot - (cfg.projectionWindowSlots ?? 5) + 1) throw unsupported('no_fresh_prior_slot_reserves');
   if (curve !== addresses(mint).curve || ix.accounts[v3 ? 16 : 11] !== PUMP) throw unsupported('curve_accounts');
   const tokenProgram = ix.accounts[v3 ? 3 : buy ? 8 : 9];
   if (!TOKEN.has(tokenProgram)) throw unsupported('token_program');

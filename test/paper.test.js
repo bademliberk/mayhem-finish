@@ -45,7 +45,7 @@ test('paper defaults are fixed strategy with validated configurable cap and cost
   assert.equal(pc.maxWatches,10);
   assert.equal(pc.rotationIdleMs,60000);assert.equal(pc.idleMs,10000);
   assert.equal(paperConfig({PAPER_MAX_WATCHES:'3'}).maxWatches,3);
-  for(const value of ['0','11','1000','2.5','NaN']) assert.throws(()=>paperConfig({PAPER_MAX_WATCHES:value}));
+  for(const value of ['0','21','1000','2.5','NaN']) assert.throws(()=>paperConfig({PAPER_MAX_WATCHES:value}));
   for(const value of ['0','-1','NaN','2.5']) assert.throws(()=>paperConfig({MAX_TRADE_COUNT:value}));
   assert.equal(paperConfig({PAPER_ENTRIES_ENABLED:'false'}).entriesEnabled,false);
 });
