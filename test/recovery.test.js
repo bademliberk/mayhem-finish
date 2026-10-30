@@ -225,3 +225,50 @@ test('real collector: follow-up scan reads only entries newer than the first sca
   assert.equal(r.pending, false);
   assert.deepEqual(store.cursor(P), {});
 });
+
+test('restart adopts all unfinished websocket gaps without changing historical completed rows', async () => {
+  const h = harness();
+  const earliest = h.store.coverage('websocket_gap', 100, 'original');
+  const later = h.store.coverage('websocket_gap', 500, 'later');
+  const complete = h.store.coverage('websocket_gap', 20, 'already complete');
+  h.store.run('UPDATE coverage SET ended_at=30 WHERE id=?', complete);
+  h.store.run("INSERT INTO metadata VALUES('backfill_cutoff','50')");
+  const r = h.recovery(); r.begin({ lastHeartbeat: 900, now: 1000 });
+  assert.equal(r.cutoff, 50);
+  r.reconnected(900, 1000);
+  assert.equal(h.store.get('SELECT ended_at FROM coverage WHERE id=?', earliest).ended_at, null);
+  h.script.push(async () => false); assert.equal(await r.run(1000), 'partial');
+  assert.equal(h.store.get('SELECT ended_at FROM coverage WHERE id=?', later).ended_at, null);
+  h.clock.t = 1061; assert.equal(await r.run(1061), 'completed');
+  assert.equal(h.store.get('SELECT ended_at FROM coverage WHERE id=?', earliest).ended_at, 1061);
+  assert.equal(h.store.get('SELECT ended_at FROM coverage WHERE id=?', later).ended_at, 1061);
+  assert.deepEqual({ ...h.store.get('SELECT started_at,ended_at,detail FROM coverage WHERE id=?', complete) }, { started_at: 20, ended_at: 30, detail: 'already complete' });
+});
+
+test('a reconnect during backfill owns its own open transport row until a follow-up scan', async () => {
+  const h = harness(); const r = h.recovery();
+  const first = h.store.coverage('websocket_gap', 900, 'first');
+  r.begin({ lastHeartbeat: 900, now: 1000 }); r.reconnected(900, 1000);
+  const gate = deferred(); h.script.push(async () => { await gate.promise; return true; });
+  const running = r.run(1000);
+  const second = h.store.coverage('websocket_gap', 1001, 'second');
+  h.clock.t = 1002; r.reconnected(1000, 1002);
+  gate.resolve(); await running;
+  assert.equal(h.store.get('SELECT ended_at FROM coverage WHERE id=?', first).ended_at, 1002);
+  assert.equal(h.store.get('SELECT ended_at FROM coverage WHERE id=?', second).ended_at, null);
+  await r.run(1002);
+  assert.equal(h.store.get('SELECT ended_at FROM coverage WHERE id=?', second).ended_at, 1002);
+});
+
+test('recovery failures never persist or log raw provider errors', async () => {
+  const h = harness(), logged = [];
+  const r = new Recovery({ store: h.store, collector: h.collector, programs: [P], now: () => h.clock.t,
+    log: value => logged.push(value) });
+  r.begin({ lastHeartbeat: 900 }); r.reconnected(900);
+  h.script.push(async () => { throw Object.assign(new Error('https://SECRET.invalid/?api-key=SECRET'), { code: 'ETIMEDOUT' }); });
+  assert.equal(await r.run(1000), 'failed');
+  const saved = h.store.get("SELECT value FROM metadata WHERE key='feed_health_recovery'").value;
+  assert.ok(!JSON.stringify([saved, logged]).includes('SECRET'));
+  assert.equal(JSON.parse(saved).lastFailure.networkCode, 'ETIMEDOUT');
+  assert.equal(h.rows('backfill')[0].ended_at, null);
+});

@@ -1,7 +1,10 @@
 import { PUMP } from './config.js';
 import { LookupCache } from './paper-lookups.js';
 import { PaperStore } from './paper-store.js';
-import { reserves, cap, entryQuote, entryQuality, exitQuote, profitable, meetsDrop, higher } from './paper-math.js';
+import { reserves, cap, entryQuote, entryQuality, exitQuote, liquidityRisk, profitable, meetsDrop, higher } from './paper-math.js';
+
+const mandatoryExit = reason => reason === 'floor' || reason === 'liquidity_risk';
+const exitPriority = reason => ({ profit: 0, liquidity_risk: 1, floor: 2, graduated_no_amm_exit: 3 }[reason] ?? -1);
 
 export class PaperEngine {
   constructor(store, rpc, cfg, { now = Date.now, project } = {}) {
@@ -149,32 +152,60 @@ export class PaperEngine {
       if (this.paper.position(mint) && watch.reason === 'graduated_no_amm_exit') {
         this.unwatch(mint); return;
       }
-      if (cap(state) <= this.cfg.floorCap) {
+      if (this.paper.position(mint)) {
+        const reason = this.exitIntent(mint, state);
+        if (reason) this.requestExit(mint, state, reason, null);
+      } else if (cap(state) <= this.cfg.floorCap) {
         const pending = this.paper.pending().find(o => o.mint === mint);
-        if (pending && pending.reason !== 'floor') this.paper.cancel(pending.id, this.now(), 'floor_override');
-        if (this.paper.position(mint)) this.requestExit(mint, state, 'floor', null);
-        else {
-          this.store.run("UPDATE paper_watches SET status='stopped',reason='floor' WHERE mint=?", mint);
-          this.unwatch(mint);
-        }
-      } else if (watch.status === 'exit_blocked' && watch.reason === 'floor') {
-        this.requestExit(mint, state, 'floor', null);
+        if (pending) this.paper.cancel(pending.id, this.now(), 'floor_override');
+        this.store.run("UPDATE paper_watches SET status='stopped',reason='floor' WHERE mint=?", mint);
+        this.unwatch(mint);
       }
     } catch {
       this.invalidateAccount(mint, slot, account, 'processing_error');
     }
   }
-  requestExit(mint, state, reason, signal) {
-    const position = this.paper.position(mint);
-    if (!position) return;
+  exitIntent(mint, state) {
+    const watch = this.paper.watch(mint), position = this.paper.position(mint);
+    if (!position || state.complete || watch.reason === 'graduated_no_amm_exit') return null;
+    if (watch.reason === 'floor' || cap(state) <= this.cfg.floorCap) return 'floor';
+    if (watch.reason === 'liquidity_risk' || liquidityRisk(state, position, this.cfg)) return 'liquidity_risk';
+    return null;
+  }
+  latchExit(mint, reason) {
+    if (!mandatoryExit(reason)) return;
+    this.store.atomic(() => {
+      const watch = this.paper.watch(mint);
+      if (exitPriority(watch.reason) > exitPriority(reason)) return;
+      // Persist before quoting/canceling: an illiquid exit, or a crash, must not lose intent.
+      if (watch.status !== 'exit_blocked' || watch.reason !== reason) {
+        this.store.run("UPDATE paper_watches SET status='exit_blocked',reason=? WHERE mint=?", reason, mint);
+      }
+      const pending = this.paper.pending().find(order => order.mint === mint);
+      if (pending && exitPriority(pending.reason) < exitPriority(reason)) {
+        this.paper.cancel(pending.id, this.now(), `${reason}_override`);
+      }
+    });
+  }
+  requestExit(mint, state, reason, signal, observation = this.states.get(mint)) {
+    const position = this.paper.position(mint), watch = this.paper.watch(mint);
+    if (this.stopped || !position || watch.reason === 'graduated_no_amm_exit' || state.complete ||
+        watch.account_error || !observation || this.now() < observation.at ||
+        this.now() - observation.at > this.cfg.maxStateAgeMs || (!signal && state !== observation.state)) return;
+    // Predictions may request profit, but only observed (or freshly confirmed) reserves latch risk.
+    const intent = this.exitIntent(mint, observation.state);
+    if (intent) {
+      reason = intent; state = observation.state; signal = null;
+      this.latchExit(mint, reason);
+    } else if (mandatoryExit(reason)) return;
+    if (this.paper.pending().some(order => order.mint === mint)) return;
     try {
       const quote = exitQuote(state, position, this.cfg);
       if (reason === 'profit' && !profitable(quote, position, this.cfg)) return;
       if (signal?.base) quote.projectionBase = signal.base;
+      if (!signal && Number.isSafeInteger(observation.slot)) quote.observationSlot = observation.slot;
       this.paper.request(mint, 'sell', reason, quote, signal, this.now());
-      if (reason === 'floor') this.store.run("UPDATE paper_watches SET status='exit_blocked',reason='floor' WHERE mint=?", mint);
     } catch {
-      if (reason === 'floor') this.store.run("UPDATE paper_watches SET status='exit_blocked',reason='floor' WHERE mint=?", mint);
       this.paper.count('exit_insufficient_liquidity');
     }
   }
@@ -200,8 +231,9 @@ export class PaperEngine {
           this.unwatch(watch.mint); continue;
         }
         const row = this.states.get(watch.mint);
-        if (watch.status === 'exit_blocked' && watch.reason === 'floor' && row &&
-            this.now() - row.at <= this.cfg.maxStateAgeMs) this.requestExit(watch.mint, row.state, 'floor', null);
+        if (watch.status === 'exit_blocked' && mandatoryExit(watch.reason) && row) {
+          this.requestExit(watch.mint, row.state, watch.reason, null);
+        }
       }
       for (const order of this.paper.pending()) {
         if (this.stopped) break;
@@ -242,7 +274,10 @@ export class PaperEngine {
     if (fallback) this.paper.count('projection_prior_slot_fallback');
     const position = this.paper.position(mint);
     if (position) {
-      if (watch.reason === 'floor' || watch.reason === 'graduated_no_amm_exit') return reject('mandatory_exit_pending');
+      if (mandatoryExit(watch.reason) || watch.reason === 'graduated_no_amm_exit') {
+        this.requestExit(mint, row.state, watch.reason, null);
+        return reject('mandatory_exit_pending');
+      }
       this.requestExit(mint, projected, 'profit', {signature, slot, base});
       return reject('exit_prediction_checked');
     }
@@ -272,7 +307,7 @@ export class PaperEngine {
       this.paper.cancel(order.id, now, 'signal_expired'); return;
     }
     const generation = this.states.get(order.mint), epoch = this.epoch;
-    if (!generation || (!this.ready && order.reason !== 'floor')) return;
+    if (!generation || (!this.ready && !mandatoryExit(order.reason))) return;
     try {
       let executedSlot = null;
       if (order.signal_signature) {
@@ -293,7 +328,9 @@ export class PaperEngine {
         this.paper.cancel(order.id, this.now(), 'signal_expired'); return;
       }
       const slot = snapshot?.context?.slot;
-      if (!Number.isSafeInteger(slot) || slot < (executedSlot ?? generation.slot)) return;
+      const predicted = JSON.parse(order.quote_json);
+      const observationSlot = Number.isSafeInteger(predicted.observationSlot) ? predicted.observationSlot : 0;
+      if (!Number.isSafeInteger(slot) || slot < Math.max(executedSlot ?? 0, generation.slot, this.states.get(order.mint).slot, observationSlot)) return;
       const state = reserves(snapshot.value?.[0]);
       if (state.complete) {
         this.paper.cancel(order.id, this.now(), 'graduated');
@@ -307,7 +344,6 @@ export class PaperEngine {
         this.store.run("UPDATE paper_watches SET status='stopped',reason='floor' WHERE mint=?", order.mint);
         this.unwatch(order.mint); return;
       }
-      const predicted = JSON.parse(order.quote_json);
       let quote;
       if (order.side === 'buy') {
         if (!this.ready || !this.cfg.entriesEnabled || watch.status !== 'watching' || !watch.preprocessed || !this.feeds.covers(order.mint)) { this.paper.cancel(order.id, this.now(), 'entries_paused'); return; }
@@ -326,9 +362,16 @@ export class PaperEngine {
       } else {
         const position = this.paper.position(order.mint);
         if (!position) { this.paper.cancel(order.id, this.now(), 'no_position'); return; }
-        if (mc <= this.cfg.floorCap && order.reason !== 'floor') {
-          this.paper.cancel(order.id, this.now(), 'floor_override');
-          this.requestExit(order.mint, state, 'floor', null); return;
+        const intent = this.exitIntent(order.mint, state);
+        if (intent) {
+          // Retain the confirmed trigger as the latest observation, including a drained pool.
+          // Otherwise a retry could quote an older streamed state after this order is canceled.
+          this.onAccount(order.mint, slot, snapshot.value[0]);
+          if (this.paper.watch(order.mint).account_error) return;
+          this.latchExit(order.mint, intent);
+          if (intent !== order.reason) {
+            this.requestExit(order.mint, state, intent, null, { state, slot, at: this.now() }); return;
+          }
         }
         quote = exitQuote(state, position, this.cfg);
         if (order.reason === 'profit' && !profitable(quote, position, this.cfg)) { this.paper.cancel(order.id, this.now(), 'profit_disappeared'); return; }
@@ -336,7 +379,9 @@ export class PaperEngine {
           this.paper.cancel(order.id, this.now(), 'sell_slippage'); return;
         }
       }
-      quote.slot = slot; quote.model = order.reason === 'floor' ? 'hypothetical_floor_fill_confirmed_state' : 'hypothetical_fill_after_confirmed_trigger';
+      quote.slot = slot;
+      quote.model = order.reason === 'floor' ? 'hypothetical_floor_fill_confirmed_state' :
+        order.signal_signature ? 'hypothetical_fill_after_confirmed_trigger' : 'hypothetical_fill_confirmed_state';
       this.paper.fill(order, quote, this.now());
       if (order.side === 'sell') this.unwatch(order.mint);
     } catch { this.paper.count('reconciliation_unavailable'); }

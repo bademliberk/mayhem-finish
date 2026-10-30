@@ -25,7 +25,7 @@ class Socket extends EventEmitter {
 
 function setup({ accounts, watches = [['m1', CURVE]] } = {}) {
   const usage = [], events = [], sockets = [], timers = new Map(), rpcCalls = [];
-  let seq = 0, clock = 0;
+  let seq = 0, clock = Date.now();
   const store = { usage: (source, method, amount = 1) => usage.push([source, method, amount]) };
   const rpc = {
     wsUrl: STD,
@@ -43,7 +43,7 @@ function setup({ accounts, watches = [['m1', CURVE]] } = {}) {
     onCoverage: mint => events.push(['coverage', mint]),
     socketFactory: (url, kind) => { const s = new Socket(url, kind); sockets.push(s); return s; },
     setTimer: (fn, delay) => { const id = ++seq; timers.set(id, { fn, at: clock + delay }); return id; },
-    clearTimer: id => timers.delete(id),
+    clearTimer: id => timers.delete(id), now: () => clock,
   });
   for (const [mint, curve] of watches) feeds.add(mint, curve);
   const advance = ms => {
@@ -63,7 +63,16 @@ function setup({ accounts, watches = [['m1', CURVE]] } = {}) {
     if (account) { a.ack('accountSubscribe', 21); await settle(); }
     return [a, b];
   };
-  return { feeds, usage, events, sockets, timers, rpcCalls, advance, of, std, pre, bringUp };
+  // Supply global slot progress when a test is exercising unrelated long-lived behavior.
+  const advanceWithSlots = ms => {
+    while (ms > 0) {
+      const a = std().at(-1);
+      if (a?.readyState === 1 && feeds.slotSubscription != null) a.text({ method: 'slotNotification',
+        params: { subscription: feeds.slotSubscription, result: { slot: Math.max(0, feeds.lastSlot + 1) } } });
+      const step = Math.min(ms, 10000); advance(step); ms -= step;
+    }
+  };
+  return { feeds, usage, events, sockets, timers, rpcCalls, advance, advanceWithSlots, of, std, pre, bringUp, now: () => clock };
 }
 
 test('derives the preprocessed endpoint from the same key without leaking on failure', () => {
@@ -117,7 +126,7 @@ test('ack fetches exactly one processed snapshot; notifications and slots need n
   assert.deepEqual(t.rpcCalls[0][0], [CURVE]);
   assert.equal(t.rpcCalls[0][1].commitment, 'processed');
   assert.ok(t.rpcCalls[0][1].signal instanceof AbortSignal);
-  assert.ok(t.rpcCalls[0][1].deadlineMs > Date.now());
+  assert.equal(t.rpcCalls[0][1].deadlineMs, t.now() + 5000);
   assert.deepEqual(t.of('account'), [['account', 'm1', 50, { lamports: 1 }]]);
   for (const slot of [51, 52, 53]) {
     a.text({ method: 'accountNotification', params: { subscription: 21, result: { context: { slot }, value: { lamports: slot } } } });
@@ -423,7 +432,7 @@ test('baseline retry uses bounded per-watch backoff and recovers on success', as
     assert.equal(t.rpcCalls.length, i + 1);
     assert.ok(retryTimer(t)); // exactly one retry timer, no request in flight
     assert.equal(watch.baseline, null);
-    t.advance(15000); await settle();
+    t.advanceWithSlots(15000); await settle();
   }
   assert.equal(t.rpcCalls.length, 7);
   assert.deepEqual(t.of('account'), [['account', 'm1', 77, { lamports: 7 }]]);
@@ -440,7 +449,7 @@ test('baseline retry delay doubles up to the cap', async () => {
     const timer = retryTimer(t);
     assert.ok(timer, `retry ${i} armed`);
     assert.equal(t.rpcCalls.length, i + 1);
-    t.advance(expected[i] - 1); await settle();
+    t.advanceWithSlots(expected[i] - 1); await settle();
     assert.equal(t.rpcCalls.length, i + 1); // not early
     t.advance(1); await settle();
     assert.equal(t.rpcCalls.length, i + 2);
@@ -472,7 +481,7 @@ test('a live valid notification satisfies the baseline and cancels the retry tim
   assert.ok(retryTimer(t));
   a.text({ method: 'accountNotification', params: { subscription: 21, result: { context: { slot: 90 }, value: { live: 1 } } } });
   assert.equal(watch.baselineRetry, null); assert.equal(watch.attempts, 0);
-  t.advance(60000); await settle();
+  t.advanceWithSlots(60000); await settle();
   assert.equal(t.rpcCalls.length, 1); // never retried
   assert.deepEqual(t.of('account'), [['account', 'm1', 90, { live: 1 }]]);
   assert.deepEqual(t.of('gap'), []);
@@ -630,7 +639,7 @@ test('resync reconnects both sockets at once, rebaselines, and re-readies withou
   assert.equal(t.of('ready').length, 2);
   assert.equal(t.of('coverage').length, 2);
   assert.equal(t.rpcCalls.length, 2);
-  t.advance(120000);
+  t.advanceWithSlots(120000);
   assert.equal(t.sockets.length, 4); // no stray reconnect timers
   await t.feeds.stop();
 });
@@ -659,6 +668,7 @@ test('heartbeat: pings both sockets, missing pong terminates, gaps and reconnect
   const [a, b] = await t.bringUp();
   t.advance(10000);
   assert.equal(a.pings, 1); assert.equal(b.pings, 1);
+  a.text({ method: 'slotNotification', params: { subscription: 9, result: { slot: 1 } } });
   a.autoPong = false;
   t.advance(10000); assert.equal(a.pings, 2);
   assert.equal(t.of('gap').length, 0);
@@ -802,7 +812,7 @@ test('no watchlist means no preprocessed socket; readiness needs only the slot a
   assert.equal(t.pre().length, 0); assert.equal(t.std().length, 1);
   const a = t.std()[0]; a.open(); a.ack('slotSubscribe', 9);
   assert.equal(t.of('ready').length, 1);
-  t.advance(120000);
+  t.advanceWithSlots(120000);
   assert.equal(t.pre().length, 0);
   await t.feeds.stop();
 });
@@ -859,7 +869,7 @@ test('removing a watch narrows the filter; removing the last closes the stream s
   t.feeds.remove('m1'); t.advance(100);
   assert.equal(b2.readyState, 3);
   assert.equal(t.pre().length, 2);
-  t.advance(120000);
+  t.advanceWithSlots(120000);
   assert.equal(t.pre().length, 2); // nothing reconnects
   assert.equal(t.of('gap').length, 0);
   t.feeds.add('m3', C3); t.advance(100);
@@ -1084,5 +1094,88 @@ test('every received binary frame is billed, including overlap and undelivered f
   assert.deepEqual(t.of('tx').map(e => e[1].length), [2, 1]);
   t.feeds.flushUsage();
   assert.deepEqual(t.usage.find(u => u[0] === 'preprocessed'), ['preprocessed', 'transactions', 3]);
+  await t.feeds.stop();
+});
+
+test('a missing account ack retains its deadline under add/remove/ack churn', async () => {
+  const t = setup(); const [a] = await t.bringUp({ account: false });
+  const oldest = a.find('accountSubscribe').id, deadline = t.feeds.ackDeadlines.get(oldest);
+  for (let i = 0; i < 14; i++) {
+    t.advance(1000);
+    t.feeds.add(`extra${i}`, `curve${i}`, false);
+    a.ack('accountSubscribe', 100 + i, i + 1);
+    t.feeds.remove(`extra${i}`);
+    assert.equal(t.feeds.ackDeadlines.get(oldest), deadline);
+  }
+  t.feeds.remove('m1'); // an in-flight removed request still requires ack/unsubscribe, or timeout
+  t.advance(999); assert.equal(a.readyState, 1);
+  t.advance(1); assert.equal(a.readyState, 3);
+  assert.deepEqual(t.of('gap').map(e => e[1]), ['standard_ack_timeout']);
+  await t.feeds.stop(); assert.equal(t.timers.size, 0);
+});
+
+test('missing initial slot progress times out despite pongs and account updates, then reconnect rebaselines', async () => {
+  const t = setup(); const [a, b] = await t.bringUp();
+  for (let i = 0; i < 2; i++) {
+    t.advance(10000);
+    a.text({ method: 'accountNotification', params: { subscription: 21, result: { context: { slot: 100 + i }, value: {} } } });
+    a.emit('pong'); b.binary(Buffer.from([1]));
+  }
+  t.advance(9999); assert.equal(a.readyState, 1);
+  t.advance(1); assert.equal(a.readyState, 3);
+  assert.deepEqual(t.of('gap').map(e => e[1]), ['standard_slot_progress_timeout']);
+  assert.equal(b.readyState, 1);
+  t.advance(1000); const a2 = t.std()[1]; a2.open(); a2.ack('slotSubscribe', 10); a2.ack('accountSubscribe', 22);
+  await settle(); assert.equal(t.rpcCalls.length, 2); assert.equal(t.of('ready').length, 2);
+  a.text({ method: 'slotNotification', params: { subscription: 9, result: { slot: 999 } } });
+  assert.equal(t.feeds.lastSlot, -1, 'stale socket cannot reset new watchdog');
+  await t.feeds.stop(); assert.equal(t.timers.size, 0);
+});
+
+test('only increasing slots reset watchdog; repeated/lower/foreign slots do not', async () => {
+  const t = setup(); const [a] = await t.bringUp();
+  const slot = (n, subscription = 9) => a.text({ method: 'slotNotification', params: { subscription, result: { slot: n } } });
+  t.advance(10000); slot(100);
+  t.advance(10000); slot(100); slot(99); slot(1000, 99);
+  t.advance(10000); a.emit('pong'); slot(100);
+  t.advance(9999); assert.equal(a.readyState, 1);
+  t.advance(1); assert.equal(a.readyState, 3);
+  assert.deepEqual(t.of('gap').map(e => e[1]), ['standard_slot_progress_timeout']);
+  await t.feeds.stop();
+});
+
+test('increasing slots keep quiet curves and silent preprocessed feed connected without extra RPC', async () => {
+  const t = setup(); const [a, b] = await t.bringUp();
+  t.advanceWithSlots(180000);
+  assert.equal(a.readyState, 1); assert.equal(b.readyState, 1); assert.equal(t.sockets.length, 2);
+  assert.equal(t.rpcCalls.length, 1); assert.deepEqual(t.of('gap'), []);
+  await t.feeds.stop();
+});
+
+test('stale ack and slot timers cannot invalidate fresh progress or a replacement generation', async () => {
+  const t = setup(); const [a] = await t.bringUp({ account: false });
+  const ackTimer = t.timers.get(t.feeds.standard.ackTimer).fn;
+  a.ack('accountSubscribe', 21); await settle();
+  const slotTimer = t.timers.get(t.feeds.slotWatchdog).fn;
+  a.text({ method: 'slotNotification', params: { subscription: 9, result: { slot: 1 } } });
+  slotTimer(); ackTimer(); assert.equal(a.readyState, 1);
+  t.feeds.resync(); const a2 = t.std()[1]; a2.open(); a2.ack('slotSubscribe', 10);
+  slotTimer(); ackTimer(); assert.equal(a2.readyState, 1);
+  assert.deepEqual(t.of('gap'), []);
+  await t.feeds.stop(); assert.equal(t.timers.size, 0);
+});
+
+test('paper diagnostics persist only safe bounded fields separately from billed usage', async () => {
+  const t = setup(); const rows = new Map();
+  t.feeds.store.run = (_sql, key, value) => rows.set(key, value);
+  t.feeds.start(); let a = t.std()[0];
+  a.emit('unexpected-response', {}, { statusCode: 503, headers: { key: KEY } });
+  t.advance(1000); a = t.std()[1];
+  a.emit('error', { code: 'ECONNRESET', message: STD, headers: { secret: KEY } });
+  const health = JSON.parse(rows.get('feed_health_standard'));
+  assert.equal(health.lastFailure.networkCode, 'ECONNRESET'); assert.equal(health.failureStreak, 2);
+  assert.equal(health.attempts, 2); assert.equal(health.nextRetryAt, t.now() + 2000);
+  assert.ok(!JSON.stringify([...rows]).includes(KEY)); assert.equal(rows.size, 2);
+  t.feeds.flushUsage(); assert.deepEqual(t.usage, []);
   await t.feeds.stop();
 });

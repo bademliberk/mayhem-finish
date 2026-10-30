@@ -1,5 +1,9 @@
 import WebSocket from 'ws';
 import { PUMP } from './config.js';
+import { FeedHealth, SLOT_PROGRESS_MS } from './feed-health.js';
+
+const validSubscription = id => Number.isSafeInteger(id) && id >= 0;
+const failureCategory = reason => reason.replace(/^(standard_|preprocessed_)/, '').replace(/^(slot_|account_)subscribe_failed$/, 'subscribe_failed');
 
 // Upper bound for any single frame we are willing to buffer (account JSON or raw transaction bytes).
 export const MAX_FRAME_BYTES = 1024 * 1024;
@@ -43,11 +47,13 @@ export class PaperFeeds {
   constructor(store, rpc, {
     onAccount = noop, onTransaction = noop, onGap = noop, onReady = noop, onSlot = noop, onCoverage = noop, onSubscriptionError = noop,
     socketFactory = url => new WebSocket(url, { handshakeTimeout: 10000, maxPayload: MAX_FRAME_BYTES }),
-    setTimer = setTimeout, clearTimer = clearTimeout,
+    setTimer = setTimeout, clearTimer = clearTimeout, now = Date.now,
   } = {}) {
     this.store = store; this.rpc = rpc;
     this.callbacks = { onAccount, onTransaction, onGap, onReady, onSlot, onCoverage, onSubscriptionError };
-    this.socketFactory = socketFactory; this.setTimer = setTimer; this.clearTimer = clearTimer;
+    this.socketFactory = socketFactory; this.setTimer = setTimer; this.clearTimer = clearTimer; this.now = now;
+    this.health = { standard: new FeedHealth(store, 'standard', now), preprocessed: new FeedHealth(store, 'preprocessed', now) };
+    this.ackDeadlines = new Map(); this.slotWatchdog = null; this.lastSlot = -1;
     this.preprocessedUrl = preprocessedUrl(rpc.wsUrl);
     this.standard = newLink('standard');
     this.preprocessed = newPreprocessed(); this.syncTimer = null;
@@ -125,6 +131,10 @@ export class PaperFeeds {
     try { socket?.terminate(); } catch { /* already closed */ }
     this.connect(standard); this.reconcile();
   }
+  flushHealth() {
+    this.health.standard.update({ pendingAcks: this.ackDeadlines.size });
+    this.health.preprocessed.update({ pending: [...this.watches.values()].filter(w => w.preprocessed && !this.covers(w.mint)).length });
+  }
   flushUsage() {
     const { standard, preprocessed } = this;
     if (standard.bytes) this.store.usage('websocket', 'paper_account_received_bytes', standard.bytes);
@@ -140,6 +150,7 @@ export class PaperFeeds {
       try { socket?.terminate(); } catch { /* already closed */ }
       this.closePreprocessed();
       this.watches.clear();
+      this.health.standard.stop(); this.health.preprocessed.stop();
       try { this.flushUsage(); } catch { /* store may already be closed */ }
     }
     await Promise.allSettled([...this.tasks]);
@@ -171,9 +182,11 @@ export class PaperFeeds {
   }
   connect(link) {
     if (this.stopped || !this.started || link.socket || link.retry) return;
+    const health = this.health.standard;
+    health.update({ phase: 'connecting', attempts: health.value.attempts + 1, nextRetryAt: null });
     const socket = (() => {
       try { return this.socketFactory(this.rpc.wsUrl, 'standard'); }
-      catch { return null; }
+      catch (error) { health.failure('connect_failed', error); return null; }
     })();
     if (!socket) { this.markGap('standard_connect_failed'); this.schedule(link); return; }
     link.socket = socket; link.alive = true;
@@ -182,19 +195,25 @@ export class PaperFeeds {
       if (link.socket !== socket || this.stopped) return;
       const buffer = toBuffer(raw);
       link.bytes += buffer.length; link.alive = true;
+      health.update({ lastPayloadAt: this.now() }, false);
       if (buffer.length > MAX_FRAME_BYTES) { this.fail(link, 'standard_oversized_frame'); return; }
       try { this.standardMessage(buffer, isBinary === true); }
       catch { this.fail(link, 'standard_malformed_message'); }
     });
-    socket.on('error', () => { if (link.socket === socket) this.fail(link, 'standard_transport_error'); });
-    socket.on('close', () => { if (link.socket === socket) this.fail(link, 'standard_disconnected'); });
+    socket.on('error', error => { if (link.socket === socket) this.fail(link, 'standard_transport_error', error); });
+    socket.on('close', code => { if (link.socket === socket) this.fail(link, 'standard_disconnected', { wsCode: code }); });
+    socket.on('unexpected-response', (_request, response) => {
+      if (link.socket === socket) this.fail(link, 'standard_http_rejected', { httpStatus: response?.statusCode });
+    });
     socket.on('pong', () => { if (link.socket === socket) link.alive = true; });
   }
   opened(link) {
+    if (this.slotRequest != null || link.acked) return;
     const socket = link.socket;
+    this.health.standard.update({ phase: 'subscribing' });
     const beat = () => {
-      link.heartbeat = null;
       if (link.socket !== socket || this.stopped) return;
+      link.heartbeat = null;
       if (!link.alive) { this.fail(link, 'standard_heartbeat_timeout'); return; }
       link.alive = false;
       try { socket.ping(); } catch { this.fail(link, 'standard_heartbeat_failed'); return; }
@@ -202,6 +221,8 @@ export class PaperFeeds {
     };
     link.heartbeat = this.setTimer(beat, HEARTBEAT_MS);
     this.slotRequest = this.send(link, 'slotSubscribe', []);
+    if (link.socket !== socket) return;
+    this.ackDeadlines.set(this.slotRequest, this.now() + ACK_TIMEOUT_MS);
     for (const watch of this.watches.values()) this.subscribe(watch);
     if (link.socket === socket) this.armAck(link);
   }
@@ -213,20 +234,38 @@ export class PaperFeeds {
   pending(link) {
     return !link.acked || this.requests.size > 0;
   }
-  // Fails a connection whose subscription is never acknowledged.
+  // Request deadlines never slide when another account is added, removed or acknowledged.
   armAck(link) {
     this.clearTimer(link.ackTimer); link.ackTimer = null;
     if (!link.socket) return;
-    if (!this.pending(link)) { link.attempts = 0; return; }
+    this.health.standard.update({ pendingAcks: this.ackDeadlines.size });
+    if (!this.pending(link)) {
+      link.attempts = 0; this.health.standard.update({ failureStreak: 0 }); return;
+    }
+    if (!this.ackDeadlines.size) return;
     const socket = link.socket;
-    link.ackTimer = this.setTimer(() => {
+    const deadline = Math.min(...this.ackDeadlines.values());
+    const timer = this.setTimer(() => {
+      if (link.ackTimer !== timer || link.socket !== socket || this.stopped) return;
       link.ackTimer = null;
-      if (link.socket === socket && this.pending(link)) this.fail(link, 'standard_ack_timeout');
-    }, ACK_TIMEOUT_MS);
+      if ([...this.ackDeadlines.values()].some(at => at <= this.now())) this.fail(link, 'standard_ack_timeout');
+    }, Math.max(0, deadline - this.now()));
+    link.ackTimer = timer;
   }
-  fail(link, reason) {
+  armSlotWatchdog() {
+    this.clearTimer(this.slotWatchdog);
+    const socket = this.standard.socket;
+    const timer = this.setTimer(() => {
+      if (this.slotWatchdog !== timer || this.standard.socket !== socket || this.stopped) return;
+      this.slotWatchdog = null;
+      this.fail(this.standard, 'standard_slot_progress_timeout');
+    }, SLOT_PROGRESS_MS);
+    this.slotWatchdog = timer;
+  }
+  fail(link, reason, error) {
     const socket = link.socket;
     if (!socket) return;
+    this.health.standard.failure(failureCategory(reason), error);
     this.markGap(reason);
     this.drop(link);
     try { socket.terminate(); } catch { /* already closed */ }
@@ -236,7 +275,9 @@ export class PaperFeeds {
     this.clearTimer(link.heartbeat); this.clearTimer(link.ackTimer); this.clearTimer(link.retry);
     link.heartbeat = null; link.ackTimer = null; link.retry = null;
     link.socket = null; link.acked = false; link.generation++;
-    this.requests.clear(); this.subscriptions.clear();
+    this.requests.clear(); this.subscriptions.clear(); this.ackDeadlines.clear();
+    this.clearTimer(this.slotWatchdog); this.slotWatchdog = null; this.lastSlot = -1;
+    this.health.standard.update({ pendingProgress: 1, pendingAcks: 0 });
     this.slotRequest = null; this.slotSubscription = null;
     // lastSlot resets so the baseline after resubscription is always delivered.
     for (const watch of this.watches.values()) {
@@ -248,8 +289,9 @@ export class PaperFeeds {
   }
   schedule(link) {
     if (this.stopped || link.retry) return;
-    const delay = Math.min(RETRY_MAX_MS, RETRY_MIN_MS * 2 ** link.attempts);
+    const delay = Math.min(RETRY_MAX_MS, RETRY_MIN_MS * 2 ** Math.min(link.attempts, 16));
     link.attempts++;
+    this.health.standard.update({ phase: 'backoff', nextRetryAt: this.now() + delay });
     link.retry = this.setTimer(() => { link.retry = null; this.connect(link); }, delay);
   }
   subscribe(watch) {
@@ -257,6 +299,7 @@ export class PaperFeeds {
     const id = this.send(this.standard, 'accountSubscribe', [watch.curve, { commitment: 'processed', encoding: 'base64' }]);
     if (id == null) return;
     watch.request = id; this.requests.set(id, watch);
+    this.ackDeadlines.set(id, this.now() + ACK_TIMEOUT_MS);
     this.armAck(this.standard);
   }
   standardMessage(buffer, isBinary) {
@@ -265,19 +308,21 @@ export class PaperFeeds {
     const link = this.standard;
     if (message.id != null) {
       if (message.id === this.slotRequest) {
-        this.slotRequest = null;
-        if (message.error || !Number.isSafeInteger(message.result)) {
-          this.subscriptionError('slotSubscribe', message.error); this.fail(link, 'slot_subscribe_failed'); return;
+        this.slotRequest = null; this.ackDeadlines.delete(message.id);
+        if (message.error || !validSubscription(message.result)) {
+          this.subscriptionError('slotSubscribe', message.error); this.fail(link, 'slot_subscribe_failed', { subscriptionCode: message.error?.code }); return;
         }
         this.slotSubscription = message.result; link.acked = true;
+        this.health.standard.update({ phase: 'subscribed', lastAckAt: this.now(), pendingProgress: 1 });
+        this.armSlotWatchdog();
         this.armAck(link); this.checkReady();
         return;
       }
       const watch = this.requests.get(message.id);
       if (!watch) return;
-      this.requests.delete(message.id);
-      if (message.error || !Number.isSafeInteger(message.result)) {
-        this.subscriptionError('accountSubscribe', message.error); this.fail(link, 'account_subscribe_failed'); return;
+      this.requests.delete(message.id); this.ackDeadlines.delete(message.id);
+      if (message.error || !validSubscription(message.result)) {
+        this.subscriptionError('accountSubscribe', message.error); this.fail(link, 'account_subscribe_failed', { subscriptionCode: message.error?.code }); return;
       }
       if (this.watches.get(watch.mint) !== watch || watch.request !== message.id) {
         this.send(link, 'accountUnsubscribe', [message.result]); // removed or replaced while the ack was in flight
@@ -291,9 +336,14 @@ export class PaperFeeds {
       return;
     }
     if (message.method === 'slotNotification') {
-      if (message.params?.subscription !== this.slotSubscription) return;
+      if (this.slotSubscription == null || message.params?.subscription !== this.slotSubscription) return;
       const slot = message.params?.result?.slot;
-      if (!Number.isSafeInteger(slot)) throw new Error('Malformed slot notification');
+      if (!Number.isSafeInteger(slot) || slot < 0) throw new Error('Malformed slot notification');
+      if (slot > this.lastSlot) {
+        this.lastSlot = slot;
+        this.health.standard.update({ lastProgressAt: this.now(), lastSlot: slot, pendingProgress: 0 }, false);
+        this.armSlotWatchdog();
+      }
       this.safe('onSlot', slot);
       return;
     }
@@ -333,13 +383,16 @@ export class PaperFeeds {
   openConn(curves, key) {
     const pre = this.preprocessed;
     let socket = null;
-    try { socket = this.socketFactory(this.preprocessedUrl, 'preprocessed'); } catch { socket = null; }
-    if (!socket) { this.connFailed(null, 'preprocessed_connect_failed'); return; }
+    const health = this.health.preprocessed;
+    health.update({ phase: pre.conn ? 'subscribed' : 'connecting', attempts: health.value.attempts + 1, nextRetryAt: null });
+    try { socket = this.socketFactory(this.preprocessedUrl, 'preprocessed'); }
+    catch (error) { this.connFailed(null, 'preprocessed_connect_failed', error); return; }
     const conn = { socket, key, curves, request: null, acked: false, alive: true, heartbeat: null, ackTimer: null };
     pre.next = conn;
     const live = () => !this.stopped && (pre.conn === conn || pre.next === conn);
     socket.on('open', () => {
-      if (!live()) return;
+      if (!live() || conn.request != null) return;
+      health.update({ phase: pre.conn ? 'subscribed' : 'subscribing' });
       const beat = () => {
         conn.heartbeat = null;
         if (!live()) return;
@@ -365,30 +418,37 @@ export class PaperFeeds {
       const buffer = toBuffer(raw);
       // Every binary frame received is billed, including overlap duplicates and frames that are not delivered.
       pre.bytes += buffer.length; conn.alive = true;
+      health.update({ lastPayloadAt: this.now() }, false);
       if (isBinary === true) pre.transactions++;
       if (buffer.length > MAX_FRAME_BYTES) { this.connFailed(conn, 'preprocessed_oversized_frame'); return; }
       try { this.preprocessedMessage(conn, buffer, isBinary === true); }
       catch { this.connFailed(conn, 'preprocessed_malformed_message'); }
     });
-    socket.on('error', () => { if (live()) this.connFailed(conn, 'preprocessed_transport_error'); });
-    socket.on('close', () => { if (live()) this.connFailed(conn, 'preprocessed_disconnected'); });
+    socket.on('error', error => { if (live()) this.connFailed(conn, 'preprocessed_transport_error', error); });
+    socket.on('close', code => { if (live()) this.connFailed(conn, 'preprocessed_disconnected', { wsCode: code }); });
+    socket.on('unexpected-response', (_request, response) => {
+      if (live()) this.connFailed(conn, 'preprocessed_http_rejected', { httpStatus: response?.statusCode });
+    });
     socket.on('pong', () => { if (live()) conn.alive = true; });
   }
   preprocessedMessage(conn, buffer, isBinary) {
     const pre = this.preprocessed;
     if (isBinary) {
       if (pre.conn !== conn) return; // only the active connection delivers, so overlap never duplicates frames
+      this.health.preprocessed.update({ lastProgressAt: this.now() }, false);
       this.safe('onTransaction', buffer);
       return;
     }
     const message = JSON.parse(buffer.toString());
     if (message.error) {
       this.subscriptionError('preprocessedSubscribe', message.error);
-      throw new Error('Preprocessed stream error');
+      this.connFailed(conn, 'preprocessed_malformed_message', { subscriptionCode: message.error?.code });
+      return;
     }
     if (message.id == null || message.id !== conn.request || conn.acked) return;
-    if (typeof message.result !== 'number' && typeof message.result !== 'string') throw new Error('Malformed ack');
+    if (!validSubscription(message.result) && !(typeof message.result === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(message.result))) throw new Error('Malformed ack');
     conn.acked = true; pre.attempts = 0;
+    this.health.preprocessed.update({ phase: 'subscribed', lastAckAt: this.now(), failureStreak: 0, nextRetryAt: null });
     this.clearTimer(conn.ackTimer); conn.ackTimer = null;
     // Make-before-break: the replacement takes over only now, then the old connection is closed silently.
     const old = pre.conn;
@@ -412,14 +472,17 @@ export class PaperFeeds {
     this.clearTimer(pre.retry); pre.retry = null; pre.attempts = 0;
     this.clearTimer(this.syncTimer); this.syncTimer = null;
     for (const conn of conns) this.closeConn(conn);
+    this.health.preprocessed.update({ phase: this.stopped ? 'stopped' : 'idle', nextRetryAt: null });
   }
   // A lost active (or never-live) connection is a gap; a failed replacement alongside a healthy one is not.
-  connFailed(conn, reason) {
+  connFailed(conn, reason, error) {
     const pre = this.preprocessed;
+    this.health.preprocessed.failure(failureCategory(reason), error);
     const wasActive = conn != null && pre.conn === conn;
     if (wasActive) pre.conn = null;
     else if (conn != null && pre.next === conn) pre.next = null;
     this.closeConn(conn);
+    this.health.preprocessed.update({ phase: pre.conn ? 'subscribed' : pre.next ? 'subscribing' : 'backoff' });
     const newGap = !pre.conn && this.markGap(reason);
     // Refresh quiet accounts once per announced gap, including a failed first subscription.
     // Repeated retry failures do not invalidate the recovered baselines again.
@@ -429,8 +492,9 @@ export class PaperFeeds {
       }
     }
     if (this.stopped || pre.retry || pre.next) return;
-    const delay = Math.min(RETRY_MAX_MS, RETRY_MIN_MS * 2 ** pre.attempts);
+    const delay = Math.min(RETRY_MAX_MS, RETRY_MIN_MS * 2 ** Math.min(pre.attempts, 16));
     pre.attempts++;
+    this.health.preprocessed.update({ phase: pre.conn ? 'subscribed' : 'backoff', nextRetryAt: this.now() + delay });
     pre.retry = this.setTimer(() => { pre.retry = null; this.reconcile(); }, delay);
   }
   // Aborts the in-flight baseline request and its retry timer and invalidates any late result.
@@ -456,7 +520,7 @@ export class PaperFeeds {
     const task = (async () => {
       try {
         const result = await this.rpc.accounts([watch.curve], {
-          commitment: 'processed', deadlineMs: Date.now() + 5000, signal: controller.signal,
+          commitment: 'processed', deadlineMs: this.now() + 5000, signal: controller.signal,
         });
         const slot = result?.context?.slot;
         if (!Number.isSafeInteger(slot) || !Array.isArray(result.value)) throw new Error('Malformed snapshot');

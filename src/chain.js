@@ -142,6 +142,23 @@ export const CURVE_VALIDATION_CODES = Object.freeze(['missing_or_wrong_owner', '
   'unsupported_quote', 'invalid_flags', 'zero_reserves']);
 const invalidCurve = (code, message) => Object.assign(new Error(message), { validation: code });
 
+// Pinned public IDL prefix, not a claim that an arbitrary account length identifies a version.
+// See test/fixtures/pump-curve-prefix.json for source revision and native-SOL sentinel semantics.
+export function curveLayoutEvidence(account) {
+  const evidence = { curveDiscriminatorMatches: null, quoteLayout: null, quoteMintObserved: null };
+  const data = account?.data;
+  if (account?.owner !== PUMP || !Array.isArray(data) || data[1] !== 'base64' || typeof data[0] !== 'string' ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data[0])) return evidence;
+  const bytes = Buffer.from(data[0], 'base64');
+  if (bytes.length < 8) return evidence;
+  evidence.curveDiscriminatorMatches = bytes.subarray(0, 8).equals(CURVE);
+  if (evidence.curveDiscriminatorMatches && bytes.length >= 115) {
+    evidence.quoteLayout = 'documented_quote_prefix_83';
+    evidence.quoteMintObserved = new PublicKey(bytes.subarray(83, 115)).toBase58();
+  }
+  return evidence;
+}
+
 export function decodeCurve(account) {
   if (!account || account.owner !== PUMP) throw invalidCurve('missing_or_wrong_owner', 'Missing or wrong-owner curve account');
   const bytes = Buffer.from(account.data[0], 'base64');

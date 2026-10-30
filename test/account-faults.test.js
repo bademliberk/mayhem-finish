@@ -91,7 +91,7 @@ test('fault samples are capped at 100 newest and survive decoder-rejection churn
     assert.equal(report.recentAccountFaults.length, 100);
     assert.equal(report.recentAccountFaults[0].slot, 129); assert.equal(report.recentAccountFaults.at(-1).slot, 30);
     assert.deepEqual(Object.keys(report.recentAccountFaults[0]).sort(),
-      ['atMs', 'base64', 'bytes', 'code', 'mint', 'ownerMatches', 'present', 'slot', 'subtype']);
+      ['atMs', 'base64', 'bytes', 'code', 'curveDiscriminatorMatches', 'mint', 'ownerMatches', 'present', 'quoteLayout', 'quoteMintObserved', 'slot', 'subtype']);
     assert.equal(report.recentAccountFaults[0].present, false);
     store.close();
     store = new Store(path, cfg); paper = new PaperStore(store, paperConfig({}));

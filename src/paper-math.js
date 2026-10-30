@@ -3,6 +3,9 @@ import { decodeCurve } from './chain.js';
 const BPS = 10000n;
 const ceilDiv = (a, b) => (a + b - 1n) / b;
 export function reserves(account) {
+  // RPC reconciliation must enforce the same encoding contract as streamed observations.
+  if (!Array.isArray(account?.data) || account.data[1] !== 'base64' || typeof account.data[0] !== 'string' ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(account.data[0])) throw new Error('invalid_data');
   const metrics = decodeCurve(account), bytes = Buffer.from(account.data[0], 'base64');
   if (!metrics.mayhem) throw new Error('not_mayhem');
   return { ...metrics, cashback: bytes.length > 82 && bytes[82] !== 0,
@@ -14,9 +17,18 @@ export function cap(state) {
   return Number(state.virtualSol * state.supply / state.virtualTokens) / 1e9;
 }
 const fee = (lamports, bps) => ceilDiv(lamports * BigInt(bps), BPS);
+// The requirement is useful even when real reserves cannot fund the full sale.
+export function fullSaleGross(state, tokens) {
+  if (state.complete || tokens <= 0n || state.virtualTokens <= 0n || state.virtualSol <= 0n) throw new Error('invalid_sell');
+  return tokens * state.virtualSol / (state.virtualTokens + tokens);
+}
+export function liquidityRisk(state, position, cfg) {
+  // Missing guard fields deliberately leave historical profiles unchanged.
+  return cfg.liquidityExitEnabled === true && !state.complete &&
+    state.realSol <= BigInt(cfg.liquidityExitMultiple ?? 2) * fullSaleGross(state, BigInt(position.tokens_raw));
+}
 export function sell(state, tokens, feeBps) {
-  if (state.complete || tokens <= 0n || state.virtualTokens <= 0n) throw new Error('invalid_sell');
-  const gross = tokens * state.virtualSol / (state.virtualTokens + tokens);
+  const gross = fullSaleGross(state, tokens);
   if (gross <= 0n || gross > state.realSol) throw new Error('insufficient_real_liquidity');
   const charges = fee(gross, feeBps);
   if (charges >= gross) throw new Error('fees_exceed_output');
@@ -89,8 +101,9 @@ export function entryQuality(state, cfg) {
 }
 export function exitQuote(state, position, cfg) {
   const result = sell(state, BigInt(position.tokens_raw), cfg.swapFeeBps);
-  return { tokens: position.tokens_raw, gross: result.gross.toString(),
-    net: (result.net - BigInt(cfg.networkFeeLamports)).toString(), mc: cap(state) };
+  const net = result.net - BigInt(cfg.networkFeeLamports);
+  if (net <= 0n) throw new Error('fees_exceed_output');
+  return { tokens: position.tokens_raw, gross: result.gross.toString(), net: net.toString(), mc: cap(state) };
 }
 export function profitable(quote, position, cfg) {
   return BigInt(quote.net) * BPS > BigInt(position.entry_cost_lamports) * (BPS + BigInt(cfg.profitBps));

@@ -1,0 +1,25 @@
+{
+  "provenance": "Schema excerpt verified against the official public IDL. Tests build synthetic accounts from these fields; these are not captured historical account bytes.",
+  "revision": "639b87fb45c3adeffa6f7c4a1bf0cb85e392bf22",
+  "idl": "https://github.com/pump-fun/pump-public-docs/blob/639b87fb45c3adeffa6f7c4a1bf0cb85e392bf22/idl/pump.json",
+  "semantics": "https://github.com/pump-fun/pump-public-docs/blob/639b87fb45c3adeffa6f7c4a1bf0cb85e392bf22/README.md",
+  "instructionConvention": "https://github.com/pump-fun/pump-public-docs/blob/639b87fb45c3adeffa6f7c4a1bf0cb85e392bf22/docs/instructions/TRADE_V3.md",
+  "account": "BondingCurve",
+  "discriminator": [23, 183, 248, 55, 96, 216, 172, 96],
+  "prefixFields": [
+    { "name": "virtual_token_reserves", "type": "u64" },
+    { "name": "virtual_quote_reserves", "type": "u64" },
+    { "name": "real_token_reserves", "type": "u64" },
+    { "name": "real_quote_reserves", "type": "u64" },
+    { "name": "token_total_supply", "type": "u64" },
+    { "name": "complete", "type": "bool" },
+    { "name": "creator", "type": "pubkey" },
+    { "name": "is_mayhem_mode", "type": "bool" },
+    { "name": "is_cashback_coin", "type": "bool" },
+    { "name": "quote_mint", "type": "pubkey" }
+  ],
+  "quoteOffset": 83,
+  "nativeSolQuote": "11111111111111111111111111111111",
+  "v3SolInstructionQuote": "So11111111111111111111111111111111111111112",
+  "limitation": "The full pinned IDL has additional trailing fields. This prefix does not establish a historical 166-byte layout version. A public key observed at offset 83 is diagnostic evidence, not proof of the account's historical schema. V3 instruction accounts use wrapped SOL; SOL-quoted BondingCurve.quote_mint uses the zero public key."
+}

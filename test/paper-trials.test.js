@@ -4,10 +4,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { Store } from '../src/store.js';
 import { PaperStore, paperConfig } from '../src/paper-store.js';
 import { PaperEngine } from '../src/paper-engine.js';
-import { trialProfiles, trialPath, bindTrial, preflightTrial } from '../src/paper-profiles.js';
+import { trialProfiles, trialPath, trialIdentity, bindTrial, preflightTrial } from '../src/paper-profiles.js';
 import { entryQuality, reserves, meetsDrop } from '../src/paper-math.js';
 import { paperPerformance } from '../src/paper-performance.js';
 import { PUMP } from '../src/config.js';
@@ -45,9 +46,37 @@ test('profiles isolate intended changes and validate experimental configuration'
   assert.equal(paperConfig({ PAPER_MAX_WATCHES: '20' }, 'baseline').maxWatches, 10);
   for (const env of [{ PAPER_MAX_WATCHES: '21' }, { PAPER_MIN_LIQUIDITY_MULTIPLE: '1.5' }, { PAPER_MAX_ROUND_TRIP_LOSS_BPS: '-1' }]) assert.throws(() => paperConfig(env));
   assert.throws(() => paperConfig({}, 'unknown'));
-  assert.equal(new Set(Object.keys(trialProfiles).map(p => trialPath(p))).size, 5);
+  assert.equal(new Set(Object.keys(trialProfiles).map(p => trialPath(p))).size, 6);
+  const exit = paperConfig({ MAX_TRADE_COUNT: '2' }, 'liquidity-exit100');
+  assert.equal(exit.maxTrades, 100); assert.equal(exit.maxWatches, 20);
+  assert.equal(exit.entryQualityEnabled, true);
+  assert.equal(exit.liquidityExitEnabled, true); assert.equal(exit.liquidityExitMultiple, 2);
+  const { profile, maxTrades, liquidityExitEnabled, liquidityExitMultiple, ...entrySettings } = exit;
+  const { profile: previousProfile, maxTrades: previousCap, ...previousSettings } = paperConfig({}, 'liquidity20');
+  assert.deepEqual(entrySettings, previousSettings);
   assert.throws(() => trialPath('../collector'));
   assert.throws(() => trialPath('baseline', 'data', 'data/baseline.sqlite'));
+});
+
+test('legacy serialized configuration and sorted trial identities stay byte-exact', () => {
+  // SHA-256 snapshots of the pre-liquidity-exit configurations, including ordinary paper mode.
+  const snapshots = [
+    [null, '78b51d8da2da351b10ecfb158c801d80aee0f6b9a4697e40747685d117138502', 'da575bd944a7b972acb93c7e9973e738dd952d581d498e7259899113540d3a9e'],
+    ['baseline', 'ba7d692d34ce3c7ff86d39c6b2baabe7724b3e2e49b13a964d534ff78c52baf9', 'b7bb3e5b4a56e5bbc2b376736ea39d8efe0010f25297dd6bd961a09a9f508a4e'],
+    ['coverage20', '5d867f087762693b02e079adad1b6511f0bcb1db7e6a505db75a9a23f5173c3f', '8abb4cd854e525d478ece0737bd5c71b689e1383741793b824ca18cee2488db4'],
+    ['liquidity20', '580d1d92248d1ca9b7cac83a2a3889a5357ed220aa7082eb17ac0cf3d8825eb4', '337d1755769d8c373ea5b53c10051772cd1496e29feba1d11618865bb3749d6a'],
+    ['drop50', 'fd64ce0d775a869b9d9f34ee5fc0e90758f89cce75f565a49b621b78e55a867a', 'ff2ad40621fb0af1ea7ba144eef485b4cc2d8c3bb1f80d760a197088e3b5be2b'],
+    ['window8', '4e6be5f85ee2225a93de678ef42d579fda10b6b0a821b405cd24eb40223afc10', 'c81bf2cd89afcca6608e7aa2daf74ad7268173ec638b7c8b706bd6f8bdb098b8'],
+  ];
+  const hash = value => createHash('sha256').update(value).digest('hex');
+  for (const [profile, serialized, identity] of snapshots) {
+    const config = paperConfig({}, profile);
+    assert.equal(hash(JSON.stringify(config)), serialized, profile);
+    assert.equal(hash(trialIdentity(config)), identity, profile);
+    assert.equal(Object.hasOwn(config, 'liquidityExitEnabled'), false);
+    assert.equal(Object.hasOwn(config, 'liquidityExitMultiple'), false);
+    assert.equal(config.version, 'creation_staged_v2');
+  }
 });
 
 test('trial identity survives restart and refuses changed config or existing history', () => {

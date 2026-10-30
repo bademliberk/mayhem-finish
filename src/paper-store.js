@@ -1,6 +1,7 @@
 import { PUMP } from './config.js';
-import { CURVE_VALIDATION_CODES } from './chain.js';
-import { reserves, exitQuote } from './paper-math.js';
+import { CURVE_VALIDATION_CODES, curveLayoutEvidence } from './chain.js';
+import { reserves, exitQuote, fullSaleGross } from './paper-math.js';
+import { readFeedHealth } from './feed-health.js';
 import { trialProfiles } from './paper-profiles.js';
 import { paperPerformance } from './paper-performance.js';
 
@@ -46,7 +47,8 @@ function safeFault(input, slot, account) {
     subtype: code === 'invalid_curve' && CURVE_VALIDATION_CODES.includes(input.subtype) ? input.subtype : null,
     present: account != null, ownerMatches: account?.owner === PUMP,
     base64: Array.isArray(data) && data[1] === 'base64',
-    bytes: Array.isArray(data) && typeof data[0] === 'string' ? Buffer.byteLength(data[0], 'base64') : null };
+    bytes: Array.isArray(data) && typeof data[0] === 'string' ? Buffer.byteLength(data[0], 'base64') : null,
+    ...curveLayoutEvidence(account) };
 }
 
 export class PaperStore {
@@ -106,8 +108,13 @@ export class PaperStore {
       store.db.exec(`CREATE TABLE IF NOT EXISTS paper_account_faults (
         id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, mint TEXT, slot INTEGER, code TEXT NOT NULL, subtype TEXT,
         present INTEGER NOT NULL, owner_matches INTEGER NOT NULL, base64 INTEGER NOT NULL, bytes INTEGER,
-        source_rejection_id INTEGER UNIQUE
+        source_rejection_id INTEGER UNIQUE,
+        curve_discriminator_matches INTEGER, quote_layout TEXT, quote_mint_observed TEXT
       )`);
+      const faultColumns = store.all('PRAGMA table_info(paper_account_faults)').map(row => row.name);
+      for (const [name, type] of [['curve_discriminator_matches', 'INTEGER'], ['quote_layout', 'TEXT'], ['quote_mint_observed', 'TEXT']]) {
+        if (!faultColumns.includes(name)) store.db.exec(`ALTER TABLE paper_account_faults ADD COLUMN ${name} ${type}`);
+      }
       if (faultsExisted) return;
       for (const row of store.all("SELECT id,at_ms,detail FROM paper_rejections WHERE reason='invalid_account' ORDER BY id DESC LIMIT ?", FAULT_SAMPLE_LIMIT).reverse()) {
         let old;
@@ -145,9 +152,11 @@ export class PaperStore {
     this.count(`account:${detail.code}`);
     this.store.run('INSERT INTO paper_rejections(reason,at_ms,detail) VALUES(?,?,?)', 'invalid_account', now, JSON.stringify(detail));
     this.store.run('DELETE FROM paper_rejections WHERE id NOT IN (SELECT id FROM paper_rejections ORDER BY id DESC LIMIT 100)');
-    this.store.run(`INSERT INTO paper_account_faults(at_ms,mint,slot,code,subtype,present,owner_matches,base64,bytes)
-      VALUES(?,?,?,?,?,?,?,?,?)`, Number.isSafeInteger(now) ? now : 0, detail.mint, detail.slot, detail.code, detail.subtype,
-    Number(detail.present), Number(detail.ownerMatches), Number(detail.base64), detail.bytes);
+    this.store.run(`INSERT INTO paper_account_faults(at_ms,mint,slot,code,subtype,present,owner_matches,base64,bytes,
+      curve_discriminator_matches,quote_layout,quote_mint_observed) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+    Number.isSafeInteger(now) ? now : 0, detail.mint, detail.slot, detail.code, detail.subtype,
+    Number(detail.present), Number(detail.ownerMatches), Number(detail.base64), detail.bytes,
+    detail.curveDiscriminatorMatches == null ? null : Number(detail.curveDiscriminatorMatches), detail.quoteLayout, detail.quoteMintObserved);
     this.store.run(`DELETE FROM paper_account_faults WHERE id NOT IN (SELECT id FROM paper_account_faults ORDER BY id DESC LIMIT ${FAULT_SAMPLE_LIMIT})`);
   }
   capacity() {
@@ -230,11 +239,19 @@ export class PaperStore {
   positionHealth(position, now) {
     const watch = this.watch(position.mint);
     const health = { mint: position.mint, model: 'saved_curve_observation_not_live_quote',
+      heldMs: Math.max(0, now - position.opened_at_ms), entryCostLamports: position.entry_cost_lamports,
+      watchStatus: watch?.status ?? null, exitReason: watch?.reason ?? null,
+      pendingExitReason: this.store.get("SELECT reason FROM paper_orders WHERE mint=? AND side='sell' AND status='pending'", position.mint)?.reason ?? null,
+      fullSaleGrossLamports: null, liquidityCoverageBps: null,
       lastObservedMs: watch?.last_observed_ms ?? null, lastChangeMs: watch?.last_change_ms ?? null,
       observationAgeMs: watch?.last_observed_ms == null ? null : Math.max(0, now - watch.last_observed_ms),
       unchangedMs: watch?.last_change_ms == null ? null : Math.max(0, now - watch.last_change_ms),
       lastMarketCapSol: watch?.last_cap ?? null, accountError: watch?.account_error ?? null,
       realSolLamports: null, fullExitSupported: null, modeledExitNetLamports: null, exitStatus: 'no_saved_state' };
+    // Reconciliation can confirm graduation without replacing the prior saved fingerprint.
+    if (watch?.reason === 'graduated_no_amm_exit') {
+      health.exitStatus = 'graduated'; health.fullExitSupported = false; health.lastMarketCapSol = null; return health;
+    }
     if (watch?.account_error) { health.exitStatus = 'invalid_latest_account'; return health; }
     if (!watch?.fingerprint) return health;
     let state;
@@ -243,6 +260,9 @@ export class PaperStore {
     health.realSolLamports = state.realSol.toString();
     if (state.complete) { health.exitStatus = 'graduated'; health.fullExitSupported = false; return health; }
     try {
+      const gross = fullSaleGross(state, BigInt(position.tokens_raw));
+      health.fullSaleGrossLamports = gross.toString();
+      if (gross > 0n) health.liquidityCoverageBps = (state.realSol * 10000n / gross).toString();
       health.modeledExitNetLamports = exitQuote(state, position, this.cfg).net;
       health.fullExitSupported = true; health.exitStatus = 'modeled_exit_available';
     } catch { health.fullExitSupported = false; health.exitStatus = 'insufficient_liquidity_or_invalid_amount'; }
@@ -250,22 +270,29 @@ export class PaperStore {
   }
   report(now = Date.now()) {
     const positions = this.store.all('SELECT * FROM paper_positions ORDER BY opened_at_ms');
+    const openPositionHealth = positions.filter(row => row.status === 'open').map(row => this.positionHealth(row, now));
+    // Read-only comparisons must also work before the new diagnostics columns are migrated.
+    const faultColumns = new Set(this.store.all('PRAGMA table_info(paper_account_faults)').map(row => row.name));
+    const evidenceColumns = [['curve_discriminator_matches', 'curveDiscriminatorMatches'], ['quote_layout', 'quoteLayout'], ['quote_mint_observed', 'quoteMintObserved']]
+      .map(([column, alias]) => `${faultColumns.has(column) ? column : 'NULL'} ${alias}`).join(',');
     return {
-      mode: 'paper', assumptions: this.cfg, capacity: this.capacity(),
-      performance: paperPerformance(this.store, positions),
+      mode: 'paper', assumptions: this.cfg, capacity: this.capacity(), feedHealth: readFeedHealth(this.store, now),
+      performance: paperPerformance(this.store, positions, openPositionHealth),
       coverage: this.store.all(`SELECT mint,status,last_cap,last_change_ms,last_observed_ms,account_error,preprocessed FROM paper_watches
         WHERE status IN ('watching','holding','exit_blocked')`),
       realizedPnlLamports: positions.reduce((sum, row) => sum + BigInt(row.pnl_lamports ?? '0'), 0n).toString(),
       watches: this.store.all('SELECT status,COUNT(*) count FROM paper_watches GROUP BY status'),
       orders: this.store.all('SELECT side,status,COUNT(*) count FROM paper_orders GROUP BY side,status'),
       positions,
-      openPositionHealth: positions.filter(row => row.status === 'open').map(row => this.positionHealth(row, now)),
+      openPositionHealth,
       recentOrders: this.store.all('SELECT * FROM paper_orders ORDER BY id DESC LIMIT 25'),
       recentSignals: this.store.all('SELECT * FROM paper_signals ORDER BY received_at_ms DESC LIMIT 25'),
       recentRejections: this.store.all('SELECT * FROM paper_rejections ORDER BY id DESC LIMIT 25'),
-      recentAccountFaults: this.store.all(`SELECT at_ms atMs,mint,slot,code,subtype,present,owner_matches ownerMatches,base64,bytes
+      recentAccountFaults: this.store.all(`SELECT at_ms atMs,mint,slot,code,subtype,present,owner_matches ownerMatches,base64,bytes,${evidenceColumns}
         FROM paper_account_faults ORDER BY id DESC LIMIT ${FAULT_SAMPLE_LIMIT}`).map(row => ({ ...row, present: Boolean(row.present),
-        ownerMatches: Boolean(row.ownerMatches), base64: Boolean(row.base64) })),
+        ownerMatches: Boolean(row.ownerMatches), base64: Boolean(row.base64),
+        curveDiscriminatorMatches: row.curveDiscriminatorMatches == null ? null : Boolean(row.curveDiscriminatorMatches) })),
+      accountFaultEvidenceNote: 'Latest 100 samples only, not all faults. quoteMintObserved is read at the documented prefix offset, not proof of a historical account layout. Missing historical evidence remains unknown.',
       counters: this.store.all('SELECT * FROM paper_counters ORDER BY name'),
       blocked: this.store.all("SELECT * FROM paper_watches WHERE status='exit_blocked'"),
       usage: this.store.all("SELECT * FROM usage WHERE source IN ('preprocessed','preprocessed_bytes') OR method='paper_account_received_bytes' ORDER BY day,source,method"),

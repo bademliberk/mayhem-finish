@@ -8,6 +8,8 @@ export const trialProfiles = {
   liquidity20: { maxWatches: 20, entryQualityEnabled: true },
   drop50: { maxWatches: 20, entryQualityEnabled: true, dropBps: 5000 },
   window8: { maxWatches: 20, entryQualityEnabled: true, windowSlots: 8 },
+  'liquidity-exit100': { maxWatches: 20, entryQualityEnabled: true, maxTrades: 100,
+    liquidityExitEnabled: true, liquidityExitMultiple: 2 },
 };
 
 export function trialPath(profile, root = 'data/paper-trials', normalPath = 'data/collector.sqlite') {
