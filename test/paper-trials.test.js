@@ -185,7 +185,8 @@ test('eight-slot entry lookback retains older peaks without extending signal exp
       engine.signal(signal(0.2));
       assert.equal(engine.paper.pending().length, profile === 'window8' ? 1 : 0);
       if (profile === 'window8') {
-        engine.onSlot(20); await engine.reconcile(engine.paper.pending()[0]);
+        engine.onSlot(20);
+        assert.equal(engine.paper.pending().length, 0, 'slot expiry does not wait for reconciliation');
         assert.equal(store.get('SELECT error FROM paper_orders').error, 'signal_expired');
       }
     } finally { store.close(); }

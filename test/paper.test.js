@@ -452,11 +452,12 @@ test('non-Mayhem and invalid flag states fail closed with bounded account diagno
   const s=setup();
   const nonMayhem=account();const bytes=Buffer.from(nonMayhem.data[0],'base64');bytes[81]=0;nonMayhem.data[0]=bytes.toString('base64');
   s.engine.onAccount(mint,15,nonMayhem);assert.equal(s.engine.paper.watch(mint).account_error,'not_mayhem');
-  bytes[81]=2;nonMayhem.data[0]=bytes.toString('base64');
-  for(let i=0;i<105;i++)s.engine.onAccount(mint,16+i,nonMayhem);
-  assert.equal(s.engine.paper.watch(mint).account_error,'invalid_curve');
-  assert.equal(s.store.get('SELECT count(*) n FROM paper_rejections').n,100);
-  assert.equal(s.engine.states.has(mint),false);s.close();
+  assert.equal(s.engine.paper.watch(mint).status,'stopped');s.close();
+  const invalid=setup();bytes[81]=2;nonMayhem.data[0]=bytes.toString('base64');
+  for(let i=0;i<105;i++)invalid.engine.onAccount(mint,16+i,nonMayhem);
+  assert.equal(invalid.engine.paper.watch(mint).account_error,'invalid_curve');
+  assert.equal(invalid.store.get('SELECT count(*) n FROM paper_rejections').n,100);
+  assert.equal(invalid.engine.states.has(mint),false);invalid.close();
 });
 test('invalid held curve preserves the position and desired exit coverage',async()=>{
   const s=setup();s.engine.signal(s.signal());await s.engine.tick();
@@ -583,6 +584,8 @@ test('legacy candidate-parent migration preserves populated paper records and ch
 });
 test('stop while reconciliation awaits RPC ignores response and makes no paper fill',async()=>{
   const s=setup();let resolve;s.rpc.call=()=>new Promise(r=>{resolve=r;});s.engine.signal(s.signal());
-  const ticking=s.engine.tick();await s.engine.stop();resolve({value:[{slot:15,err:null,confirmationStatus:'confirmed'}]});
-  await ticking;assert.equal(s.engine.paper.position(mint),undefined);s.close();
+  const ticking=s.engine.tick();let stopped=false;
+  const stopping=s.engine.stop().then(()=>{stopped=true;});await Promise.resolve();assert.equal(stopped,false);
+  resolve({value:[{slot:15,err:null,confirmationStatus:'confirmed'}]});
+  await stopping;await ticking;assert.equal(s.engine.paper.position(mint),undefined);s.close();
 });

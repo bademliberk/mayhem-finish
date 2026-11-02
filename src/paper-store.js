@@ -4,6 +4,7 @@ import { reserves, exitQuote, fullSaleGross } from './paper-math.js';
 import { readFeedHealth } from './feed-health.js';
 import { trialProfiles } from './paper-profiles.js';
 import { paperPerformance } from './paper-performance.js';
+import { safeOrderDiagnostics, readOrderDiagnostics } from './paper-diagnostics.js';
 
 export function paperConfig(env = process.env, profile = null) {
   const number = (name, fallback, min, max, integer = true) => {
@@ -100,6 +101,9 @@ export class PaperStore {
     const columns = store.all('PRAGMA table_info(paper_watches)').map(row => row.name);
     for (const [name, type] of [['fingerprint', 'TEXT'], ['last_change_ms', 'INTEGER'], ['preprocessed', 'INTEGER NOT NULL DEFAULT 0'], ['account_error', 'TEXT'], ['last_observed_ms', 'INTEGER']]) {
       if (!columns.includes(name)) store.db.exec(`ALTER TABLE paper_watches ADD COLUMN ${name} ${type}`);
+    }
+    if (!store.all('PRAGMA table_info(paper_orders)').some(row => row.name === 'diagnostics_json')) {
+      store.db.exec('ALTER TABLE paper_orders ADD COLUMN diagnostics_json TEXT');
     }
     // Durable account-fault samples, separate from decoder-rejection churn. A one-time copy of the
     // existing safe samples happens only when this table is first created (never re-copied after pruning).
@@ -217,12 +221,26 @@ export class PaperStore {
       return Number(result.lastInsertRowid);
     });
   }
-  cancel(id, now, reason) {
-    this.store.run("UPDATE paper_orders SET status='canceled',settled_at_ms=?,error=? WHERE id=? AND status='pending'", now, reason, id);
+  diagnose(id, patch) {
+    const order = this.store.get("SELECT diagnostics_json FROM paper_orders WHERE id=? AND status='pending'", id);
+    if (!order) return;
+    const value = { ...readOrderDiagnostics(order.diagnostics_json), ...safeOrderDiagnostics(patch) };
+    this.store.run("UPDATE paper_orders SET diagnostics_json=? WHERE id=? AND status='pending'", JSON.stringify(value), id);
+  }
+  cancel(id, now, reason, diagnostics) {
+    if (!diagnostics) return this.store.run("UPDATE paper_orders SET status='canceled',settled_at_ms=?,error=? WHERE id=? AND status='pending'", now, reason, id);
+    const order = this.store.get("SELECT diagnostics_json FROM paper_orders WHERE id=? AND status='pending'", id);
+    if (!order) return { changes: 0 };
+    const value = { ...readOrderDiagnostics(order.diagnostics_json), ...safeOrderDiagnostics(diagnostics) };
+    // One terminal write, also safe inside the engine's existing intent/restart transactions.
+    return this.store.run("UPDATE paper_orders SET status='canceled',settled_at_ms=?,error=?,diagnostics_json=? WHERE id=? AND status='pending'",
+      now, reason, JSON.stringify(value), id);
   }
   fill(order, quote, now) {
     this.store.atomic(() => {
-      if (!this.store.get("SELECT 1 FROM paper_orders WHERE id=? AND status='pending'", order.id)) return;
+      const pending = this.store.get("SELECT diagnostics_json FROM paper_orders WHERE id=? AND status='pending'", order.id);
+      if (!pending) return;
+      if (pending.diagnostics_json != null) this.diagnose(order.id, { stage: 'filled', updatedAtMs: now });
       this.store.run("UPDATE paper_orders SET status='filled',settled_at_ms=?,fill_json=? WHERE id=?", now, JSON.stringify(quote), order.id);
       if (order.side === 'buy') {
         this.store.run(`INSERT INTO paper_positions(mint,tokens_raw,entry_cost_lamports,entry_order_id,opened_at_ms)
@@ -285,14 +303,21 @@ export class PaperStore {
       orders: this.store.all('SELECT side,status,COUNT(*) count FROM paper_orders GROUP BY side,status'),
       positions,
       openPositionHealth,
-      recentOrders: this.store.all('SELECT * FROM paper_orders ORDER BY id DESC LIMIT 25'),
+      recentOrders: this.store.all('SELECT * FROM paper_orders ORDER BY id DESC LIMIT 25').map(({ diagnostics_json, ...order }) =>
+        ({ ...order, diagnostics: readOrderDiagnostics(diagnostics_json) })),
+      orderDiagnosticsNote: 'Bounded evidence recorded after diagnostics were enabled; historical missing evidence is unknown. Status/account elapsed times include RPC queueing and retries, not network latency alone.',
       recentSignals: this.store.all('SELECT * FROM paper_signals ORDER BY received_at_ms DESC LIMIT 25'),
       recentRejections: this.store.all('SELECT * FROM paper_rejections ORDER BY id DESC LIMIT 25'),
       recentAccountFaults: this.store.all(`SELECT at_ms atMs,mint,slot,code,subtype,present,owner_matches ownerMatches,base64,bytes,${evidenceColumns}
         FROM paper_account_faults ORDER BY id DESC LIMIT ${FAULT_SAMPLE_LIMIT}`).map(row => ({ ...row, present: Boolean(row.present),
         ownerMatches: Boolean(row.ownerMatches), base64: Boolean(row.base64),
         curveDiscriminatorMatches: row.curveDiscriminatorMatches == null ? null : Boolean(row.curveDiscriminatorMatches) })),
-      accountFaultEvidenceNote: 'Latest 100 samples only, not all faults. quoteMintObserved is read at the documented prefix offset, not proof of a historical account layout. Missing historical evidence remains unknown.',
+      accountFaultSummary: {
+        totalEvents: this.store.get("SELECT COALESCE(SUM(count),0) n FROM paper_counters WHERE name IN ('account:missing_account','account:wrong_owner','account:invalid_data','account:invalid_curve','account:not_mayhem','account:processing_error')").n,
+        retainedSamples: this.store.get('SELECT COUNT(*) n FROM paper_account_faults').n,
+        distinctMintsInRetainedSamples: this.store.get('SELECT COUNT(DISTINCT mint) n FROM paper_account_faults').n,
+      },
+      accountFaultEvidenceNote: 'Events count rejected observations, not unique mints. Distinct mints cover only the latest 100 retained samples, not all historical faults. quoteMintObserved is read at the documented prefix offset, not proof of a historical account layout. Missing historical evidence remains unknown.',
       counters: this.store.all('SELECT * FROM paper_counters ORDER BY name'),
       blocked: this.store.all("SELECT * FROM paper_watches WHERE status='exit_blocked'"),
       usage: this.store.all("SELECT * FROM usage WHERE source IN ('preprocessed','preprocessed_bytes') OR method='paper_account_received_bytes' ORDER BY day,source,method"),

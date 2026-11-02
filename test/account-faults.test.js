@@ -52,12 +52,13 @@ test('decodeCurve errors carry fixed validation codes with unchanged messages', 
 test('engine records the safe validation subtype only for invalid curves', () => {
   const { store, engine } = setup();
   engine.onAccount(mint, 20, acct(curveBytes(b => { b[81] = 2; })));
-  engine.onAccount(mint, 21, acct(curveBytes(b => { b[81] = 0; })));
-  engine.onAccount(mint, 22, acct(curveBytes(b => { b.writeBigUInt64LE(0n, 8); })));
-  engine.onAccount(mint, 23, null);
+  engine.onAccount(mint, 21, acct(curveBytes(b => { b.writeBigUInt64LE(0n, 8); })));
+  engine.onAccount(mint, 22, null);
+  // A proven non-Mayhem unheld watch is terminal; exercise recoverable faults first.
+  engine.onAccount(mint, 23, acct(curveBytes(b => { b[81] = 0; })));
   const rows = faults(store);
   assert.deepEqual(rows.map(row => [row.code, row.subtype]),
-    [['invalid_curve', 'invalid_flags'], ['not_mayhem', null], ['invalid_curve', 'zero_reserves'], ['missing_account', null]]);
+    [['invalid_curve', 'invalid_flags'], ['invalid_curve', 'zero_reserves'], ['missing_account', null], ['not_mayhem', null]]);
   // Existing counters and paper_rejections remain compatible.
   assert.equal(store.get("SELECT count FROM paper_counters WHERE name='account:invalid_curve'").count, 2);
   const legacy = store.all("SELECT detail FROM paper_rejections WHERE reason='invalid_account'").map(row => JSON.parse(row.detail));
