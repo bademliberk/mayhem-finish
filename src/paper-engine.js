@@ -27,7 +27,7 @@ export class PaperEngine {
     this.coverageSlots = new Map();
     this.lookups = new LookupCache(rpc, name => { if (!this.stopped) this.paper.count(name); }, now);
     this.slot = 0; this.slotAt = 0; this.epoch = 0; this.queue = []; this.working = false; this.stopped = false;
-    this.reconciliations = new Map(); this.exitRefreshes = new Map(); this.exitRefreshAt = new Map(); this.stopPromise = null;
+    this.reconciliations = new Map(); this.exitAttempts = new Map(); this.stopPromise = null;
   }
   attach(feeds) { this.feeds = feeds; }
   request(mint, side, reason, quote, signal, diagnostics = {}, now = this.now()) {
@@ -78,10 +78,15 @@ export class PaperEngine {
         this.cancel(order.id, this.now(), 'sell_superseded'); return false;
       }
     }
-    return this.epoch === active.epoch && this.states.get(order.mint)?.since === active.generation.since;
+    if (this.epoch !== active.epoch) return false;
+    if (this.agentMode && order.side === 'sell' && mandatoryExit(order.reason)) {
+      // Transaction coverage changes affect entry history, not account-driven exit confirmations.
+      return this.states.has(order.mint) && this.paper.position(order.mint)?.entry_order_id === active.entryOrderId;
+    }
+    return this.states.get(order.mint)?.since === active.generation.since;
   }
   unwatch(mint) {
-    this.exitRefreshes.get(mint)?.controller.abort(); this.exitRefreshAt.delete(mint);
+    this.exitAttempts.delete(mint);
     this.states.delete(mint); this.coverageSlots.delete(mint); this.feeds.remove(mint);
     this.store.run('UPDATE paper_watches SET preprocessed=0 WHERE mint=?', mint);
   }
@@ -153,7 +158,6 @@ export class PaperEngine {
     if (this.stopped) return;
     this.ready = false; this.epoch++; this.slot = 0; this.slotAt = 0; this.states.clear(); this.queue = [];
     this.coverageSlots.clear(); this.lookups.clear();
-    for (const active of this.exitRefreshes.values()) active.controller.abort();
     this.paper.count(`gap:${reason}`);
     for (const order of this.paper.pending()) this.cancel(order.id, this.now(), 'feed_gap');
   }
@@ -189,7 +193,7 @@ export class PaperEngine {
       this.unwatch(mint);
     }
   }
-  onAccount(mint, slot, account) {
+  onAccount(mint, slot, account, source = 'live') {
     if (this.stopped || !Number.isSafeInteger(slot) || slot < 0) return;
     const watch = this.paper.watch(mint);
     if (!watch || !['watching', 'holding', 'exit_blocked'].includes(watch.status)) return;
@@ -202,6 +206,8 @@ export class PaperEngine {
     try {
       const row = { state, slot, at: this.now(), revision: ++this.observationRevision,
         since: old?.since ?? Math.max(slot, this.coverageSlots.get(mint) ?? slot), history: old?.history ?? [] };
+      // Confirmation snapshots cannot authorize another exit attempt by themselves.
+      row.exitRevision = source === 'rpc' ? old?.exitRevision : row.revision;
       row.history = row.history.filter(item => item.slot >= slot - this.cfg.windowSlots + 1);
       if (!state.complete) row.history.push({ state, slot, at: row.at });
       // Several writes in one slot have no transaction index; retain their observed peak only.
@@ -247,45 +253,10 @@ export class PaperEngine {
       if (row && position) this.requestExit(watch.mint, row.state, this.exitIntent(watch.mint, row.state) ?? 'profit', null);
     }
   }
-  async refreshAgentExits() {
-    const now = this.now();
-    if (this.stopped || !this.slot || now < this.slotAt || now - this.slotAt > this.cfg.maxStateAgeMs) return;
-    const tasks = [];
-    for (const watch of this.paper.active()) {
-      const mint = watch.mint, position = this.paper.position(mint), row = this.states.get(mint);
-      if (!position || !mandatoryExit(watch.reason) || this.exitRefreshes.has(mint) ||
-          this.paper.pending().some(order => order.mint === mint) || now < (this.exitRefreshAt.get(mint) ?? 0) ||
-          (row && now >= row.at && now - row.at <= this.cfg.maxStateAgeMs)) continue;
-      // Quiet/missing accounts need a fresh quote, not permission to sell stale reserves.
-      // One request per holding, bounded by the watch cap, with a queue-inclusive deadline and retry interval.
-      const active = { controller: new AbortController(), epoch: this.epoch, revision: row?.revision,
-        deadline: now + Math.min(5000, this.cfg.orderTtlMs) };
-      this.exitRefreshAt.set(mint, now + Math.max(1000, this.cfg.maxStateAgeMs));
-      this.exitRefreshes.set(mint, active);
-      const current = () => !this.stopped && !active.controller.signal.aborted && this.epoch === active.epoch &&
-        this.now() >= now && this.now() < active.deadline &&
-        this.paper.position(mint)?.entry_order_id === position.entry_order_id &&
-        this.paper.watch(mint)?.reason !== 'graduated_no_amm_exit';
-      active.promise = (async () => {
-        try {
-          this.paper.count('agent:exit_refresh');
-          const snapshot = await this.rpc.accounts([watch.curve_address], { commitment: 'confirmed',
-            deadlineMs: active.deadline, signal: active.controller.signal });
-          if (!current()) return;
-          const slot = snapshot?.context?.slot, latest = this.states.get(mint), saved = this.paper.watch(mint);
-          const required = Math.max(position.entry_snapshot_slot ?? 0, saved.last_slot ?? 0, latest?.slot ?? 0);
-          if (!Number.isSafeInteger(slot) || slot < required ||
-              (latest?.revision !== active.revision && slot <= required)) {
-            this.paper.count('agent:exit_refresh_behind'); return;
-          }
-          this.onAccount(mint, slot, snapshot.value?.[0] ?? null);
-        } catch {
-          if (current()) this.paper.count('agent:exit_refresh_unavailable');
-        } finally { this.exitRefreshes.delete(mint); }
-      })();
-      tasks.push(active.promise);
-    }
-    await Promise.allSettled(tasks);
+  exitAttemptAvailable(mint, position, observation) {
+    if (!position || !Number.isSafeInteger(observation?.exitRevision)) return false;
+    const previous = this.exitAttempts.get(mint);
+    return previous?.entryOrderId !== position.entry_order_id || previous.revision !== observation.exitRevision;
   }
   exitIntent(mint, state) {
     const watch = this.paper.watch(mint), position = this.paper.position(mint);
@@ -306,7 +277,12 @@ export class PaperEngine {
       }
       const pending = this.paper.pending().find(order => order.mint === mint);
       if (pending && exitPriority(pending.reason) < exitPriority(reason)) {
-        this.cancel(pending.id, this.now(), `${reason}_override`);
+        if (this.agentMode && pending.side === 'sell' && mandatoryExit(pending.reason)) {
+          // Keep the quote, authorization and deadline while promoting an existing mandatory exit.
+          this.store.run("UPDATE paper_orders SET reason=? WHERE id=? AND status='pending'", reason, pending.id);
+          const active = this.reconciliations.get(pending.id);
+          if (active) active.order.reason = reason;
+        } else this.cancel(pending.id, this.now(), `${reason}_override`);
       }
     });
   }
@@ -322,8 +298,15 @@ export class PaperEngine {
       this.latchExit(mint, reason);
     } else if (mandatoryExit(reason)) return;
     if (this.paper.pending().some(order => order.mint === mint)) return;
+    const eventDriven = this.agentMode && mandatoryExit(reason);
+    if (eventDriven) {
+      if (!this.exitAttemptAvailable(mint, position, observation)) return;
+      // Claim the event at evaluation, including unquotable reserves or orders that expire before execution.
+      this.exitAttempts.set(mint, { entryOrderId: position.entry_order_id, revision: observation.exitRevision });
+    }
     try {
       const quote = exitQuote(state, position, this.cfg);
+      if (eventDriven) quote.exitObservationRevision = observation.exitRevision;
       if (reason === 'profit' && !profitable(quote, position, this.cfg)) return;
       if (signal?.base) quote.projectionBase = signal.base;
       if (!signal && Number.isSafeInteger(observation.slot)) quote.observationSlot = observation.slot;
@@ -390,7 +373,7 @@ export class PaperEngine {
     this.working = true;
     try {
       this.discover();
-      if (this.agentMode) { this.checkAgentExits(); await this.refreshAgentExits(); }
+      if (this.agentMode) this.checkAgentExits();
       if (this.stopped) return;
       for (const watch of this.paper.active()) {
         if (watch.preprocessed && !this.paper.position(watch.mint) &&
@@ -479,15 +462,21 @@ export class PaperEngine {
   reconcile(order) {
     if (this.stopped) return Promise.resolve();
     if (this.reconciliations.has(order.id)) return this.reconciliations.get(order.id).promise;
-    if (!this.store.get("SELECT 1 FROM paper_orders WHERE id=? AND status='pending'", order.id) || this.expire(order)) return Promise.resolve();
+    order = this.store.get("SELECT * FROM paper_orders WHERE id=? AND status='pending'", order.id);
+    if (!order || this.expire(order)) return Promise.resolve();
     const generation = this.states.get(order.mint);
     if (!generation || (!this.ready && !mandatoryExit(order.reason))) return Promise.resolve();
-    const saved = this.store.get('SELECT diagnostics_json FROM paper_orders WHERE id=?', order.id);
-    const active = { controller: new AbortController(), generation: { ...generation }, epoch: this.epoch,
+    const limited = this.agentMode && order.side === 'sell' && mandatoryExit(order.reason);
+    const active = { controller: new AbortController(), order, generation: { ...generation }, epoch: this.epoch,
+      entryOrderId: limited ? this.paper.position(order.mint)?.entry_order_id : null,
       triggerRevision: this.agentMode && order.side === 'buy' ? JSON.parse(order.quote_json).triggerRevision : null,
-      diagnostics: readOrderDiagnostics(saved?.diagnostics_json) ?? {} };
+      diagnostics: readOrderDiagnostics(order.diagnostics_json) ?? {} };
     this.reconciliations.set(order.id, active);
-    active.promise = this.reconcileActive(order, active).finally(() => this.reconciliations.delete(order.id));
+    active.promise = this.reconcileActive(order, active).finally(() => {
+      // cancel() already ignores filled/canceled orders; failed exits wait for a new account event.
+      if (limited) this.cancel(order.id, this.now(), 'awaiting_account_update');
+      this.reconciliations.delete(order.id);
+    });
     return active.promise;
   }
   async reconcileActive(order, active) {
@@ -608,7 +597,7 @@ export class PaperEngine {
         if (intent) {
           // Retain the confirmed trigger as the latest observation, including a drained pool.
           // Otherwise a retry could quote an older streamed state after this order is canceled.
-          this.onAccount(order.mint, slot, snapshot.value[0]);
+          this.onAccount(order.mint, slot, snapshot.value[0], 'rpc');
           if (this.paper.watch(order.mint).account_error) return;
           this.latchExit(order.mint, intent);
           if (intent !== order.reason) {
@@ -628,7 +617,7 @@ export class PaperEngine {
       this.diagnose(order, { stage: 'ready_to_fill' });
       if (this.agentMode && order.side === 'buy') {
         // The holding must never be evaluated against an older pre-entry observation.
-        this.onAccount(order.mint, slot, snapshot.value[0]);
+        this.onAccount(order.mint, slot, snapshot.value[0], 'rpc');
         if (!this.current(order, active)) return;
       }
       this.paper.fill(order, quote, this.now());
@@ -646,11 +635,9 @@ export class PaperEngine {
     this.stopped = true; this.ready = false; this.epoch++; this.queue = [];
     for (const order of this.paper.pending()) this.cancel(order.id, this.now(), 'stopped');
     for (const active of this.reconciliations.values()) active.controller.abort();
-    for (const active of this.exitRefreshes.values()) active.controller.abort();
     // Cancellation happens before feed teardown; wait for all continuations, including failed teardown.
     this.stopPromise = Promise.allSettled([
       ...[...this.reconciliations.values()].map(active => active.promise),
-      ...[...this.exitRefreshes.values()].map(active => active.promise),
       Promise.resolve().then(() => this.feeds.stop()), Promise.resolve().then(() => this.lookups.stop()),
     ]).then(results => {
       const failed = results.find(result => result.status === 'rejected');

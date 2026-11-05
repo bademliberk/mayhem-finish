@@ -264,7 +264,7 @@ test('timeout triggers on slots without changed accounts, stays mandatory, and n
     s.engine.onAccount(mint, 23, account(0n)); s.snapshot(account(0n), 23);
     await s.engine.reconcile(pending(s)); assert.ok(position(s)); assert.equal(watch(s).reason, 'timeout');
     // Cancel/expiry does not lose intent; fresh funded state permits a later full exit.
-    s.engine.cancel(pending(s).id, 100000, 'test'); s.engine.onAccount(mint, 24, account()); s.snapshot(account(), 24);
+    assert.equal(pending(s), undefined); s.engine.onAccount(mint, 24, account()); s.snapshot(account(), 24);
     assert.equal(pending(s).reason, 'timeout'); await s.engine.reconcile(pending(s)); assert.equal(position(s), undefined);
   } finally { s.close(); }
 });
@@ -352,51 +352,202 @@ test('confirmed entry retains its newer account watermark before evaluating hold
   } finally { s.close(); }
 });
 
-test('quiet liquid holding refreshes at the default timeout and exits without an account notification', async () => {
+test('quiet timeout holdings wait for account updates without fallback RPC polling', async () => {
   const s = setup(); try {
     await buy(s); let calls = 0, slot = 20;
     s.rpc.accounts = async () => { calls++; return snapshotOf(account(), slot); };
-    for (slot = 21; slot <= 100; slot++) { s.now(100000 + (slot - 20) * 400); s.engine.onSlot(slot); await s.engine.tick(); }
-    assert.equal(calls, 2); assert.equal(position(s), undefined); assert.equal(watch(s).reason, 'timeout');
+    for (slot = 21; slot <= 120; slot++) {
+      s.now(100000 + (slot - 20) * 400); s.engine.onSlot(slot); await s.engine.tick();
+    }
+    assert.equal(calls, 0); assert.ok(position(s)); assert.equal(watch(s).reason, 'timeout');
+    assert.equal(pending(s), undefined);
+    s.engine.onAccount(mint, slot, account()); await s.engine.tick();
+    assert.equal(calls, 1); assert.equal(position(s), undefined);
+    assert.equal(s.engine.exitAttempts.has(mint), false);
   } finally { s.close(); }
 });
 
-test('missing holding state is refreshed before a mandatory timeout quote', async () => {
-  const s = setup({ holdSlots: 3 }); try {
-    await buy(s); s.engine.states.delete(mint); s.engine.onSlot(23); s.snapshot(account(), 23);
-    assert.equal(pending(s), undefined); assert.equal(watch(s).reason, 'timeout');
-    await s.engine.tick(); assert.equal(position(s), undefined);
-  } finally { s.close(); }
-});
-
-test('timeout refresh failures are rate limited and do not fabricate fills', async () => {
-  const s = setup({ holdSlots: 3 }); try {
-    await buy(s); let calls = 0; s.rpc.accounts = async () => { calls++; throw new Error('offline'); };
-    s.now(106000); s.engine.onSlot(23); await s.engine.tick(); assert.equal(calls, 1);
-    await s.engine.tick(); assert.equal(calls, 1); assert.ok(position(s)); assert.equal(pending(s), undefined);
-    s.now(111001); s.engine.onSlot(24); await s.engine.tick(); assert.equal(calls, 2); assert.ok(position(s));
-  } finally { s.close(); }
-});
-
-test('gap and shutdown abort stale-holding refreshes and ignore late results', async () => {
-  for (const kind of ['gap', 'stop']) {
+test('missing and illiquid holdings remain unresolved without periodic account reads', async () => {
+  for (const missing of [true, false]) {
     const s = setup({ holdSlots: 3 }); try {
-      await buy(s); const wait = deferred(); let signal;
-      s.rpc.accounts = (_addresses, options) => { signal = options.signal; return wait.promise; };
-      s.now(106000); s.engine.onSlot(23); const work = s.engine.tick();
-      assert.ok(signal); const stop = kind === 'stop' ? s.engine.stop() : (s.engine.gap('test'), Promise.resolve());
-      assert.equal(signal.aborted, true); wait.resolve(snapshotOf(account(), 23)); await work; await stop;
-      assert.ok(position(s)); assert.equal(pending(s), undefined); assert.equal(s.engine.exitRefreshes.size, 0);
+      await buy(s);
+      if (missing) s.engine.states.delete(mint);
+      else s.engine.onAccount(mint, 20, account(0n));
+      let calls = 0; s.rpc.accounts = async () => { calls++; throw new Error('No fallback reads allowed'); };
+      for (let i = 0; i < 100; i++) {
+        s.now(106000 + i * 60000); s.engine.onSlot(23 + i); await s.engine.tick();
+      }
+      assert.equal(calls, 0); assert.ok(position(s)); assert.equal(watch(s).reason, 'timeout');
+      assert.equal(pending(s), undefined);
     } finally { s.close(); }
   }
 });
 
-test('quiet-holding refresh ignores a response after its own deadline', async () => {
+test('failed mandatory confirmations wait for new account events instead of polling or replacing orders', async () => {
+  for (const result of ['failure', 'missing', 'invalid', 'behind', 'drained', 'slippage']) {
+    const s = setup({ holdSlots: 3 }); try {
+      await buy(s); let calls = 0;
+      s.rpc.accounts = async () => {
+        calls++;
+        if (result === 'failure') throw new Error('offline');
+        return snapshotOf(result === 'missing' ? null : result === 'invalid' ? {} :
+          result === 'drained' ? account(0n) : result === 'slippage' ? account(40000000n, 100000000n) : account(),
+          result === 'behind' ? 19 : 23);
+      };
+      s.engine.onSlot(23); await s.engine.tick(); assert.equal(calls, 1, result);
+      assert.equal(pending(s), undefined); const orders = s.store.get('SELECT COUNT(*) n FROM paper_orders').n;
+      for (const now of [100100, 101000, 110000, 400000, 1000000]) {
+        s.now(now); s.engine.onSlot(23); await s.engine.tick(); assert.equal(calls, 1, result);
+        assert.equal(s.store.get('SELECT COUNT(*) n FROM paper_orders').n, orders);
+      }
+      s.rpc.accounts = async () => { calls++; return snapshotOf(account(), 24); };
+      s.engine.onSlot(24); s.engine.onAccount(mint, 24, account()); await s.engine.tick();
+      assert.equal(calls, 2, result); assert.equal(position(s), undefined);
+    } finally { s.close(); }
+  }
+});
+
+test('confirmation snapshots cannot authorize a second mandatory exit attempt', async () => {
+  const s = setup({ holdSlots: 3 }); try {
+    await buy(s); let calls = 0;
+    s.rpc.accounts = async () => { calls++; throw new Error('offline'); };
+    s.engine.onSlot(23); await s.engine.tick(); assert.equal(calls, 1);
+    s.engine.onAccount(mint, 24, account(), 'rpc'); await s.engine.tick();
+    assert.equal(calls, 1); assert.equal(pending(s), undefined);
+    s.engine.onAccount(mint, 24, account()); s.engine.onAccount(mint, 24, account(45000000n));
+    await s.engine.tick(); assert.equal(calls, 2);
+    // The second live event retains its own authorization rather than being consumed by the older quote.
+    await s.engine.tick(); assert.equal(calls, 3);
+    await s.engine.tick(); assert.equal(calls, 3);
+  } finally { s.close(); }
+});
+
+test('subscription baseline can authorize one exit attempt but does not start polling', async () => {
+  const s = setup({ holdSlots: 3 }); let feeds;
+  try {
+    await buy(s); s.engine.gap('test'); s.engine.onReady(); s.engine.onSlot(23);
+    let calls = 0, source;
+    s.rpc.accounts = async () => { calls++; throw new Error('offline'); };
+    await s.engine.tick(); assert.equal(calls, 0);
+    feeds = new PaperFeeds(s.store, { accounts: async () => snapshotOf(account(), 24) }, {
+      agentMode: true, now: () => 100000, socketFactory: () => { throw new Error('No sockets allowed'); },
+      onAccount: (...args) => { source = args[3]; s.engine.onAccount(...args); },
+    });
+    feeds.add(mint, watch(s).curve_address); feeds.snapshot(feeds.watches.get(mint));
+    await Promise.all([...feeds.tasks]); assert.equal(source, 'baseline');
+    await s.engine.tick(); assert.equal(calls, 1);
+    for (const now of [100100, 101000, 110000, 1000000]) {
+      s.now(now); s.engine.onSlot(24); await s.engine.tick(); assert.equal(calls, 1);
+    }
+    assert.ok(position(s)); assert.equal(watch(s).reason, 'timeout');
+  } finally { await feeds?.stop(); s.close(); }
+});
+
+test('gap and shutdown abort event-driven exit confirmations and ignore late results', async () => {
+  for (const kind of ['gap', 'stop']) {
+    const s = setup({ holdSlots: 3 }); try {
+      await buy(s); const wait = deferred(); let signal;
+      s.rpc.accounts = (_addresses, options) => { signal = options.signal; return wait.promise; };
+      s.engine.onSlot(23); const work = s.engine.tick(); assert.ok(signal);
+      const stop = kind === 'stop' ? s.engine.stop() : (s.engine.gap('test'), Promise.resolve());
+      assert.equal(signal.aborted, true); wait.resolve(snapshotOf(account(), 23)); await work; await stop;
+      assert.ok(position(s)); assert.equal(pending(s), undefined);
+    } finally { s.close(); }
+  }
+});
+
+test('newer invalid observations cancel in-flight confirmations even in the same slot', async () => {
   const s = setup({ holdSlots: 3 }); try {
     await buy(s); const wait = deferred(); s.rpc.accounts = () => wait.promise;
-    s.now(106000); s.engine.onSlot(23); const work = s.engine.tick();
-    s.now(111000); wait.resolve(snapshotOf(account(), 23)); await work;
-    assert.equal(s.engine.states.get(mint).slot, 20); assert.ok(position(s)); assert.equal(pending(s), undefined);
+    s.engine.onSlot(23); const work = s.engine.tick();
+    s.engine.onAccount(mint, 23, null); wait.resolve(snapshotOf(account(), 23)); await work;
+    assert.ok(position(s)); assert.equal(watch(s).account_error, 'missing_account');
+    assert.equal(s.engine.states.has(mint), false); assert.equal(pending(s), undefined);
+  } finally { s.close(); }
+});
+
+test('event-driven confirmation still enforces its order deadline', async () => {
+  const s = setup({ holdSlots: 3, orderTtlMs: 1000 }); try {
+    await buy(s); const wait = deferred(); let calls = 0;
+    s.rpc.accounts = () => { calls++; return wait.promise; };
+    s.engine.onSlot(23); const order = pending(s), work = s.engine.tick();
+    s.now(101000); wait.resolve(snapshotOf(account(), 23)); await work;
+    assert.ok(position(s)); assert.equal(canceled(s, order.id), 'signal_expired');
+    await s.engine.tick(); assert.equal(calls, 1); assert.equal(pending(s), undefined);
+  } finally { s.close(); }
+});
+
+test('timeout promotes queued and in-flight risk exits without aborting or replacing their authorization', async () => {
+  for (const started of [false, true]) {
+    const s = setup({ holdSlots: 3 }); try {
+      await buy(s); s.engine.onAccount(mint, 21, account(6000000n)); const order = pending(s), wait = deferred();
+      assert.equal(order.reason, 'liquidity_risk'); let signal;
+      s.rpc.accounts = (_addresses, options) => { signal = options.signal; return wait.promise; };
+      let work = started ? s.engine.reconcile(order) : null;
+      s.engine.onSlot(23); assert.equal(pending(s).id, order.id); assert.equal(pending(s).reason, 'timeout');
+      assert.equal(pending(s).expires_at_ms, order.expires_at_ms);
+      if (!started) work = s.engine.reconcile(order);
+      assert.equal(signal.aborted, false);
+      wait.resolve(snapshotOf(account(6000000n), 23)); await work;
+      assert.equal(position(s), undefined); assert.equal(watch(s).reason, 'timeout');
+      assert.equal(s.store.get('SELECT reason FROM paper_orders WHERE id=?', order.id).reason, 'timeout');
+    } finally { s.close(); }
+  }
+});
+
+test('an older order does not consume a newer account event against its stale quote', async () => {
+  const s = setup({ holdSlots: 3 }); try {
+    await buy(s); s.engine.onSlot(23); const first = pending(s);
+    const revision = JSON.parse(first.quote_json).exitObservationRevision;
+    s.engine.onAccount(mint, 24, account(40000000n, 100000000n));
+    const newer = s.engine.states.get(mint).exitRevision; assert.notEqual(revision, newer);
+    let calls = 0; s.rpc.accounts = async () => { calls++; return snapshotOf(account(40000000n, 100000000n), 24); };
+    await s.engine.reconcile(first); assert.equal(canceled(s, first.id), 'sell_slippage');
+    assert.equal(s.engine.exitAttempts.get(mint).revision, revision); assert.ok(position(s));
+    await s.engine.tick(); assert.equal(calls, 2); assert.equal(position(s), undefined);
+    const second = s.store.get("SELECT quote_json FROM paper_orders WHERE side='sell' ORDER BY id DESC LIMIT 1");
+    assert.equal(JSON.parse(second.quote_json).exitObservationRevision, newer);
+  } finally { s.close(); }
+});
+
+test('transaction coverage cannot invalidate an account-baseline-authorized mandatory exit', async () => {
+  const s = setup({ holdSlots: 3 }); try {
+    await buy(s); s.engine.gap('reconnect'); s.engine.onSlot(23);
+    s.engine.onAccount(mint, 24, account(), 'baseline'); const order = pending(s), wait = deferred();
+    assert.ok(order); s.rpc.accounts = () => wait.promise;
+    const work = s.engine.reconcile(order), before = s.engine.states.get(mint).since;
+    s.engine.onSlot(25); s.engine.coverage(mint);
+    assert.notEqual(s.engine.states.get(mint).since, before);
+    wait.resolve(snapshotOf(account(), 25)); await work;
+    assert.equal(position(s), undefined); assert.equal(watch(s).reason, 'timeout');
+  } finally { s.close(); }
+});
+
+test('orders expiring before their first RPC cannot be recreated from the same account event', async () => {
+  const s = setup({ holdSlots: 3, orderTtlMs: 1000, maxStateAgeMs: 60000 }); try {
+    await buy(s); let calls = 0;
+    s.rpc.accounts = async () => { calls++; return snapshotOf(account(), 24); };
+    s.engine.onSlot(23); const order = pending(s), count = s.store.get('SELECT COUNT(*) n FROM paper_orders').n;
+    for (const now of [101000, 102000, 110000, 150000]) {
+      s.now(now); s.engine.onSlot(23); await s.engine.tick();
+      assert.equal(calls, 0); assert.equal(pending(s), undefined);
+      assert.equal(s.store.get('SELECT COUNT(*) n FROM paper_orders').n, count);
+    }
+    assert.equal(canceled(s, order.id), 'signal_expired');
+    s.engine.onAccount(mint, 24, account()); assert.equal(pending(s).expires_at_ms, 151000);
+    await s.engine.tick(); assert.equal(calls, 1); assert.equal(position(s), undefined);
+  } finally { s.close(); }
+});
+
+test('an illiquid mandatory-exit observation is evaluated and counted only once', async () => {
+  const s = setup({ holdSlots: 3 }); try {
+    await buy(s); let failures = 0; const count = s.engine.paper.count.bind(s.engine.paper);
+    s.engine.paper.count = name => { if (name === 'exit_insufficient_liquidity') failures++; return count(name); };
+    s.engine.onAccount(mint, 21, account(0n)); assert.equal(failures, 1);
+    for (let i = 0; i < 20; i++) { s.engine.onSlot(23); await s.engine.tick(); }
+    assert.equal(failures, 1); assert.equal(watch(s).reason, 'timeout');
+    s.engine.onAccount(mint, 24, account(0n)); await s.engine.tick(); assert.equal(failures, 2);
+    assert.ok(position(s)); assert.equal(pending(s), undefined);
   } finally { s.close(); }
 });
 

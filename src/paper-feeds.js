@@ -555,11 +555,11 @@ export class PaperFeeds {
           commitment: this.agentMode ? 'confirmed' : 'processed', deadlineMs: this.now() + 5000, signal: controller.signal,
         });
         const slot = result?.context?.slot;
-        if (!Number.isSafeInteger(slot) || !Array.isArray(result.value)) throw new Error('Malformed snapshot');
+        if (!Number.isSafeInteger(slot) || slot < 0 || !Array.isArray(result.value)) throw new Error('Malformed snapshot');
         if (!current() || controller.signal.aborted) return; // stale generation, or cancelled by a newer state
         if (slot > watch.lastSlot) {
           watch.lastSlot = slot;
-          this.safe('onAccount', watch.mint, slot, result.value[0] ?? null);
+          this.safe('onAccount', watch.mint, slot, result.value[0] ?? null, 'baseline');
         }
         watch.attempts = 0;
         if (this.agentMode) this.notifyCoverage();

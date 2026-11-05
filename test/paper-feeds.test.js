@@ -441,6 +441,19 @@ test('baseline retry uses bounded per-watch backoff and recovers on success', as
   await t.feeds.stop();
 });
 
+test('negative baseline slots are rejected and retried as malformed responses', async () => {
+  let calls = 0;
+  const t = setup({ accounts: async () => ({ context: { slot: ++calls === 1 ? -1 : 0 }, value: [{ lamports: 7 }] }) });
+  try {
+    await t.bringUp(); assert.equal(calls, 1); assert.deepEqual(t.of('account'), []);
+    assert.ok(retryTimer(t)); assert.equal(t.feeds.watches.get('m1').lastSlot, -1);
+    assert.deepEqual(t.usage.filter(u => u[0] === 'paper_baseline'), [['paper_baseline', 'failed', 1]]);
+    t.advance(1000); await settle();
+    assert.equal(calls, 2); assert.deepEqual(t.of('account'), [['account', 'm1', 0, { lamports: 7 }]]);
+    assert.equal(t.feeds.watches.get('m1').baselineRetry, null);
+  } finally { await t.feeds.stop(); }
+});
+
 test('baseline retry delay doubles up to the cap', async () => {
   const t = setup({ accounts: async () => { throw new Error('rpc down'); } });
   await t.bringUp();

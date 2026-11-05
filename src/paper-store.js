@@ -34,7 +34,7 @@ export function paperConfig(env = process.env, profile = null) {
     entriesEnabled: env.PAPER_ENTRIES_ENABLED !== 'false',
     ...(profile === null ? {} : { maxWatches: 10, ...trialProfiles[profile] }),
     ...(profile !== 'agent-sell-liquidity' ? {} : {
-      version: 'agent_sell_liquidity_v1',
+      version: 'agent_sell_liquidity_v2_event_only',
       fractionBps: number('PAPER_AGENT_FRACTION_BPS', 1200, 1, 10000),
       maxSwapBudgetLamports: String(number('PAPER_AGENT_MAX_SWAP_LAMPORTS', 10000000, 1, 1e12)),
       minRealSolLamports: String(number('PAPER_AGENT_MIN_REAL_SOL_LAMPORTS', 10000000, 1, 1e12)),
@@ -388,6 +388,10 @@ export class PaperStore {
     return {
       mode: 'paper', assumptions: this.cfg, capacity: this.capacity(), feedHealth: readFeedHealth(this.store, now),
       ...(this.cfg.strategy !== 'agent-sell-liquidity' ? {} : {
+        policyMigrations: (() => {
+          const saved = this.store.get("SELECT value FROM metadata WHERE key='paper_trial_policy_migration'")?.value;
+          return saved ? [JSON.parse(saved)] : [];
+        })(),
         exposure: Object.fromEntries(Object.entries(this.exposure()).map(([key, value]) => [`${key}Lamports`, value.toString()])),
         recentAgentEvents: this.store.get("SELECT 1 FROM sqlite_master WHERE name='paper_agent_events'") ?
           this.store.all('SELECT * FROM paper_agent_events ORDER BY id DESC LIMIT 25') : [],

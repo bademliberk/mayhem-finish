@@ -14,17 +14,23 @@ import { PaperEngine } from './paper-engine.js';
 import { paperConfig, PaperStore } from './paper-store.js';
 import { PaperFeeds } from './paper-feeds.js';
 import { projectTransaction } from './paper-decode.js';
-import { trialPath, bindTrial, preflightTrial } from './paper-profiles.js';
+import { trialPath, bindTrial, preflightTrial, migrateAgentExitPolicy } from './paper-profiles.js';
 
 const cfg = config();
 const command = process.argv[2] ?? 'start';
 const trial = command === 'paper-trial';
 const profile = trial ? process.argv[3] : null;
+const trialArgs = trial ? process.argv.slice(4) : [];
+const migratePolicy = trialArgs.includes('--migrate-exit-policy');
+if (trialArgs.length && !(profile === 'agent-sell-liquidity' && migratePolicy &&
+    trialArgs.length === 2 && trialArgs.includes('--confirm-offline'))) {
+  throw new Error('Usage: paper-trial <profile> OR paper-trial agent-sell-liquidity --migrate-exit-policy --confirm-offline (stop all trial processes first)');
+}
 if (trial) cfg.db = trialPath(profile, process.env.PAPER_TRIAL_DIR, cfg.db);
 cfg.paperMode = command === 'paper' || trial;
 const paperCfg = cfg.paperMode || command === 'paper-report' ? paperConfig(process.env, profile) : null;
-if (trial) preflightTrial(cfg.db, paperCfg);
-const store = new Store(cfg.db, cfg);
+if (trial && !migratePolicy) preflightTrial(cfg.db, paperCfg);
+const store = migratePolicy ? null : new Store(cfg.db, cfg);
 
 async function inspect(rpc, mint) {
   if (!mint) throw new Error('Usage: npm run inspect -- <mint>');
@@ -122,7 +128,9 @@ async function start(rpc) {
 }
 
 try {
-  if (command === 'report') console.log(JSON.stringify(report(store), null, 2));
+  if (migratePolicy) console.log(JSON.stringify({ event: 'paper_trial_policy_migrated', database: cfg.db,
+    migration: migrateAgentExitPolicy(cfg.db, paperCfg, { confirmOffline: true }) }, null, 2));
+  else if (command === 'report') console.log(JSON.stringify(report(store), null, 2));
   else if (command === 'inspect') await inspect(new Rpc(cfg, store), process.argv[3]);
   else if (command === 'paper-report') {
     const saved = store.get("SELECT value FROM metadata WHERE key='paper_trial_config'")?.value;
@@ -133,4 +141,4 @@ try {
 } catch (error) {
   console.error(error.message);
   process.exitCode = 1;
-} finally { store.close(); }
+} finally { store?.close(); }
