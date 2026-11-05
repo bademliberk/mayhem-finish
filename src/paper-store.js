@@ -33,6 +33,17 @@ export function paperConfig(env = process.env, profile = null) {
     orderTtlMs: number('PAPER_ORDER_TTL_MS', 10000, 1000, 60000),
     entriesEnabled: env.PAPER_ENTRIES_ENABLED !== 'false',
     ...(profile === null ? {} : { maxWatches: 10, ...trialProfiles[profile] }),
+    ...(profile !== 'agent-sell-liquidity' ? {} : {
+      version: 'agent_sell_liquidity_v1',
+      fractionBps: number('PAPER_AGENT_FRACTION_BPS', 1200, 1, 10000),
+      maxSwapBudgetLamports: String(number('PAPER_AGENT_MAX_SWAP_LAMPORTS', 10000000, 1, 1e12)),
+      minRealSolLamports: String(number('PAPER_AGENT_MIN_REAL_SOL_LAMPORTS', 10000000, 1, 1e12)),
+      maxExposureLamports: String(number('PAPER_AGENT_MAX_EXPOSURE_LAMPORTS', 50000000, 1, 1e13)),
+      holdSlots: number('PAPER_AGENT_HOLD_SLOTS', 80, 1, 100000),
+      profitBps: number('PAPER_AGENT_PROFIT_BPS', 3000, 0, 100000),
+      liquidityExitMultiple: number('PAPER_AGENT_EXIT_MULTIPLE', 2, 0, 100),
+      swapFeeBps: number('PAPER_SWAP_FEE_BPS', 125, 0, 2000),
+    }),
   };
 }
 
@@ -105,6 +116,21 @@ export class PaperStore {
     if (!store.all('PRAGMA table_info(paper_orders)').some(row => row.name === 'diagnostics_json')) {
       store.db.exec('ALTER TABLE paper_orders ADD COLUMN diagnostics_json TEXT');
     }
+    store.db.exec(`
+      CREATE TABLE IF NOT EXISTS paper_agent_cursors (
+        mint TEXT PRIMARY KEY REFERENCES paper_watches(mint), slot INTEGER NOT NULL,
+        signature TEXT NOT NULL, event_index INTEGER NOT NULL, revision INTEGER NOT NULL, ambiguous INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS paper_agent_events (
+        id INTEGER PRIMARY KEY, signature TEXT NOT NULL, mint TEXT NOT NULL, event_index INTEGER NOT NULL,
+        slot INTEGER NOT NULL, received_at_ms INTEGER NOT NULL, outcome TEXT NOT NULL, detail TEXT,
+        UNIQUE(signature,mint,event_index)
+      );
+    `);
+    const positionColumns = store.all('PRAGMA table_info(paper_positions)').map(row => row.name);
+    for (const name of ['entry_snapshot_slot', 'timeout_slot']) {
+      if (!positionColumns.includes(name)) store.db.exec(`ALTER TABLE paper_positions ADD COLUMN ${name} INTEGER`);
+    }
     // Durable account-fault samples, separate from decoder-rejection churn. A one-time copy of the
     // existing safe samples happens only when this table is first created (never re-copied after pruning).
     const faultsExisted = store.get("SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_account_faults'") != null;
@@ -145,7 +171,7 @@ export class PaperStore {
         program: key(ix.program), discriminator: /^[a-f0-9]{0,16}$/.test(ix.discriminator) ? ix.discriminator : null,
         accounts: Number.isSafeInteger(ix.accounts) ? ix.accounts : null, bytes: Number.isSafeInteger(ix.bytes) ? ix.bytes : null,
       })) };
-    if (['slotSubscribe', 'accountSubscribe', 'preprocessedSubscribe'].includes(details?.method)) {
+    if (['slotSubscribe', 'accountSubscribe', 'preprocessedSubscribe', 'transactionSubscribe'].includes(details?.method)) {
       safe.method = details.method; safe.code = Number.isSafeInteger(details.code) ? details.code : null;
     }
     this.store.run('INSERT INTO paper_rejections(reason,at_ms,detail) VALUES(?,?,?)', reason, now, JSON.stringify(safe));
@@ -207,19 +233,76 @@ export class PaperStore {
     this.store.run('UPDATE paper_signals SET mint=?,outcome=?,detail=? WHERE signature=?', mint, outcome, detail, signature);
     this.count(outcome);
   }
+  agentCursor(mint) { return this.store.get('SELECT * FROM paper_agent_cursors WHERE mint=?', mint); }
+  advanceAgent(event, now) {
+    const old = this.agentCursor(event.mint);
+    let outcome = 'received', revision = old?.revision ?? 0;
+    if (old && event.slot < old.slot) outcome = 'older_sell';
+    else if (old && event.slot === old.slot) {
+      if (old.signature === event.signature && old.event_index === event.index) outcome = 'duplicate_sell';
+      else {
+        outcome = 'ambiguous_sell_slot';
+        if (!old.ambiguous) this.store.run('UPDATE paper_agent_cursors SET ambiguous=1,revision=revision+1 WHERE mint=?', event.mint);
+        revision += old.ambiguous ? 0 : 1;
+      }
+    } else {
+      revision++;
+      this.store.run(`INSERT INTO paper_agent_cursors VALUES(?,?,?,?,?,0)
+        ON CONFLICT(mint) DO UPDATE SET slot=excluded.slot,signature=excluded.signature,
+        event_index=excluded.event_index,revision=excluded.revision,ambiguous=0`,
+      event.mint, event.slot, event.signature, event.index, revision);
+    }
+    this.store.run(`INSERT OR IGNORE INTO paper_agent_events(signature,mint,event_index,slot,received_at_ms,outcome)
+      VALUES(?,?,?,?,?,?)`, event.signature, event.mint, event.index, event.slot, now, outcome);
+    this.store.run('DELETE FROM paper_agent_events WHERE id NOT IN (SELECT id FROM paper_agent_events ORDER BY id DESC LIMIT 1000)');
+    if (outcome !== 'received') this.count(`agent:${outcome}`);
+    return { outcome, revision };
+  }
+  agentOutcome(event, outcome, detail = null) {
+    this.store.run('UPDATE paper_agent_events SET outcome=?,detail=? WHERE signature=? AND mint=? AND event_index=?',
+      outcome, detail == null ? null : JSON.stringify(detail), event.signature, event.mint, event.index);
+    this.count(`agent:${outcome}`);
+  }
+  exposure(excludeOrder = null) {
+    const open = this.store.all("SELECT entry_cost_lamports FROM paper_positions WHERE status='open'")
+      .reduce((sum, row) => sum + BigInt(row.entry_cost_lamports), 0n);
+    const reserved = this.pending().filter(row => row.side === 'buy' && row.id !== excludeOrder).reduce((sum, row) => {
+      const quote = JSON.parse(row.quote_json), cfg = JSON.parse(row.assumptions_json);
+      return sum + (quote.requestedBudgetLamports == null ? BigInt(quote.cost) :
+        BigInt(quote.requestedBudgetLamports) + BigInt(cfg.networkFeeLamports));
+    }, 0n);
+    return { open, reserved, total: open + reserved };
+  }
+  exposureAllows(cost, excludeOrder = null) {
+    return this.cfg.strategy !== 'agent-sell-liquidity' ||
+      this.exposure(excludeOrder).total + cost <= BigInt(this.cfg.maxExposureLamports);
+  }
   request(mint, side, reason, quote, signal, now) {
-    return this.store.atomic(() => {
-      if (this.store.get("SELECT 1 FROM paper_orders WHERE mint=? AND status='pending'", mint)) return null;
-      if (side === 'buy') {
-        if (!this.cfg.entriesEnabled || !this.capacity().remaining || this.watch(mint)?.status !== 'watching' ||
-            this.store.get('SELECT 1 FROM paper_positions WHERE mint=?', mint)) return null;
-      } else if (!this.position(mint)) return null;
-      const result = this.store.run(`INSERT INTO paper_orders
-        (mint,side,status,created_at_ms,expires_at_ms,signal_signature,signal_slot,reason,quote_json,assumptions_json)
-        VALUES(?,?,'pending',?,?,?,?,?,?,?)`, mint, side, now, now + this.cfg.orderTtlMs,
-      signal?.signature ?? null, signal?.slot ?? null, reason, JSON.stringify(quote), JSON.stringify(this.cfg));
-      return Number(result.lastInsertRowid);
-    });
+    // SAVEPOINT supports atomic signal/cursor admission without nesting BEGIN transactions.
+    this.store.db.exec('SAVEPOINT paper_request');
+    try {
+      const id = this.requestWithinTransaction(mint, side, reason, quote, signal, now);
+      this.store.db.exec('RELEASE paper_request'); return id;
+    } catch (error) {
+      this.store.db.exec('ROLLBACK TO paper_request; RELEASE paper_request'); throw error;
+    }
+  }
+  requestWithinTransaction(mint, side, reason, quote, signal, now) {
+    if (this.store.get("SELECT 1 FROM paper_orders WHERE mint=? AND status='pending'", mint)) return null;
+    if (side === 'buy') {
+      if (this.cfg.strategy === 'agent-sell-liquidity') {
+        const reservation = quote.requestedBudgetLamports == null ? BigInt(quote.cost) :
+          BigInt(quote.requestedBudgetLamports) + BigInt(this.cfg.networkFeeLamports);
+        if (!this.exposureAllows(reservation)) { this.count('agent:exposure_cap'); return null; }
+      }
+      if (!this.cfg.entriesEnabled || !this.capacity().remaining || this.watch(mint)?.status !== 'watching' ||
+          this.store.get('SELECT 1 FROM paper_positions WHERE mint=?', mint)) return null;
+    } else if (!this.position(mint)) return null;
+    const result = this.store.run(`INSERT INTO paper_orders
+      (mint,side,status,created_at_ms,expires_at_ms,signal_signature,signal_slot,reason,quote_json,assumptions_json)
+      VALUES(?,?,'pending',?,?,?,?,?,?,?)`, mint, side, now, now + this.cfg.orderTtlMs,
+    signal?.signature ?? null, signal?.slot ?? null, reason, JSON.stringify(quote), JSON.stringify(this.cfg));
+    return Number(result.lastInsertRowid);
   }
   diagnose(id, patch) {
     const order = this.store.get("SELECT diagnostics_json FROM paper_orders WHERE id=? AND status='pending'", id);
@@ -240,11 +323,20 @@ export class PaperStore {
     this.store.atomic(() => {
       const pending = this.store.get("SELECT diagnostics_json FROM paper_orders WHERE id=? AND status='pending'", order.id);
       if (!pending) return;
+      if (order.side === 'buy' && !this.exposureAllows(BigInt(quote.cost), order.id)) {
+        this.cancel(order.id, now, 'exposure_cap'); return;
+      }
+      if (order.side === 'buy' && this.cfg.strategy === 'agent-sell-liquidity' &&
+          (!Number.isSafeInteger(quote.slot) || !Number.isSafeInteger(quote.slot + this.cfg.holdSlots))) {
+        this.cancel(order.id, now, 'invalid_fill_slot'); return;
+      }
       if (pending.diagnostics_json != null) this.diagnose(order.id, { stage: 'filled', updatedAtMs: now });
       this.store.run("UPDATE paper_orders SET status='filled',settled_at_ms=?,fill_json=? WHERE id=?", now, JSON.stringify(quote), order.id);
       if (order.side === 'buy') {
         this.store.run(`INSERT INTO paper_positions(mint,tokens_raw,entry_cost_lamports,entry_order_id,opened_at_ms)
           VALUES(?,?,?,?,?)`, order.mint, quote.tokens, quote.cost, order.id, now);
+        if (this.cfg.strategy === 'agent-sell-liquidity') this.store.run(
+          'UPDATE paper_positions SET entry_snapshot_slot=?,timeout_slot=? WHERE mint=?', quote.slot, quote.slot + this.cfg.holdSlots, order.mint);
         this.store.run("UPDATE paper_watches SET status='holding',reason=NULL WHERE mint=?", order.mint);
       } else {
         const position = this.position(order.mint);
@@ -295,6 +387,12 @@ export class PaperStore {
       .map(([column, alias]) => `${faultColumns.has(column) ? column : 'NULL'} ${alias}`).join(',');
     return {
       mode: 'paper', assumptions: this.cfg, capacity: this.capacity(), feedHealth: readFeedHealth(this.store, now),
+      ...(this.cfg.strategy !== 'agent-sell-liquidity' ? {} : {
+        exposure: Object.fromEntries(Object.entries(this.exposure()).map(([key, value]) => [`${key}Lamports`, value.toString()])),
+        recentAgentEvents: this.store.get("SELECT 1 FROM sqlite_master WHERE name='paper_agent_events'") ?
+          this.store.all('SELECT * FROM paper_agent_events ORDER BY id DESC LIMIT 25') : [],
+        agentStrategyNote: 'Budget includes swap fees; total entry cost adds modeled network fees. Rent and non-fill attempt fees excluded. Events are live confirmed signals, not recovered history. Timeout attempts do not guarantee exits.',
+      }),
       performance: paperPerformance(this.store, positions, openPositionHealth),
       coverage: this.store.all(`SELECT mint,status,last_cap,last_change_ms,last_observed_ms,account_error,preprocessed FROM paper_watches
         WHERE status IN ('watching','holding','exit_blocked')`),
@@ -320,7 +418,7 @@ export class PaperStore {
       accountFaultEvidenceNote: 'Events count rejected observations, not unique mints. Distinct mints cover only the latest 100 retained samples, not all historical faults. quoteMintObserved is read at the documented prefix offset, not proof of a historical account layout. Missing historical evidence remains unknown.',
       counters: this.store.all('SELECT * FROM paper_counters ORDER BY name'),
       blocked: this.store.all("SELECT * FROM paper_watches WHERE status='exit_blocked'"),
-      usage: this.store.all("SELECT * FROM usage WHERE source IN ('preprocessed','preprocessed_bytes') OR method='paper_account_received_bytes' ORDER BY day,source,method"),
+      usage: this.store.all("SELECT * FROM usage WHERE source IN ('preprocessed','preprocessed_bytes','paper_agent') OR method IN ('paper_account_received_bytes','paper_agent_received_bytes') ORDER BY day,source,method"),
       note: 'Hypothetical fills using later executed reserves and configured fees; not actual trades, balances or achievable returns. Unsupported transactions are skipped. Graduation exits require manual attention; no AMM execution.',
     };
   }

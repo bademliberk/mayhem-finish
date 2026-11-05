@@ -1,8 +1,9 @@
 // Fixed-size order evidence only: never raw RPC errors, messages, URLs or payloads.
 const stages = new Set(['requested', 'status_pending', 'status_unconfirmed', 'status_confirmed', 'status_failed',
-  'status_invalid', 'account_pending', 'snapshot_behind', 'entry_rejected', 'ready_to_fill', 'filled', 'canceled', 'unavailable']);
+  'status_invalid', 'account_pending', 'snapshot_behind', 'snapshot_changed', 'entry_rejected', 'ready_to_fill', 'filled', 'canceled', 'unavailable']);
 const integers = ['signalSlot', 'currentSlot', 'executedSlot', 'snapshotSlot', 'requiredSlot', 'peakSlot', 'windowStartSlot',
-  'createdAtMs', 'updatedAtMs', 'elapsedMs', 'statusElapsedMs', 'accountElapsedMs', 'statusAttempts', 'accountAttempts'];
+  'createdAtMs', 'updatedAtMs', 'elapsedMs', 'statusElapsedMs', 'accountElapsedMs', 'statusAttempts', 'accountAttempts',
+  'eventIndex', 'triggerRevision', 'triggerToRequestSlots', 'triggerToFillSlots'];
 const transactionKinds = new Set(['AccountInUse', 'AccountLoadedTwice', 'AccountNotFound', 'ProgramAccountNotFound',
   'InsufficientFundsForFee', 'InvalidAccountForFee', 'AlreadyProcessed', 'BlockhashNotFound', 'CallChainTooDeep',
   'MissingSignatureForFee', 'InvalidAccountIndex', 'SignatureFailure', 'InvalidProgramForExecution', 'SanitizeFailure',
@@ -36,6 +37,9 @@ export function safeOrderDiagnostics(value) {
   if (['buy', 'sell'].includes(value.triggerSide)) result.triggerSide = value.triggerSide;
   if (['processed', 'confirmed', 'finalized', 'unknown'].includes(value.confirmationStatus)) result.confirmationStatus = value.confirmationStatus;
   for (const key of integers) if (nonnegative(value[key])) result[key] = value[key];
+  for (const key of ['requestedBudgetLamports', 'referenceRealSolLamports', 'currentRealSolLamports', 'exposureLamports']) {
+    if (typeof value[key] === 'string' && /^(0|[1-9][0-9]{0,39})$/.test(value[key])) result[key] = value[key];
+  }
   for (const key of ['marketCapSol', 'floorCapSol', 'ceilingCapSol']) {
     if (Number.isFinite(value[key]) && value[key] >= 0 && value[key] <= 1e15) result[key] = value[key];
   }

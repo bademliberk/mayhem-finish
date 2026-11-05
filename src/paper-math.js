@@ -70,21 +70,30 @@ export function buyExactInput(state, budget, feeBps, v3 = false) {
   if (quote.cost > budget) throw new Error('budget_exceeded');
   return quote;
 }
-export function entryQuote(state, cfg) {
-  const result = buyBudget(state, BigInt(cfg.buyLamports), cfg.swapFeeBps);
+export function liquidityBudget(realSol, cfg) {
+  const fraction = realSol * BigInt(cfg.fractionBps) / BPS;
+  const maximum = BigInt(cfg.maxSwapBudgetLamports);
+  return fraction < maximum ? fraction : maximum;
+}
+export function entryQuote(state, cfg, budget = BigInt(cfg.buyLamports)) {
+  const result = buyBudget(state, budget, cfg.swapFeeBps);
   return { tokens: result.tokens.toString(), swapCost: result.cost.toString(),
     cost: (result.cost + BigInt(cfg.networkFeeLamports)).toString(), mc: cap(state) };
 }
-export function entryQuality(state, cfg) {
-  const buy = buyBudget(state, BigInt(cfg.buyLamports), cfg.swapFeeBps);
+export function entryQuality(state, cfg, budget = BigInt(cfg.buyLamports)) {
+  const buy = buyBudget(state, budget, cfg.swapFeeBps);
   const cost = buy.cost + BigInt(cfg.networkFeeLamports);
   const quality = { model: 'isolated_post_buy_round_trip', preBuyRealSolLamports: state.realSol.toString(),
-    minimumRealSolLamports: (BigInt(cfg.buyLamports) * BigInt(cfg.minEntryLiquidityMultiple ?? 2)).toString(),
+    minimumRealSolLamports: (budget * BigInt(cfg.minEntryLiquidityMultiple ?? 2)).toString(),
     postBuyRealSolLamports: buy.state.realSol.toString(), fullExitSupported: false,
     roundTripNetLamports: null, roundTripLossLamports: null, roundTripLossBps: null,
     residualRealSolLamports: null, buyImpactBps: Number((buy.state.virtualSol * state.virtualTokens -
       state.virtualSol * buy.state.virtualTokens) * BPS / (state.virtualSol * buy.state.virtualTokens)),
     rejection: null };
+  // Exhausting inventory would complete the curve; this profile has no AMM exit model.
+  if (cfg.strategy === 'agent-sell-liquidity' && buy.tokens >= state.realTokens) {
+    quality.rejection = 'entry_inventory_exhaustion'; return quality;
+  }
   try {
     const exit = sell(buy.state, buy.tokens, cfg.swapFeeBps);
     const net = exit.net - BigInt(cfg.networkFeeLamports), loss = cost - net;

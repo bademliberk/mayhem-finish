@@ -38,6 +38,7 @@ export function paperPerformance(store, positions, openHealth = []) {
     estimatedCredits: credits, estimatedCreditsPerFilledBuy: buys ? credits / buys : null,
     orderFunnel: store.all('SELECT side,status,error,COUNT(*) count FROM paper_orders GROUP BY side,status,error'),
     signalFunnel: store.all('SELECT outcome,COUNT(*) count FROM paper_signals GROUP BY outcome'),
+    agentSignalFunnel: store.all("SELECT name,count FROM paper_counters WHERE name LIKE 'agent:%' ORDER BY name"),
     note: 'Closed-only statistics exclude unresolved returns. Drawdown is realized-only, not equity drawdown. Zero recovery is a scenario, not a fill. Credits are an application estimate, not an invoice. Averages truncate to whole lamports.',
   };
 }

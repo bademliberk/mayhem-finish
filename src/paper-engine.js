@@ -1,11 +1,12 @@
 import { PUMP } from './config.js';
+import { agentSellEvents } from './chain.js';
 import { LookupCache } from './paper-lookups.js';
 import { PaperStore } from './paper-store.js';
 import { transactionFailure, readOrderDiagnostics } from './paper-diagnostics.js';
-import { reserves, cap, entryQuote, entryQuality, exitQuote, liquidityRisk, profitable, meetsDrop, higher } from './paper-math.js';
+import { reserves, cap, entryQuote, entryQuality, exitQuote, liquidityRisk, liquidityBudget, profitable, meetsDrop, higher } from './paper-math.js';
 
-const mandatoryExit = reason => reason === 'floor' || reason === 'liquidity_risk';
-const exitPriority = reason => ({ profit: 0, liquidity_risk: 1, floor: 2, graduated_no_amm_exit: 3 }[reason] ?? -1);
+const mandatoryExit = reason => ['floor', 'liquidity_risk', 'timeout'].includes(reason);
+const exitPriority = reason => ({ profit: 0, liquidity_risk: 1, timeout: 2, floor: 3, graduated_no_amm_exit: 4 }[reason] ?? -1);
 
 function validateAccount(account) {
   if (!account) return { code: 'missing_account' };
@@ -22,14 +23,15 @@ export class PaperEngine {
   constructor(store, rpc, cfg, { now = Date.now, project } = {}) {
     this.store = store; this.rpc = rpc; this.cfg = cfg; this.now = now; this.project = project;
     this.paper = new PaperStore(store, cfg); this.states = new Map(); this.ready = false;
+    this.agentMode = cfg.strategy === 'agent-sell-liquidity'; this.observationRevision = 0;
     this.coverageSlots = new Map();
     this.lookups = new LookupCache(rpc, name => { if (!this.stopped) this.paper.count(name); }, now);
     this.slot = 0; this.slotAt = 0; this.epoch = 0; this.queue = []; this.working = false; this.stopped = false;
-    this.reconciliations = new Map(); this.stopPromise = null;
+    this.reconciliations = new Map(); this.exitRefreshes = new Map(); this.exitRefreshAt = new Map(); this.stopPromise = null;
   }
   attach(feeds) { this.feeds = feeds; }
-  request(mint, side, reason, quote, signal, diagnostics = {}) {
-    const now = this.now(), id = this.paper.request(mint, side, reason, quote, signal, now);
+  request(mint, side, reason, quote, signal, diagnostics = {}, now = this.now()) {
+    const id = this.paper.request(mint, side, reason, quote, signal, now);
     if (id) this.paper.diagnose(id, { stage: 'requested', createdAtMs: now, updatedAtMs: now,
       elapsedMs: 0, currentSlot: this.slot, signalSlot: signal?.slot, triggerSide: signal?.side, ...diagnostics });
     return id;
@@ -70,9 +72,16 @@ export class PaperEngine {
     if (this.stopped || active.controller.signal.aborted ||
         !this.store.get("SELECT 1 FROM paper_orders WHERE id=? AND status='pending'", order.id)) return false;
     if (this.expire(order)) return false;
+    if (this.agentMode && order.side === 'buy') {
+      const cursor = this.paper.agentCursor(order.mint);
+      if (!cursor || cursor.ambiguous || cursor.revision !== active.triggerRevision) {
+        this.cancel(order.id, this.now(), 'sell_superseded'); return false;
+      }
+    }
     return this.epoch === active.epoch && this.states.get(order.mint)?.since === active.generation.since;
   }
   unwatch(mint) {
+    this.exitRefreshes.get(mint)?.controller.abort(); this.exitRefreshAt.delete(mint);
     this.states.delete(mint); this.coverageSlots.delete(mint); this.feeds.remove(mint);
     this.store.run('UPDATE paper_watches SET preprocessed=0 WHERE mint=?', mint);
   }
@@ -92,7 +101,7 @@ export class PaperEngine {
     if (row) { row.since = Math.max(row.slot, since); row.history = [{ state: row.state, slot: row.slot, at: row.at }]; }
   }
   membership(mint, enabled) {
-    if (this.stopped) return;
+    if (this.stopped || this.agentMode) return;
     const watch = this.paper.watch(mint);
     if (!watch || Boolean(watch.preprocessed) === enabled) return;
     this.store.run('UPDATE paper_watches SET preprocessed=? WHERE mint=?', Number(enabled), mint);
@@ -126,7 +135,7 @@ export class PaperEngine {
     });
     for (const row of this.paper.active()) {
       const held = Boolean(this.paper.position(row.mint));
-      const enabled = row.reason !== 'graduated_no_amm_exit' &&
+      const enabled = !this.agentMode && row.reason !== 'graduated_no_amm_exit' &&
         (held || Boolean(row.preprocessed && this.now() - row.last_change_ms < this.cfg.idleMs));
       this.store.run('UPDATE paper_watches SET preprocessed=? WHERE mint=?', Number(enabled), row.mint);
       if (row.reason !== 'graduated_no_amm_exit') this.feeds.add(row.mint, row.curve_address, enabled);
@@ -144,6 +153,7 @@ export class PaperEngine {
     if (this.stopped) return;
     this.ready = false; this.epoch++; this.slot = 0; this.slotAt = 0; this.states.clear(); this.queue = [];
     this.coverageSlots.clear(); this.lookups.clear();
+    for (const active of this.exitRefreshes.values()) active.controller.abort();
     this.paper.count(`gap:${reason}`);
     for (const order of this.paper.pending()) this.cancel(order.id, this.now(), 'feed_gap');
   }
@@ -156,6 +166,7 @@ export class PaperEngine {
     if (slot < this.slot) return;
     this.slot = slot; this.slotAt = this.now();
     for (const order of this.paper.pending()) this.expire(order);
+    if (this.agentMode) this.checkAgentExits();
     if (slot) {
       for (const [mint, since] of this.coverageSlots) {
         if (since === Infinity) this.coverage(mint);
@@ -189,7 +200,8 @@ export class PaperEngine {
     const { state, code, subtype } = validateAccount(account);
     if (code) { this.invalidateAccount(mint, slot, account, code, subtype); return; }
     try {
-      const row = { state, slot, at: this.now(), since: old?.since ?? Math.max(slot, this.coverageSlots.get(mint) ?? slot), history: old?.history ?? [] };
+      const row = { state, slot, at: this.now(), revision: ++this.observationRevision,
+        since: old?.since ?? Math.max(slot, this.coverageSlots.get(mint) ?? slot), history: old?.history ?? [] };
       row.history = row.history.filter(item => item.slot >= slot - this.cfg.windowSlots + 1);
       if (!state.complete) row.history.push({ state, slot, at: row.at });
       // Several writes in one slot have no transaction index; retain their observed peak only.
@@ -199,7 +211,7 @@ export class PaperEngine {
       const fingerprint = account.data[0];
       const changed = fingerprint !== watch.fingerprint;
       if (changed) this.store.run('UPDATE paper_watches SET fingerprint=?,last_change_ms=? WHERE mint=?', fingerprint, this.now(), mint);
-      if (!state.complete && cap(state) > this.cfg.floorCap &&
+      if (!this.agentMode && !state.complete && cap(state) > this.cfg.floorCap &&
           (this.paper.position(mint) || (changed && cap(state) < this.cfg.activationCap))) this.membership(mint, true);
       if (state.complete) {
         for (const order of this.paper.pending().filter(o => o.mint === mint)) this.cancel(order.id, this.now(), 'graduated');
@@ -212,7 +224,8 @@ export class PaperEngine {
       if (this.paper.position(mint)) {
         const reason = this.exitIntent(mint, state);
         if (reason) this.requestExit(mint, state, reason, null);
-      } else if (cap(state) <= this.cfg.floorCap) {
+        else if (this.agentMode) this.requestExit(mint, state, 'profit', null);
+      } else if (!this.agentMode && cap(state) <= this.cfg.floorCap) {
         const pending = this.paper.pending().find(o => o.mint === mint);
         if (pending) this.cancel(pending.id, this.now(), 'floor_override');
         this.store.run("UPDATE paper_watches SET status='stopped',reason='floor' WHERE mint=?", mint);
@@ -222,10 +235,63 @@ export class PaperEngine {
       this.invalidateAccount(mint, slot, account, 'processing_error');
     }
   }
+  timeoutDue(position) {
+    return this.agentMode && position && Number.isSafeInteger(position.timeout_slot) && this.slot >= position.timeout_slot;
+  }
+  checkAgentExits() {
+    for (const watch of this.paper.active()) {
+      if (watch.reason === 'graduated_no_amm_exit') continue;
+      const position = this.paper.position(watch.mint);
+      if (this.timeoutDue(position)) this.latchExit(watch.mint, 'timeout');
+      const row = this.states.get(watch.mint);
+      if (row && position) this.requestExit(watch.mint, row.state, this.exitIntent(watch.mint, row.state) ?? 'profit', null);
+    }
+  }
+  async refreshAgentExits() {
+    const now = this.now();
+    if (this.stopped || !this.slot || now < this.slotAt || now - this.slotAt > this.cfg.maxStateAgeMs) return;
+    const tasks = [];
+    for (const watch of this.paper.active()) {
+      const mint = watch.mint, position = this.paper.position(mint), row = this.states.get(mint);
+      if (!position || !mandatoryExit(watch.reason) || this.exitRefreshes.has(mint) ||
+          this.paper.pending().some(order => order.mint === mint) || now < (this.exitRefreshAt.get(mint) ?? 0) ||
+          (row && now >= row.at && now - row.at <= this.cfg.maxStateAgeMs)) continue;
+      // Quiet/missing accounts need a fresh quote, not permission to sell stale reserves.
+      // One request per holding, bounded by the watch cap, with a queue-inclusive deadline and retry interval.
+      const active = { controller: new AbortController(), epoch: this.epoch, revision: row?.revision,
+        deadline: now + Math.min(5000, this.cfg.orderTtlMs) };
+      this.exitRefreshAt.set(mint, now + Math.max(1000, this.cfg.maxStateAgeMs));
+      this.exitRefreshes.set(mint, active);
+      const current = () => !this.stopped && !active.controller.signal.aborted && this.epoch === active.epoch &&
+        this.now() >= now && this.now() < active.deadline &&
+        this.paper.position(mint)?.entry_order_id === position.entry_order_id &&
+        this.paper.watch(mint)?.reason !== 'graduated_no_amm_exit';
+      active.promise = (async () => {
+        try {
+          this.paper.count('agent:exit_refresh');
+          const snapshot = await this.rpc.accounts([watch.curve_address], { commitment: 'confirmed',
+            deadlineMs: active.deadline, signal: active.controller.signal });
+          if (!current()) return;
+          const slot = snapshot?.context?.slot, latest = this.states.get(mint), saved = this.paper.watch(mint);
+          const required = Math.max(position.entry_snapshot_slot ?? 0, saved.last_slot ?? 0, latest?.slot ?? 0);
+          if (!Number.isSafeInteger(slot) || slot < required ||
+              (latest?.revision !== active.revision && slot <= required)) {
+            this.paper.count('agent:exit_refresh_behind'); return;
+          }
+          this.onAccount(mint, slot, snapshot.value?.[0] ?? null);
+        } catch {
+          if (current()) this.paper.count('agent:exit_refresh_unavailable');
+        } finally { this.exitRefreshes.delete(mint); }
+      })();
+      tasks.push(active.promise);
+    }
+    await Promise.allSettled(tasks);
+  }
   exitIntent(mint, state) {
     const watch = this.paper.watch(mint), position = this.paper.position(mint);
     if (!position || state.complete || watch.reason === 'graduated_no_amm_exit') return null;
-    if (watch.reason === 'floor' || cap(state) <= this.cfg.floorCap) return 'floor';
+    if (this.agentMode && (watch.reason === 'timeout' || this.timeoutDue(position))) return 'timeout';
+    if (!this.agentMode && (watch.reason === 'floor' || cap(state) <= this.cfg.floorCap)) return 'floor';
     if (watch.reason === 'liquidity_risk' || liquidityRisk(state, position, this.cfg)) return 'liquidity_risk';
     return null;
   }
@@ -266,8 +332,56 @@ export class PaperEngine {
       this.paper.count('exit_insufficient_liquidity');
     }
   }
+  agentFresh(mint, slot) {
+    const row = this.states.get(mint), age = this.now() - this.slotAt;
+    return this.ready && this.feeds.covers(mint) && row && this.slot > 0 && age >= 0 && age <= this.cfg.maxStateAgeMs &&
+      this.now() >= row.at && this.now() - row.at <= this.cfg.maxStateAgeMs &&
+      slot >= (this.coverageSlots.get(mint) ?? Infinity) && slot <= this.slot + 2 &&
+      this.slot < slot + this.cfg.signalValiditySlots;
+  }
+  agentTransaction(tx) {
+    if (this.stopped || !this.agentMode) return;
+    const receivedAt = this.now();
+    this.paper.count('agent:frames_processed');
+    for (const event of agentSellEvents(tx)) {
+      const watch = this.paper.watch(event.mint);
+      if (!watch || !['watching', 'holding', 'exit_blocked'].includes(watch.status)) continue;
+      // Admission is synchronous: a new sell invalidates an in-flight reconciliation immediately.
+      this.store.atomic(() => {
+        const { outcome, revision } = this.paper.advanceAgent(event, receivedAt);
+        if (outcome === 'duplicate_sell' || outcome === 'older_sell') return;
+        for (const order of this.paper.pending().filter(o => o.mint === event.mint && o.side === 'buy')) {
+          this.cancel(order.id, receivedAt, outcome === 'ambiguous_sell_slot' ? outcome : 'sell_superseded');
+        }
+        if (outcome !== 'received') return;
+        const reject = (reason, detail) => this.paper.agentOutcome(event, reason, detail);
+        if (!event.reserves) return reject('missing_sell_reserves');
+        if (!this.agentFresh(event.mint, event.slot)) return reject('coverage_or_state_stale');
+        if (watch.status !== 'watching' || this.paper.position(event.mint) || !this.cfg.entriesEnabled ||
+            !this.paper.capacity().remaining) return reject('entries_disabled_or_cap');
+        try {
+          const state = { ...this.states.get(event.mint).state,
+            ...Object.fromEntries(Object.entries(event.reserves).map(([key, value]) => [key, BigInt(value)])) };
+          if (state.complete || state.realSol < BigInt(this.cfg.minRealSolLamports)) return reject('minimum_real_liquidity');
+          const budget = liquidityBudget(state.realSol, this.cfg);
+          if (budget <= 0n) return reject('budget_too_small');
+          const quote = entryQuote(state, this.cfg, budget);
+          quote.entryQuality = entryQuality(state, this.cfg, budget);
+          if (quote.entryQuality.rejection) return reject(quote.entryQuality.rejection, quote.entryQuality);
+          Object.assign(quote, { requestedBudgetLamports: budget.toString(), triggerRevision: revision,
+            eventIndex: event.index, eventActor: event.user, referenceReserves: event.reserves,
+            provenance: 'successful_mayhem_ancestor', receivedAtMs: receivedAt });
+          if (!this.paper.exposureAllows(budget + BigInt(this.cfg.networkFeeLamports))) return reject('exposure_cap');
+          const id = this.request(event.mint, 'buy', 'agent_sell', quote, { signature: event.signature, slot: event.slot, side: 'sell' },
+            { eventIndex: event.index, triggerRevision: revision, requestedBudgetLamports: budget.toString(),
+              referenceRealSolLamports: event.reserves.realSol, triggerToRequestSlots: Math.max(0, this.slot - event.slot) }, receivedAt);
+          reject(id ? 'buy_pending' : 'entry_blocked', { requestedBudgetLamports: budget.toString(), referenceReserves: event.reserves });
+        } catch { reject('entry_quote_unavailable'); }
+      });
+    }
+  }
   enqueue(raw) {
-    if (this.stopped) return;
+    if (this.stopped || this.agentMode) return;
     if (this.queue.length >= this.cfg.queueLimit) { this.gap('queue_overflow'); this.feeds.resync?.(); return; }
     this.queue.push(raw);
   }
@@ -276,6 +390,8 @@ export class PaperEngine {
     this.working = true;
     try {
       this.discover();
+      if (this.agentMode) { this.checkAgentExits(); await this.refreshAgentExits(); }
+      if (this.stopped) return;
       for (const watch of this.paper.active()) {
         if (watch.preprocessed && !this.paper.position(watch.mint) &&
             this.now() - (watch.last_change_ms ?? watch.enrolled_at_ms) >= this.cfg.idleMs) this.membership(watch.mint, false);
@@ -299,7 +415,7 @@ export class PaperEngine {
     } finally { this.working = false; }
   }
   signal(raw) {
-    if (this.stopped) return;
+    if (this.stopped || this.agentMode) return;
     let prediction;
     this.paper.count('frames_processed');
     try { prediction = this.project(raw, this.states, this.cfg, (...args) => this.lookups.resolve(...args), this.now()); }
@@ -368,6 +484,7 @@ export class PaperEngine {
     if (!generation || (!this.ready && !mandatoryExit(order.reason))) return Promise.resolve();
     const saved = this.store.get('SELECT diagnostics_json FROM paper_orders WHERE id=?', order.id);
     const active = { controller: new AbortController(), generation: { ...generation }, epoch: this.epoch,
+      triggerRevision: this.agentMode && order.side === 'buy' ? JSON.parse(order.quote_json).triggerRevision : null,
       diagnostics: readOrderDiagnostics(saved?.diagnostics_json) ?? {} };
     this.reconciliations.set(order.id, active);
     active.promise = this.reconcileActive(order, active).finally(() => this.reconciliations.delete(order.id));
@@ -410,6 +527,7 @@ export class PaperEngine {
       const watch = this.paper.watch(order.mint);
       this.diagnose(order, { stage: 'account_pending', accountAttempts: (active.diagnostics.accountAttempts ?? 0) + 1 });
       active.waitKind = 'account'; active.waitAt = this.now();
+      const observationRevision = this.states.get(order.mint)?.revision;
       const snapshot = await this.rpc.accounts([watch.curve_address],
         { commitment: 'confirmed', deadlineMs: order.expires_at_ms, signal: controller.signal });
       if (!this.current(order, active)) return;
@@ -422,6 +540,14 @@ export class PaperEngine {
       if (!Number.isSafeInteger(slot) || slot < requiredSlot) {
         this.diagnose(order, { stage: 'snapshot_behind' }); this.paper.count('snapshot_behind'); return;
       }
+      if (this.agentMode && order.side === 'buy' && slot >= order.signal_slot + this.cfg.signalValiditySlots) {
+        this.cancel(order.id, this.now(), 'signal_expired', { expiryCause: 'slot', snapshotSlot: slot }); return;
+      }
+      const latest = this.states.get(order.mint);
+      if (this.agentMode && latest.revision !== observationRevision && slot <= latest.slot) {
+        this.paper.count('agent:snapshot_observation_changed');
+        this.diagnose(order, { stage: 'snapshot_changed' }); return;
+      }
       const { state, code, subtype } = validateAccount(snapshot.value?.[0]);
       if (code) { this.invalidateAccount(order.mint, slot, snapshot.value?.[0], code, subtype); return; }
       if (state.complete) {
@@ -431,27 +557,44 @@ export class PaperEngine {
         this.unwatch(order.mint); return;
       }
       const mc = cap(state);
-      if (mc <= this.cfg.floorCap && order.side === 'buy') {
+      if (!this.agentMode && mc <= this.cfg.floorCap && order.side === 'buy') {
         this.cancel(order.id, this.now(), 'floor');
         this.store.run("UPDATE paper_watches SET status='stopped',reason='floor' WHERE mint=?", order.mint);
         this.unwatch(order.mint); return;
       }
       let quote;
       if (order.side === 'buy') {
-        if (!this.ready || !this.cfg.entriesEnabled || watch.status !== 'watching' || !watch.preprocessed || !this.feeds.covers(order.mint)) { this.cancel(order.id, this.now(), 'entries_paused'); return; }
-        const reference = { virtualSol: BigInt(predicted.reference.virtualSol), virtualTokens: BigInt(predicted.reference.virtualTokens) };
-        const rangePassed = mc > this.cfg.floorCap && mc < this.cfg.ceilingCap;
-        const dropPassed = meetsDrop(state, reference, this.cfg);
-        const dropBps = Number((reference.virtualSol * state.virtualTokens - state.virtualSol * reference.virtualTokens) * 10000n /
-          (reference.virtualSol * state.virtualTokens));
-        this.diagnose(order, { marketCapSol: mc, dropBps, rangePassed, dropPassed,
-          floorCapSol: this.cfg.floorCap, ceilingCapSol: this.cfg.ceilingCap, requiredDropBps: this.cfg.dropBps });
-        if (!rangePassed || !dropPassed) {
-          this.diagnose(order, { stage: 'entry_rejected' });
-          this.cancel(order.id, this.now(), 'entry_condition_changed'); return;
+        if (!this.ready || !this.cfg.entriesEnabled || watch.status !== 'watching' ||
+            (!this.agentMode && !watch.preprocessed) || !this.feeds.covers(order.mint)) {
+          this.cancel(order.id, this.now(), 'entries_paused'); return;
         }
-        quote = entryQuote(state, this.cfg);
-        quote.entryQuality = entryQuality(state, this.cfg);
+        let budget = BigInt(this.cfg.buyLamports);
+        if (this.agentMode) {
+          if (!this.agentFresh(order.mint, order.signal_slot)) { this.cancel(order.id, this.now(), 'coverage_or_state_stale'); return; }
+          budget = BigInt(predicted.requestedBudgetLamports);
+          this.diagnose(order, { currentRealSolLamports: state.realSol.toString(), requestedBudgetLamports: budget.toString(),
+            exposureLamports: this.paper.exposure().total.toString(), triggerToFillSlots: Math.max(0, slot - order.signal_slot) });
+          if (state.realSol < BigInt(this.cfg.minRealSolLamports) || budget > liquidityBudget(state.realSol, this.cfg)) {
+            this.cancel(order.id, this.now(), 'liquidity_budget_changed'); return;
+          }
+        } else {
+          const reference = { virtualSol: BigInt(predicted.reference.virtualSol), virtualTokens: BigInt(predicted.reference.virtualTokens) };
+          const rangePassed = mc > this.cfg.floorCap && mc < this.cfg.ceilingCap;
+          const dropPassed = meetsDrop(state, reference, this.cfg);
+          const dropBps = Number((reference.virtualSol * state.virtualTokens - state.virtualSol * reference.virtualTokens) * 10000n /
+            (reference.virtualSol * state.virtualTokens));
+          this.diagnose(order, { marketCapSol: mc, dropBps, rangePassed, dropPassed,
+            floorCapSol: this.cfg.floorCap, ceilingCapSol: this.cfg.ceilingCap, requiredDropBps: this.cfg.dropBps });
+          if (!rangePassed || !dropPassed) {
+            this.diagnose(order, { stage: 'entry_rejected' });
+            this.cancel(order.id, this.now(), 'entry_condition_changed'); return;
+          }
+        }
+        quote = entryQuote(state, this.cfg, budget);
+        quote.entryQuality = entryQuality(state, this.cfg, budget);
+        if (this.agentMode) Object.assign(quote, { requestedBudgetLamports: budget.toString(),
+          triggerRevision: predicted.triggerRevision, eventIndex: predicted.eventIndex, referenceReserves: predicted.referenceReserves,
+          confirmedReserves: Object.fromEntries(['realSol', 'realTokens', 'virtualSol', 'virtualTokens'].map(key => [key, state[key].toString()])) });
         if (this.cfg.entryQualityEnabled && quote.entryQuality.rejection) {
           this.cancel(order.id, this.now(), quote.entryQuality.rejection); return;
         }
@@ -483,6 +626,11 @@ export class PaperEngine {
         order.signal_signature ? 'hypothetical_fill_after_confirmed_trigger' : 'hypothetical_fill_confirmed_state';
       if (!this.current(order, active)) return;
       this.diagnose(order, { stage: 'ready_to_fill' });
+      if (this.agentMode && order.side === 'buy') {
+        // The holding must never be evaluated against an older pre-entry observation.
+        this.onAccount(order.mint, slot, snapshot.value[0]);
+        if (!this.current(order, active)) return;
+      }
       this.paper.fill(order, quote, this.now());
       if (order.side === 'sell') this.unwatch(order.mint);
     } catch {
@@ -498,9 +646,11 @@ export class PaperEngine {
     this.stopped = true; this.ready = false; this.epoch++; this.queue = [];
     for (const order of this.paper.pending()) this.cancel(order.id, this.now(), 'stopped');
     for (const active of this.reconciliations.values()) active.controller.abort();
+    for (const active of this.exitRefreshes.values()) active.controller.abort();
     // Cancellation happens before feed teardown; wait for all continuations, including failed teardown.
     this.stopPromise = Promise.allSettled([
       ...[...this.reconciliations.values()].map(active => active.promise),
+      ...[...this.exitRefreshes.values()].map(active => active.promise),
       Promise.resolve().then(() => this.feeds.stop()), Promise.resolve().then(() => this.lookups.stop()),
     ]).then(results => {
       const failed = results.find(result => result.status === 'rejected');

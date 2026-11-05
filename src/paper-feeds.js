@@ -1,6 +1,7 @@
 import WebSocket from 'ws';
 import { PUMP } from './config.js';
 import { FeedHealth, SLOT_PROGRESS_MS } from './feed-health.js';
+import { PaperAgentFeed } from './paper-agent-feed.js';
 
 const validSubscription = id => Number.isSafeInteger(id) && id >= 0;
 const failureCategory = reason => reason.replace(/^(standard_|preprocessed_)/, '').replace(/^(slot_|account_)subscribe_failed$/, 'subscribe_failed');
@@ -46,15 +47,31 @@ const newPreprocessed = () => ({
 export class PaperFeeds {
   constructor(store, rpc, {
     onAccount = noop, onTransaction = noop, onGap = noop, onReady = noop, onSlot = noop, onCoverage = noop, onSubscriptionError = noop,
+    agentMode = false, onAgentTransaction = noop,
     socketFactory = url => new WebSocket(url, { handshakeTimeout: 10000, maxPayload: MAX_FRAME_BYTES }),
     setTimer = setTimeout, clearTimer = clearTimeout, now = Date.now,
   } = {}) {
     this.store = store; this.rpc = rpc;
-    this.callbacks = { onAccount, onTransaction, onGap, onReady, onSlot, onCoverage, onSubscriptionError };
+    this.agentMode = agentMode === true;
+    this.callbacks = { onAccount, onTransaction, onAgentTransaction, onGap, onReady, onSlot, onCoverage, onSubscriptionError };
     this.socketFactory = socketFactory; this.setTimer = setTimer; this.clearTimer = clearTimer; this.now = now;
     this.health = { standard: new FeedHealth(store, 'standard', now), preprocessed: new FeedHealth(store, 'preprocessed', now) };
     this.ackDeadlines = new Map(); this.slotWatchdog = null; this.lastSlot = -1;
-    this.preprocessedUrl = preprocessedUrl(rpc.wsUrl);
+    // Agent mode never derives beta credentials or opens the legacy transport.
+    this.preprocessedUrl = this.agentMode ? null : preprocessedUrl(rpc.wsUrl);
+    this.agent = this.agentMode ? new PaperAgentFeed(store, rpc, {
+      socketFactory, setTimer, clearTimer, now,
+      onTransaction: tx => { if (this.ready) this.safe('onAgentTransaction', tx); },
+      onCoverage: () => { this.notifyCoverage(); this.checkReady(); },
+      onGap: reason => {
+        if (!this.markGap(reason)) return;
+        for (const watch of this.watches.values()) {
+          watch.lastSlot = -1;
+          if (watch.subscription != null) this.snapshot(watch);
+        }
+      },
+      onSubscriptionError: detail => this.safe('onSubscriptionError', detail),
+    }) : null;
     this.standard = newLink('standard');
     this.preprocessed = newPreprocessed(); this.syncTimer = null;
     this.watches = new Map();        // mint -> watch
@@ -79,6 +96,7 @@ export class PaperFeeds {
     this.scheduleSync();
   }
   setPreprocessed(mint, enabled) {
+    if (this.agentMode) return; // Confirmed coverage belongs to every watch, not a persisted legacy flag.
     const watch = this.watches.get(mint);
     if (!watch || watch.preprocessed === enabled) return;
     watch.preprocessed = enabled;
@@ -87,11 +105,15 @@ export class PaperFeeds {
   }
   covers(mint) {
     const watch = this.watches.get(mint);
+    if (this.agentMode) return Boolean(watch?.covered && this.standard.acked && watch.subscription != null
+      && watch.lastSlot >= 0 && this.agent.covers(watch.curve));
     return Boolean(watch?.preprocessed && watch.covered && this.preprocessed.conn?.curves.includes(watch.curve));
   }
   notifyCoverage() {
     for (const watch of this.watches.values()) {
-      const included = watch.preprocessed && this.preprocessed.conn?.curves.includes(watch.curve);
+      const included = this.agentMode
+        ? this.standard.acked && watch.subscription != null && watch.lastSlot >= 0 && this.agent.covers(watch.curve)
+        : watch.preprocessed && this.preprocessed.conn?.curves.includes(watch.curve);
       if (!included) watch.covered = false;
       else if (!watch.covered) {
         watch.covered = true; this.safe('onCoverage', watch.mint);
@@ -133,7 +155,8 @@ export class PaperFeeds {
   }
   flushHealth() {
     this.health.standard.update({ pendingAcks: this.ackDeadlines.size });
-    this.health.preprocessed.update({ pending: [...this.watches.values()].filter(w => w.preprocessed && !this.covers(w.mint)).length });
+    if (this.agentMode) this.agent.flushHealth([...this.watches.values()].filter(w => !this.covers(w.mint)).length);
+    else this.health.preprocessed.update({ pending: [...this.watches.values()].filter(w => w.preprocessed && !this.covers(w.mint)).length });
   }
   flushUsage() {
     const { standard, preprocessed } = this;
@@ -141,6 +164,7 @@ export class PaperFeeds {
     if (preprocessed.transactions) this.store.usage('preprocessed', 'transactions', preprocessed.transactions);
     if (preprocessed.bytes) this.store.usage('preprocessed_bytes', 'received_bytes', preprocessed.bytes);
     standard.bytes = 0; preprocessed.bytes = 0; preprocessed.transactions = 0;
+    this.agent?.flushUsage();
   }
   async stop() {
     if (!this.stopped) {
@@ -149,6 +173,7 @@ export class PaperFeeds {
       this.drop(this.standard);
       try { socket?.terminate(); } catch { /* already closed */ }
       this.closePreprocessed();
+      this.agent?.stop();
       this.watches.clear();
       this.health.standard.stop(); this.health.preprocessed.stop();
       try { this.flushUsage(); } catch { /* store may already be closed */ }
@@ -173,9 +198,10 @@ export class PaperFeeds {
     return true;
   }
   checkReady() {
-    if (this.stopped || this.ready) return;
-    if (!this.standard.acked) return;
-    if (this.curves().length && !this.preprocessed.conn) return;
+    if (this.stopped) return;
+    if (this.agentMode) this.notifyCoverage();
+    if (this.ready || !this.standard.acked) return;
+    if (this.curves().length && !(this.agentMode ? this.agent.conn : this.preprocessed.conn)) return;
     this.notifyCoverage();
     this.ready = true; this.gapPending = false;
     this.safe('onReady');
@@ -211,6 +237,7 @@ export class PaperFeeds {
     if (this.slotRequest != null || link.acked) return;
     const socket = link.socket;
     this.health.standard.update({ phase: 'subscribing' });
+    if (this.agentMode) this.reconcile();
     const beat = () => {
       if (link.socket !== socket || this.stopped) return;
       link.heartbeat = null;
@@ -275,6 +302,7 @@ export class PaperFeeds {
     this.clearTimer(link.heartbeat); this.clearTimer(link.ackTimer); this.clearTimer(link.retry);
     link.heartbeat = null; link.ackTimer = null; link.retry = null;
     link.socket = null; link.acked = false; link.generation++;
+    this.agent?.reset();
     this.requests.clear(); this.subscriptions.clear(); this.ackDeadlines.clear();
     this.clearTimer(this.slotWatchdog); this.slotWatchdog = null; this.lastSlot = -1;
     this.health.standard.update({ pendingProgress: 1, pendingAcks: 0 });
@@ -296,7 +324,7 @@ export class PaperFeeds {
   }
   subscribe(watch) {
     if (watch.request != null || watch.subscription != null) return;
-    const id = this.send(this.standard, 'accountSubscribe', [watch.curve, { commitment: 'processed', encoding: 'base64' }]);
+    const id = this.send(this.standard, 'accountSubscribe', [watch.curve, { commitment: this.agentMode ? 'confirmed' : 'processed', encoding: 'base64' }]);
     if (id == null) return;
     watch.request = id; this.requests.set(id, watch);
     this.ackDeadlines.set(id, this.now() + ACK_TIMEOUT_MS);
@@ -357,18 +385,22 @@ export class PaperFeeds {
     // A live valid notification is a full account state: it satisfies the baseline and ends any request or retry.
     this.cancelBaseline(watch);
     this.safe('onAccount', watch.mint, slot, result.value);
+    if (this.agentMode) this.notifyCoverage();
   }
   // ---- preprocessed stream: one candidate-only filtered connection, replaced make-before-break ----
   scheduleSync() {
     if (!this.started || this.stopped || this.syncTimer) return;
     this.syncTimer = this.setTimer(() => { this.syncTimer = null; this.reconcile(); }, SYNC_DEBOUNCE_MS);
   }
-  curves() { return [...new Set([...this.watches.values()].filter(watch => watch.preprocessed).map(watch => watch.curve))].sort(); }
+  curves() { return [...new Set([...this.watches.values()].filter(watch => this.agentMode || watch.preprocessed).map(watch => watch.curve))].sort(); }
   // Brings the preprocessed connection in line with the current watchlist.
   reconcile() {
     if (this.stopped || !this.started) return;
     const pre = this.preprocessed;
     this.clearTimer(this.syncTimer); this.syncTimer = null;
+    if (this.agentMode) {
+      this.agent.setCurves(this.curves()); this.checkReady(); return;
+    }
     const curves = this.curves(), key = curves.join(',');
     if (!curves.length) { this.closePreprocessed(); this.checkReady(); return; }
     if (pre.conn?.key === key) {
@@ -520,7 +552,7 @@ export class PaperFeeds {
     const task = (async () => {
       try {
         const result = await this.rpc.accounts([watch.curve], {
-          commitment: 'processed', deadlineMs: this.now() + 5000, signal: controller.signal,
+          commitment: this.agentMode ? 'confirmed' : 'processed', deadlineMs: this.now() + 5000, signal: controller.signal,
         });
         const slot = result?.context?.slot;
         if (!Number.isSafeInteger(slot) || !Array.isArray(result.value)) throw new Error('Malformed snapshot');
@@ -530,6 +562,7 @@ export class PaperFeeds {
           this.safe('onAccount', watch.mint, slot, result.value[0] ?? null);
         }
         watch.attempts = 0;
+        if (this.agentMode) this.notifyCoverage();
       } catch {
         if (!current() || controller.signal.aborted) return;
         this.baselineUsage('failed');

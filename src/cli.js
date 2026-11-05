@@ -57,6 +57,8 @@ async function start(rpc) {
     : new CandidateTracker(store, rpc);
   if (cfg.paperMode) {
     tracker.attach(new PaperFeeds(store, rpc, {
+      agentMode: paperCfg.strategy === 'agent-sell-liquidity',
+      onAgentTransaction: tx => tracker.agentTransaction(tx),
       onAccount: (...args) => tracker.onAccount(...args), onTransaction: raw => tracker.enqueue(raw),
       onGap: reason => tracker.gap(reason), onReady: () => tracker.onReady(), onSlot: slot => tracker.onSlot(slot),
       onCoverage: mint => tracker.coverage(mint),

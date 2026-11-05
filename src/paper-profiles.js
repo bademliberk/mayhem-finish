@@ -4,6 +4,8 @@ import { DatabaseSync } from 'node:sqlite';
 
 export const trialProfiles = {
   baseline: {},
+  'agent-sell-liquidity': { strategy: 'agent-sell-liquidity', maxWatches: 20, entryQualityEnabled: true,
+    liquidityExitEnabled: true, liquidityExitMultiple: 2 },
   coverage20: { maxWatches: 20 },
   liquidity20: { maxWatches: 20, entryQualityEnabled: true },
   drop50: { maxWatches: 20, entryQualityEnabled: true, dropBps: 5000 },

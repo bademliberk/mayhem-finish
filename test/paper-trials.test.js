@@ -46,7 +46,7 @@ test('profiles isolate intended changes and validate experimental configuration'
   assert.equal(paperConfig({ PAPER_MAX_WATCHES: '20' }, 'baseline').maxWatches, 10);
   for (const env of [{ PAPER_MAX_WATCHES: '21' }, { PAPER_MIN_LIQUIDITY_MULTIPLE: '1.5' }, { PAPER_MAX_ROUND_TRIP_LOSS_BPS: '-1' }]) assert.throws(() => paperConfig(env));
   assert.throws(() => paperConfig({}, 'unknown'));
-  assert.equal(new Set(Object.keys(trialProfiles).map(p => trialPath(p))).size, 6);
+  assert.equal(new Set(Object.keys(trialProfiles).map(p => trialPath(p))).size, 7);
   const exit = paperConfig({ MAX_TRADE_COUNT: '2' }, 'liquidity-exit100');
   assert.equal(exit.maxTrades, 100); assert.equal(exit.maxWatches, 20);
   assert.equal(exit.entryQualityEnabled, true);

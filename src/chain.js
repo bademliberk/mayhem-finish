@@ -137,6 +137,76 @@ export function transactionEvents(tx) {
   return decodeLogs(tx.meta.logMessages).map(event => ({ ...event, slot: tx.slot }));
 }
 
+// The fixed TradeEvent prefix ends at byte 97; newer fields may follow the four reserves.
+// A recognizable sell with unusable reserves still supersedes an earlier sell for its mint.
+function agentTradeEvent(data, index) {
+  const r = new Reader(data);
+  const mint = r.key(), solAmount = r.u64().toString(), tokenAmount = r.u64().toString();
+  const buy = r.bool(), user = r.key();
+  r.take(8); // Timestamp is not needed for confirmed websocket signals.
+  let reserves = null;
+  if (data.length >= 129) {
+    const virtualSol = r.u64(), virtualTokens = r.u64(), realSol = r.u64(), realTokens = r.u64();
+    if (virtualSol > 0n && virtualTokens > 0n && realSol <= virtualSol && realTokens <= virtualTokens) {
+      reserves = { virtualSol: virtualSol.toString(), virtualTokens: virtualTokens.toString(),
+        realSol: realSol.toString(), realTokens: realTokens.toString() };
+    }
+  }
+  return { mint, index, solAmount, tokenAmount, user, buy, reserves };
+}
+
+/**
+ * Decode canonical confirmed { signature, slot, meta, transaction } envelopes (no blockTime
+ * required). Confirmation is the caller's responsibility; metadata must report success.
+ * Return the last successful Pump sell under Mayhem ancestry per mint, in log-index order:
+ * { mint, index, slot, signature, solAmount, tokenAmount, user, buy: false, reserves }.
+ * Amounts and reserve fields { virtualSol, virtualTokens, realSol, realTokens } are decimal
+ * strings. Missing/invalid reserves produce a null marker, never fallback to an earlier sell.
+ * Invalid metadata, malformed events/scopes, truncated logs or unclosed scopes return [].
+ * The transaction body is not used: attribution comes only from complete successful scopes.
+ */
+export function agentSellEvents(tx) {
+  if (!tx?.meta || tx.meta.err !== null || !Number.isSafeInteger(tx.slot) || tx.slot < 0 ||
+      typeof tx.signature !== 'string' || !tx.signature.trim() || !Array.isArray(tx.meta.logMessages)) return [];
+  const frames = [], proven = [];
+  for (const [index, line] of tx.meta.logMessages.entries()) {
+    if (typeof line !== 'string' || line.includes(TRUNCATION_MARKER)) return [];
+    const invoke = /^Program (\w+) invoke \[(\d+)\]$/.exec(line);
+    if (invoke) {
+      if (Number(invoke[2]) !== frames.length + 1) return [];
+      frames.push({ program: invoke[1], events: [] });
+      continue;
+    }
+    const close = /^Program (\w+) (success|failed: .*)$/.exec(line);
+    if (close) {
+      const frame = frames.pop();
+      if (!frame || frame.program !== close[1]) return [];
+      if (close[2] === 'success') (frames.length ? frames.at(-1).events : proven).push(...frame.events);
+      continue;
+    }
+    if (/^\s*Program\s+\S+\s+(?:invoke\b|success\b|failed\b)/.test(line)) return [];
+    if (!line.startsWith('Program data:')) continue;
+    if (!frames.length || !line.startsWith('Program data: ')) return [];
+    if (frames.at(-1).program !== PUMP) continue;
+    const encoded = line.slice(14);
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) return [];
+    const data = Buffer.from(encoded, 'base64');
+    if (data.length < 8 || data.toString('base64') !== encoded) return [];
+    if (!data.subarray(0, 8).equals(TRADE)) continue;
+    try {
+      const event = agentTradeEvent(data, index);
+      if (!event.buy && frames.slice(0, -1).some(frame => frame.program === MAYHEM)) {
+        frames.at(-1).events.push(event);
+      }
+    } catch { return []; }
+  }
+  if (frames.length) return [];
+  const latest = new Map();
+  for (const event of proven) latest.set(event.mint, event);
+  return [...latest.values()].sort((a, b) => a.index - b.index)
+    .map(event => ({ ...event, slot: tx.slot, signature: tx.signature }));
+}
+
 // Fixed, payload-free labels for why a curve account failed validation (diagnostics only).
 export const CURVE_VALIDATION_CODES = Object.freeze(['missing_or_wrong_owner', 'length_or_discriminator',
   'unsupported_quote', 'invalid_flags', 'zero_reserves']);

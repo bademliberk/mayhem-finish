@@ -2,7 +2,7 @@
 const PREFIX = 'feed_health_';
 export const HEALTH_STALE_MS = 5000;
 export const SLOT_PROGRESS_MS = 30000;
-const components = new Set(['process', 'discovery', 'standard', 'preprocessed', 'recovery']);
+const components = new Set(['process', 'discovery', 'standard', 'preprocessed', 'agent', 'recovery']);
 const phases = new Set(['starting', 'connecting', 'subscribing', 'subscribed', 'backoff', 'idle', 'running', 'stopped', 'waiting', 'recovering', 'complete']);
 const categories = new Set(['connect_failed', 'transport_error', 'http_rejected', 'disconnected', 'ack_timeout',
   'subscribe_failed', 'send_failed', 'heartbeat_timeout', 'heartbeat_failed', 'malformed_message', 'oversized_frame',
@@ -69,13 +69,13 @@ export function readFeedHealth(store, now = Date.now()) {
   const process = read('process');
   process.state = process.phase === 'stopped' ? 'stopped' : !process.phase ? 'unavailable' : expired(process) ? 'stale' : 'running';
   const result = { process };
-  for (const component of ['discovery', 'standard', 'preprocessed']) {
+  for (const component of ['discovery', 'standard', 'preprocessed', 'agent']) {
     const value = read(component);
     value.state = value.phase === 'stopped' || process.state === 'stopped' ? 'stopped'
       : !value.phase ? 'unavailable' : process.state !== 'running' || expired(value) ? 'stale'
         : value.phase === 'idle' ? 'idle' : value.phase !== 'subscribed' ? 'degraded'
           : component === 'standard' ? (nonnegative(value.lastProgressAt) && value.lastProgressAt <= now && now - value.lastProgressAt < SLOT_PROGRESS_MS
-            && !value.pendingAcks && !value.pendingProgress ? 'healthy' : 'degraded') : component === 'preprocessed' && value.pending ? 'degraded' : 'subscribed';
+            && !value.pendingAcks && !value.pendingProgress ? 'healthy' : 'degraded') : (component === 'preprocessed' || component === 'agent') && value.pending ? 'degraded' : 'subscribed';
     result[component] = value;
   }
   const recovery = read('recovery');
