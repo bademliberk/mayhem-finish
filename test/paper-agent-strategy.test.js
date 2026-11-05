@@ -10,7 +10,7 @@ import { PUMP, MAYHEM } from '../src/config.js';
 import { Store } from '../src/store.js';
 import { PaperEngine } from '../src/paper-engine.js';
 import { PaperStore, paperConfig } from '../src/paper-store.js';
-import { reserves, liquidityBudget, entryQuote, entryQuality } from '../src/paper-math.js';
+import { reserves, liquidityBudget, entryQuote, entryQuality, terminalExitQuote, writeOffQuote, fullSaleGross } from '../src/paper-math.js';
 import { trialIdentity, bindTrial, preflightTrial } from '../src/paper-profiles.js';
 
 const key = n => new PublicKey(Buffer.alloc(32, n)).toBase58();
@@ -69,6 +69,39 @@ test('new profile validates independent assumptions without changing legacy iden
     assert.throws(() => paperConfig(env, 'agent-sell-liquidity'));
   }
   assert.notEqual(trialIdentity(config), trialIdentity(paperConfig({ PAPER_AGENT_HOLD_SLOTS: '81' }, 'agent-sell-liquidity')));
+});
+
+test('agent watch capacity accepts up to 1000 without changing legacy identities or default trial identity', () => {
+  const larger = paperConfig({ PAPER_AGENT_MAX_WATCHES: '1000' }, 'agent-sell-liquidity');
+  assert.equal(larger.maxWatches, 1000);
+  assert.equal(paperConfig({ PAPER_AGENT_MAX_WATCHES: '1' }, 'agent-sell-liquidity').maxWatches, 1);
+  assert.equal(trialIdentity(paperConfig({ PAPER_AGENT_MAX_WATCHES: '20' }, 'agent-sell-liquidity')), trialIdentity(config));
+  assert.notEqual(trialIdentity(larger), trialIdentity(config));
+  for (const value of ['0', '1001', '1.5', 'Infinity', 'invalid']) {
+    assert.throws(() => paperConfig({ PAPER_AGENT_MAX_WATCHES: value }, 'agent-sell-liquidity'), /PAPER_AGENT_MAX_WATCHES/);
+  }
+  for (const profile of [null, 'baseline', 'coverage20', 'liquidity20', 'drop50', 'window8', 'liquidity-exit100']) {
+    assert.equal(trialIdentity(paperConfig({ PAPER_AGENT_MAX_WATCHES: '1000' }, profile)), trialIdentity(paperConfig({}, profile)));
+  }
+});
+
+test('agent admission and restart retain 1000 watches and reject the next nonreplaceable mint offline', async () => {
+  const store = new Store(':memory:', storeConfig);
+  const cfg = paperConfig({ PAPER_AGENT_MAX_WATCHES: '1000' }, 'agent-sell-liquidity');
+  const engine = new PaperEngine(store, {}, cfg, { now: () => 100000 });
+  const subscribed = new Set();
+  engine.attach({ add: mint => subscribed.add(mint), remove: mint => subscribed.delete(mint), start() {}, stop() {} });
+  try {
+    for (let i = 1; i <= 1001; i++) {
+      const bytes = Buffer.alloc(32); bytes.writeUInt32LE(i);
+      const candidate = new PublicKey(bytes).toBase58();
+      store.addMint({ mint: candidate, timestamp: 100 }); engine.add(candidate);
+    }
+    assert.equal(engine.paper.active().length, 1000); assert.equal(subscribed.size, 1000);
+    assert.equal(store.get("SELECT count FROM paper_counters WHERE name='enrollment_watch_cap'").count, 1);
+    subscribed.clear(); engine.start();
+    assert.equal(engine.paper.active().length, 1000); assert.equal(subscribed.size, 1000);
+  } finally { await engine.stop(); store.close(); }
 });
 
 test('integer fraction truncates, applies cap, and explicit budgets retain exact fee-inclusive semantics', () => {
@@ -257,8 +290,8 @@ test('profit exits are driven by accounts without preprocessed trades', async ()
   } finally { s.close(); }
 });
 
-test('timeout triggers on slots without changed accounts, stays mandatory, and never fabricates illiquid sale', async () => {
-  const s = setup({ holdSlots: 3 }); try {
+test('v2 compatibility: timeout stays mandatory without fabricating an illiquid sale', async () => {
+  const s = setup({ version: 'agent_sell_liquidity_v2_event_only', holdSlots: 3 }); try {
     await buy(s); s.engine.onSlot(22); assert.equal(pending(s), undefined);
     s.engine.onSlot(23); assert.equal(watch(s).reason, 'timeout'); assert.equal(pending(s).reason, 'timeout');
     s.engine.onAccount(mint, 23, account(0n)); s.snapshot(account(0n), 23);
@@ -269,16 +302,16 @@ test('timeout triggers on slots without changed accounts, stays mandatory, and n
   } finally { s.close(); }
 });
 
-test('stale accounts cannot prevent timeout latch or authorize a quote', async () => {
-  const s = setup({ holdSlots: 3 }); try {
+test('v2 compatibility: stale accounts latch timeout and wait for a fresh quote', async () => {
+  const s = setup({ version: 'agent_sell_liquidity_v2_event_only', holdSlots: 3 }); try {
     await buy(s); s.now(106000); s.engine.onSlot(23);
     assert.equal(watch(s).reason, 'timeout'); assert.equal(pending(s), undefined);
     s.engine.onAccount(mint, 23, account()); assert.equal(pending(s).reason, 'timeout');
   } finally { s.close(); }
 });
 
-test('graduated and drained holdings remain unresolved, never simulated as exited', async () => {
-  const s = setup({ holdSlots: 3 }); try {
+test('v2 compatibility: graduated and drained holdings remain unresolved', async () => {
+  const s = setup({ version: 'agent_sell_liquidity_v2_event_only', holdSlots: 3 }); try {
     await buy(s); s.engine.onAccount(mint, 21, account(0n)); assert.equal(watch(s).reason, 'liquidity_risk'); assert.equal(pending(s), undefined);
     s.engine.onSlot(23); assert.equal(watch(s).reason, 'timeout'); assert.equal(pending(s), undefined);
     s.engine.onAccount(mint, 24, account(0n, 140000000n, true)); assert.equal(watch(s).reason, 'graduated_no_amm_exit'); assert.ok(position(s));
@@ -352,8 +385,8 @@ test('confirmed entry retains its newer account watermark before evaluating hold
   } finally { s.close(); }
 });
 
-test('quiet timeout holdings wait for account updates without fallback RPC polling', async () => {
-  const s = setup(); try {
+test('v2 compatibility: quiet timeout holdings wait for accounts without RPC polling', async () => {
+  const s = setup({ version: 'agent_sell_liquidity_v2_event_only' }); try {
     await buy(s); let calls = 0, slot = 20;
     s.rpc.accounts = async () => { calls++; return snapshotOf(account(), slot); };
     for (slot = 21; slot <= 120; slot++) {
@@ -367,9 +400,9 @@ test('quiet timeout holdings wait for account updates without fallback RPC polli
   } finally { s.close(); }
 });
 
-test('missing and illiquid holdings remain unresolved without periodic account reads', async () => {
+test('v2 compatibility: missing and illiquid holdings remain unresolved without account reads', async () => {
   for (const missing of [true, false]) {
-    const s = setup({ holdSlots: 3 }); try {
+    const s = setup({ version: 'agent_sell_liquidity_v2_event_only', holdSlots: 3 }); try {
       await buy(s);
       if (missing) s.engine.states.delete(mint);
       else s.engine.onAccount(mint, 20, account(0n));
@@ -383,9 +416,9 @@ test('missing and illiquid holdings remain unresolved without periodic account r
   }
 });
 
-test('failed mandatory confirmations wait for new account events instead of polling or replacing orders', async () => {
+test('v2 compatibility: failed mandatory confirmations wait for new events without polling', async () => {
   for (const result of ['failure', 'missing', 'invalid', 'behind', 'drained', 'slippage']) {
-    const s = setup({ holdSlots: 3 }); try {
+    const s = setup({ version: 'agent_sell_liquidity_v2_event_only', holdSlots: 3 }); try {
       await buy(s); let calls = 0;
       s.rpc.accounts = async () => {
         calls++;
@@ -422,8 +455,8 @@ test('confirmation snapshots cannot authorize a second mandatory exit attempt', 
   } finally { s.close(); }
 });
 
-test('subscription baseline can authorize one exit attempt but does not start polling', async () => {
-  const s = setup({ holdSlots: 3 }); let feeds;
+test('v2 compatibility: subscription baseline authorizes one attempt without polling', async () => {
+  const s = setup({ version: 'agent_sell_liquidity_v2_event_only', holdSlots: 3 }); let feeds;
   try {
     await buy(s); s.engine.gap('test'); s.engine.onReady(); s.engine.onSlot(23);
     let calls = 0, source;
@@ -456,8 +489,8 @@ test('gap and shutdown abort event-driven exit confirmations and ignore late res
   }
 });
 
-test('newer invalid observations cancel in-flight confirmations even in the same slot', async () => {
-  const s = setup({ holdSlots: 3 }); try {
+test('v2 compatibility: invalid observations cancel in-flight confirmations without closing holdings', async () => {
+  const s = setup({ version: 'agent_sell_liquidity_v2_event_only', holdSlots: 3 }); try {
     await buy(s); const wait = deferred(); s.rpc.accounts = () => wait.promise;
     s.engine.onSlot(23); const work = s.engine.tick();
     s.engine.onAccount(mint, 23, null); wait.resolve(snapshotOf(account(), 23)); await work;
@@ -495,8 +528,8 @@ test('timeout promotes queued and in-flight risk exits without aborting or repla
   }
 });
 
-test('an older order does not consume a newer account event against its stale quote', async () => {
-  const s = setup({ holdSlots: 3 }); try {
+test('v2 compatibility: mandatory slippage preserves a newer account authorization', async () => {
+  const s = setup({ version: 'agent_sell_liquidity_v2_event_only', holdSlots: 3 }); try {
     await buy(s); s.engine.onSlot(23); const first = pending(s);
     const revision = JSON.parse(first.quote_json).exitObservationRevision;
     s.engine.onAccount(mint, 24, account(40000000n, 100000000n));
@@ -510,8 +543,8 @@ test('an older order does not consume a newer account event against its stale qu
   } finally { s.close(); }
 });
 
-test('transaction coverage cannot invalidate an account-baseline-authorized mandatory exit', async () => {
-  const s = setup({ holdSlots: 3 }); try {
+test('v2 compatibility: coverage cannot invalidate a post-gap baseline-authorized exit', async () => {
+  const s = setup({ version: 'agent_sell_liquidity_v2_event_only', holdSlots: 3 }); try {
     await buy(s); s.engine.gap('reconnect'); s.engine.onSlot(23);
     s.engine.onAccount(mint, 24, account(), 'baseline'); const order = pending(s), wait = deferred();
     assert.ok(order); s.rpc.accounts = () => wait.promise;
@@ -539,8 +572,8 @@ test('orders expiring before their first RPC cannot be recreated from the same a
   } finally { s.close(); }
 });
 
-test('an illiquid mandatory-exit observation is evaluated and counted only once', async () => {
-  const s = setup({ holdSlots: 3 }); try {
+test('v2 compatibility: an illiquid exit observation is evaluated only once', async () => {
+  const s = setup({ version: 'agent_sell_liquidity_v2_event_only', holdSlots: 3 }); try {
     await buy(s); let failures = 0; const count = s.engine.paper.count.bind(s.engine.paper);
     s.engine.paper.count = name => { if (name === 'exit_insufficient_liquidity') failures++; return count(name); };
     s.engine.onAccount(mint, 21, account(0n)); assert.equal(failures, 1);
@@ -583,6 +616,391 @@ test('inventory-exhausting agent buys fail quality at both admission and confirm
     q.engine.agentTransaction(tx()); const order = pending(q); q.snapshot(thin);
     await q.engine.reconcile(order); assert.equal(canceled(q, order.id), 'entry_inventory_exhaustion'); assert.equal(position(q), undefined);
   } finally { q.close(); }
+});
+
+const lastExit = s => s.store.get("SELECT * FROM paper_orders WHERE mint=? AND side='sell' ORDER BY id DESC LIMIT 1", mint);
+function assertTerminal(s, original, expectedOutcome) {
+  const closed = s.store.get('SELECT * FROM paper_positions WHERE mint=?', mint), order = lastExit(s);
+  const quote = JSON.parse(order.fill_json);
+  assert.equal(position(s), undefined); assert.equal(closed.status, 'closed');
+  assert.equal(closed.tokens_raw, original.tokens_raw); assert.equal(closed.entry_cost_lamports, original.entry_cost_lamports);
+  assert.equal(closed.entry_order_id, original.entry_order_id); assert.equal(quote.entryOrderId, original.entry_order_id);
+  assert.equal(quote.originalTokens, original.tokens_raw); assert.equal(quote.tokens, original.tokens_raw);
+  assert.equal(BigInt(quote.soldTokens) + BigInt(quote.burnedTokens), BigInt(original.tokens_raw));
+  assert.equal(quote.remainingTokens, '0'); assert.equal(quote.accountClosed, true);
+  assert.equal(quote.terminalOutcome, expectedOutcome);
+  assert.equal(order.status, expectedOutcome === 'write_off' ? 'written_off' : 'filled');
+  assert.equal(quote.networkFee, s.engine.cfg.networkFeeLamports);
+  assert.equal(BigInt(quote.net), BigInt(quote.gross) - BigInt(quote.swapFee) - BigInt(quote.networkFee));
+  assert.equal(closed.exit_net_lamports, quote.net);
+  assert.equal(BigInt(closed.pnl_lamports), BigInt(quote.net) - BigInt(original.entry_cost_lamports));
+  assert.equal(watch(s).status, 'closed'); assert.equal(s.engine.paper.exposure().total, 0n);
+  assert.equal(s.engine.states.has(mint), false); assert.equal(s.engine.coverageSlots.has(mint), false);
+  assert.equal(s.engine.exitAttempts.has(mint), false); assert.equal(pending(s), undefined);
+  return { closed, order, quote };
+}
+async function restartEngine(s, at = 200000) {
+  const previous = s.engine; await previous.stop();
+  let now = at;
+  s.engine = new PaperEngine(s.store, s.rpc, previous.cfg, { now: () => now, project: raw => raw });
+  s.engine.attach(previous.feeds); s.now = value => { now = value; };
+  s.engine.start();
+}
+
+test('v3 mandatory exits recover full or partial liquidity and preserve original entry history', async () => {
+  for (const real of [1000000n, 6000000n, 40000000n]) {
+    const s = setup({ holdSlots: 3 }); try {
+      await buy(s); const original = { ...position(s) };
+      const entry = s.store.get('SELECT * FROM paper_orders WHERE id=?', original.entry_order_id);
+      let removed = 0, calls = 0;
+      s.engine.feeds.remove = m => { if (m === mint) removed++; };
+      s.rpc.accounts = async () => { calls++; return snapshotOf(account(real), 23); };
+      s.engine.onAccount(mint, 21, account(real)); s.engine.onSlot(23);
+      const requested = pending(s); assert.ok(requested); assert.equal(calls, 0);
+      await s.engine.tick();
+      const result = assertTerminal(s, original, real === 1000000n ? 'partial_sale' : 'full_sale');
+      assert.equal(calls, 1); assert.equal(removed, 1);
+      assert.equal(result.quote.model, 'hypothetical_terminal_liquidation');
+      assert.equal(result.quote.reserveEvidence.realSol, real.toString());
+      assert.ok(BigInt(result.quote.gross) <= real);
+      if (real === 1000000n) {
+        assert.ok(BigInt(result.quote.burnedTokens) > 0n);
+        assert.ok(fullSaleGross(reserves(account(real)), BigInt(result.quote.soldTokens) + 1n) > real);
+      } else assert.equal(result.quote.burnedTokens, '0');
+      assert.deepEqual(s.store.get('SELECT * FROM paper_orders WHERE id=?', original.entry_order_id), entry);
+      await s.engine.reconcile(requested); await s.engine.tick();
+      assert.equal(calls, 1); assert.equal(removed, 1);
+    } finally { s.close(); }
+  }
+});
+
+test('v3 mandatory confirmation accepts reduced recovery but profit keeps profitability and slippage guards', async () => {
+  const s = setup({ holdSlots: 3 }); try {
+    await buy(s); const original = { ...position(s) };
+    s.engine.onSlot(23); const requested = pending(s), prediction = JSON.parse(requested.quote_json);
+    s.snapshot(account(500000n), 23); await s.engine.reconcile(requested);
+    const { quote } = assertTerminal(s, original, 'partial_sale');
+    assert.ok(BigInt(quote.net) * 10000n < BigInt(prediction.net) * BigInt(10000 - config.sellSlippageBps));
+    assert.equal(quote.reserveEvidence.realSol, '500000');
+  } finally { s.close(); }
+  for (const virtual of [140000000n, 200000000n]) {
+    const p = setup(); try {
+      await buy(p); p.engine.onAccount(mint, 21, account(100000000n, 240000000n));
+      const order = pending(p); assert.equal(order.reason, 'profit');
+      p.snapshot(account(100000000n, virtual), 21); await p.engine.reconcile(order);
+      assert.equal(canceled(p, order.id), virtual === 140000000n ? 'profit_disappeared' : 'sell_slippage');
+      assert.ok(position(p)); assert.equal(lastExit(p).fill_json, null);
+    } finally { p.close(); }
+  }
+});
+
+test('v3 zero and fee-dust reserves burn everything without confirmation RPC or fabricated sell fills', async () => {
+  for (const real of [0n, 1n]) {
+    const s = setup(); try {
+      await buy(s); const original = { ...position(s) }; let calls = 0;
+      s.rpc.accounts = async () => { calls++; throw new Error('Unexpected RPC'); };
+      s.engine.onAccount(mint, 21, account(real));
+      const { quote } = assertTerminal(s, original, 'write_off');
+      assert.equal(quote.soldTokens, '0'); assert.equal(quote.burnedTokens, original.tokens_raw);
+      assert.equal(quote.gross, '0'); assert.equal(quote.swapFee, '0'); assert.equal(quote.net, '-10000');
+      assert.equal(quote.writeOffReason, real === 0n ? 'insufficient_real_liquidity' : 'fees_exceed_output');
+      for (let i = 0; i < 5; i++) { s.engine.onSlot(21 + i); await s.engine.tick(); s.engine.onAccount(mint, 21 + i, account()); }
+      assert.equal(calls, 0); assert.equal(s.store.get("SELECT COUNT(*) n FROM paper_orders WHERE side='sell'").n, 1);
+    } finally { s.close(); }
+  }
+});
+
+test('v3 stale or missing timeout state writes off with exact losses and immediate exposure release', async () => {
+  for (const missing of [false, true]) {
+    const s = setup({ holdSlots: 3 }); try {
+      await buy(s); const original = { ...position(s) }; let calls = 0;
+      const saved = watch(s).fingerprint; assert.ok(saved);
+      s.rpc.accounts = async () => { calls++; throw new Error('No fallback account reads'); };
+      if (missing) s.engine.states.delete(mint);
+      else s.now(106000);
+      s.engine.onSlot(23); await s.engine.tick();
+      const { quote, closed } = assertTerminal(s, original, 'write_off');
+      assert.equal(quote.writeOffReason, missing ? 'missing_observation' : 'stale_observation');
+      assert.equal(quote.gross, '0'); assert.equal(quote.net, '-10000');
+      assert.equal(BigInt(closed.pnl_lamports), -10000n - BigInt(original.entry_cost_lamports));
+      assert.equal(calls, 0); assert.equal(watch(s).fingerprint, saved);
+      assert.equal(watch(s).reason, 'timeout');
+    } finally { s.close(); }
+  }
+});
+
+test('v3 ordinary holdings without mandatory intent are not closed for stale, missing or invalid accounts', async () => {
+  for (const kind of ['stale', 'missing', 'invalid']) {
+    const s = setup(); try {
+      await buy(s); const original = { ...position(s) }; let calls = 0;
+      s.rpc.accounts = async () => { calls++; throw new Error('No RPC'); };
+      if (kind === 'missing') s.engine.states.delete(mint);
+      if (kind === 'invalid') s.engine.onAccount(mint, 21, null);
+      s.now(106000); s.engine.onSlot(21); await s.engine.tick();
+      assert.deepEqual({ ...position(s) }, original); assert.equal(watch(s).reason, null);
+      assert.equal(lastExit(s), undefined); assert.equal(calls, 0);
+    } finally { s.close(); }
+  }
+});
+
+test('v3 graduation closes from live, confirmed and restored evidence without inventing AMM proceeds', async () => {
+  for (const source of ['live', 'confirmed', 'restored']) {
+    const s = setup({ holdSlots: 3 }); try {
+      await buy(s); const original = { ...position(s) }; let calls = 0;
+      s.rpc.accounts = async () => { calls++; return snapshotOf(account(0n, 140000000n, true), 23); };
+      if (source === 'live') s.engine.onAccount(mint, 21, account(0n, 140000000n, true));
+      else if (source === 'confirmed') { s.engine.onSlot(23); await s.engine.tick(); }
+      else {
+        s.store.run("UPDATE paper_watches SET status='exit_blocked',reason='graduated_no_amm_exit' WHERE mint=?", mint);
+        await restartEngine(s);
+      }
+      const { quote } = assertTerminal(s, original, 'write_off');
+      assert.equal(quote.writeOffReason, 'graduated_no_amm_exit'); assert.equal(quote.gross, '0');
+      assert.equal(calls, source === 'confirmed' ? 1 : 0);
+      assert.equal(s.engine.startupExitGrace.has(mint), false);
+    } finally { s.close(); }
+  }
+});
+
+test('v3 invalid observation aborts in-flight confirmation and late results cannot overwrite write-off', async () => {
+  for (const value of [null, {}, { owner: key(9), data: account().data }]) {
+    const s = setup({ holdSlots: 3 }); try {
+      await buy(s); const original = { ...position(s) }, wait = deferred(); let signal, calls = 0;
+      s.rpc.accounts = (_addresses, options) => { signal = options.signal; calls++; return wait.promise; };
+      s.engine.onSlot(23); const order = pending(s), work = s.engine.tick();
+      s.engine.onAccount(mint, 23, value); assert.equal(signal.aborted, true);
+      const settled = assertTerminal(s, original, 'write_off');
+      assert.equal(canceled(s, order.id), 'invalid_account');
+      wait.resolve(snapshotOf(account(), 24)); await work; await s.engine.tick();
+      assert.deepEqual(assertTerminal(s, original, 'write_off'), settled);
+      assert.equal(calls, 1); assert.equal(s.store.get("SELECT COUNT(*) n FROM paper_orders WHERE status='written_off'").n, 1);
+    } finally { s.close(); }
+  }
+});
+
+test('v3 cache aging does not abort an in-flight confirmation within its existing TTL', async () => {
+  const s = setup({ holdSlots: 3, maxStateAgeMs: 1000, orderTtlMs: 10000 }); try {
+    await buy(s); const original = { ...position(s) }, wait = deferred(); let signal;
+    s.rpc.accounts = (_addresses, options) => { signal = options.signal; return wait.promise; };
+    s.engine.onSlot(23); const order = pending(s), work = s.engine.tick();
+    s.now(105000); s.engine.onSlot(24); await s.engine.tick();
+    assert.equal(signal.aborted, false); assert.ok(position(s)); assert.equal(pending(s).id, order.id);
+    wait.resolve(snapshotOf(account(), 24)); await work;
+    assertTerminal(s, original, 'full_sale');
+  } finally { s.close(); }
+});
+
+test('v3 restored mandatory intent gives initial baseline one TTL grace, then writes off without RPC', async () => {
+  for (const baseline of [false, true]) {
+    const s = setup({ holdSlots: 3, orderTtlMs: 1000 }); try {
+      await buy(s); const original = { ...position(s) }; s.engine.onSlot(23);
+      const oldOrder = pending(s); let calls = 0;
+      s.rpc.accounts = async () => { calls++; return snapshotOf(account(), 24); };
+      await restartEngine(s);
+      assert.equal(pending(s), undefined); assert.ok(position(s));
+      assert.equal(s.engine.states.has(mint), false); assert.equal(s.engine.startupExitGrace.get(mint), 201000);
+      s.now(200999); await s.engine.tick(); assert.ok(position(s)); assert.equal(calls, 0);
+      if (baseline) {
+        s.engine.onAccount(mint, 24, account(), 'baseline');
+        assert.ok(pending(s)); assert.equal(s.engine.startupExitGrace.has(mint), false);
+        await s.engine.tick(); assertTerminal(s, original, 'full_sale'); assert.equal(calls, 1);
+      } else {
+        s.now(201000); await s.engine.tick();
+        const { quote } = assertTerminal(s, original, 'write_off');
+        assert.equal(quote.writeOffReason, 'missing_observation'); assert.equal(calls, 0);
+      }
+      assert.notEqual(lastExit(s).id, oldOrder.id);
+    } finally { s.close(); }
+  }
+});
+
+test('v3 restored ordinary holdings survive empty cache and elapsed startup grace until timeout', async () => {
+  const s = setup({ holdSlots: 3, orderTtlMs: 1000 }); try {
+    await buy(s); const original = { ...position(s) }; let calls = 0;
+    s.rpc.accounts = async () => { calls++; throw new Error('No initial polling'); };
+    await restartEngine(s); await s.engine.tick();
+    s.now(202000); s.engine.onSlot(22); await s.engine.tick();
+    assert.deepEqual({ ...position(s) }, original); assert.equal(watch(s).reason, null); assert.equal(lastExit(s), undefined);
+    s.engine.onSlot(23); await s.engine.tick();
+    assertTerminal(s, original, 'write_off'); assert.equal(calls, 0);
+  } finally { s.close(); }
+});
+
+test('v3 gapped expired mandatory intent writes off without an additional RPC', async () => {
+  const s = setup({ holdSlots: 3, orderTtlMs: 1000 }); try {
+    await buy(s); const original = { ...position(s) }, wait = deferred(); let calls = 0, signal;
+    s.rpc.accounts = (_addresses, options) => { calls++; signal = options.signal; return wait.promise; };
+    s.engine.onSlot(23); const work = s.engine.tick(), order = pending(s);
+    s.engine.gap('test'); assert.equal(signal.aborted, true);
+    s.now(102000); wait.resolve(snapshotOf(account(), 24)); await work; await s.engine.tick();
+    assertTerminal(s, original, 'write_off'); assert.equal(canceled(s, order.id), 'feed_gap');
+    for (let i = 0; i < 5; i++) await s.engine.tick();
+    assert.equal(calls, 1);
+  } finally { s.close(); }
+});
+
+test('v3 failed, missing, invalid, behind and drained confirmations never create fallback polling', async () => {
+  for (const result of ['failure', 'missing', 'invalid', 'behind', 'drained']) {
+    const s = setup({ holdSlots: 3 }); try {
+      await buy(s); const original = { ...position(s) }; let calls = 0;
+      s.rpc.accounts = async () => {
+        calls++; if (result === 'failure') throw new Error('offline');
+        return snapshotOf(result === 'missing' ? null : result === 'invalid' ? {} :
+          result === 'drained' ? account(0n) : account(), result === 'behind' ? 19 : 23);
+      };
+      s.engine.onSlot(23); await s.engine.tick(); assert.equal(calls, 1);
+      s.now(111000); await s.engine.tick();
+      assertTerminal(s, original, 'write_off');
+      for (let i = 0; i < 5; i++) await s.engine.tick();
+      assert.equal(calls, 1);
+    } finally { s.close(); }
+  }
+});
+
+test('v3 terminal settlement remains exactly once across ticks, duplicate fills and disk restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'terminal-once-')), path = join(dir, 'trial.sqlite');
+  let s = setup({ holdSlots: 3 }, path);
+  try {
+    await buy(s); const original = { ...position(s) }; s.engine.onAccount(mint, 21, account(0n));
+    const settled = assertTerminal(s, original, 'write_off');
+    const count = s.store.get('SELECT COUNT(*) n FROM paper_orders').n;
+    assert.equal(s.engine.paper.writeOff(mint, 'timeout', settled.quote, 101000), false);
+    s.engine.paper.fill(settled.order, settled.quote, 101000); await s.engine.tick();
+    await s.engine.stop(); s.close();
+    const store = new Store(path, storeConfig); let calls = 0;
+    const rpc = { accounts: async () => { calls++; throw new Error('No restart polling'); } };
+    const engine = new PaperEngine(store, rpc, { ...config, holdSlots: 3 }, { now: () => 300000 });
+    engine.attach({ add() {}, remove() {}, start() {}, stop() {} });
+    s = { store, rpc, engine, close: () => store.close() };
+    engine.start(); await engine.tick();
+    assert.deepEqual(assertTerminal(s, original, 'write_off'), settled);
+    assert.equal(store.get('SELECT COUNT(*) n FROM paper_orders').n, count); assert.equal(calls, 0);
+  } finally { s.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v3 reports distinguish partial/full modeled fills from write-offs and include all realized losses', async () => {
+  for (const real of [0n, 1000000n, 40000000n]) {
+    const s = setup({ holdSlots: 3 }); try {
+      await buy(s); const original = { ...position(s) };
+      s.engine.onAccount(mint, 21, account(real)); s.engine.onSlot(23); s.snapshot(account(real), 23); await s.engine.tick();
+      const outcome = real === 0n ? 'write_off' : real === 1000000n ? 'partial_sale' : 'full_sale';
+      const { closed, quote } = assertTerminal(s, original, outcome), report = s.engine.paper.report(101000);
+      const performance = report.performance;
+      assert.equal(performance.closedTrades, 1); assert.equal(performance.losses, 1); assert.equal(performance.wins, 0);
+      assert.equal(performance.writeOffs, real === 0n ? 1 : 0);
+      assert.equal(performance.partialLiquidations, real === 1000000n ? 1 : 0);
+      assert.equal(performance.modeledSellFills, real === 0n ? 0 : 1);
+      assert.equal(performance.unresolvedPositions, 0); assert.equal(performance.unresolvedCostLamports, '0');
+      assert.equal(report.realizedPnlLamports, closed.pnl_lamports);
+      assert.equal(performance.zeroRecoveryScenarioPnlLamports, closed.pnl_lamports);
+      assert.equal(performance.realizedMaxDrawdownLamports, (-BigInt(closed.pnl_lamports)).toString());
+      assert.equal(performance.terminalSettlements[0].outcome, outcome);
+      assert.equal(performance.terminalSettlements[0].netLamports, quote.net);
+      assert.equal(performance.terminalSettlements[0].burnedTokens, quote.burnedTokens);
+      assert.equal(report.orders.find(row => row.side === 'sell').status, real === 0n ? 'written_off' : 'filled');
+    } finally { s.close(); }
+  }
+});
+
+test('v3 store rejects invalid terminal evidence atomically and rolls back write-off order creation', async () => {
+  const s = setup(); try {
+    await buy(s); const original = { ...position(s) }, quote = writeOffQuote(original, config, 'missing_observation');
+    const before = s.store.all('SELECT * FROM paper_orders ORDER BY id'), beforeWatch = watch(s);
+    for (const patch of [{ soldTokens: '1' }, { burnedTokens: '0' }, { remainingTokens: '1' },
+      { accountClosed: false }, { originalTokens: '1' }, { net: '0' }, { networkFee: '0' },
+      { gross: '1', net: '-9999' }, { swapFee: '1', net: '-10001' }]) {
+      assert.throws(() => s.engine.paper.writeOff(mint, 'timeout', { ...quote, ...patch }, 101000), /Invalid terminal settlement/);
+      assert.deepEqual(s.store.all('SELECT * FROM paper_orders ORDER BY id'), before);
+      assert.deepEqual({ ...position(s) }, original); assert.deepEqual(watch(s), beforeWatch);
+    }
+    assert.equal(s.engine.paper.writeOff(mint, 'timeout', { ...quote, entryOrderId: -1 }, 101000), false);
+    const sale = terminalExitQuote(reserves(account()), original, config);
+    s.engine.paper.request(mint, 'sell', 'timeout', sale, null, 101000); const order = pending(s);
+    for (const patch of [{ entryOrderId: -1 }, { terminalOutcome: 'unknown' }, { burnedTokens: '1' }, { soldTokens: '-1' }]) {
+      assert.throws(() => s.engine.paper.fill(order, { ...sale, ...patch }, 101000), /Invalid terminal settlement/);
+      assert.deepEqual(pending(s), order); assert.deepEqual({ ...position(s) }, original);
+    }
+    assert.equal(s.engine.paper.writeOff(mint, 'timeout', quote, 101000), false);
+    s.engine.cancel(order.id, 101000, 'test'); s.engine.paper.fill(order, sale, 101001);
+    assert.deepEqual({ ...position(s) }, original); assert.equal(canceled(s, order.id), 'test');
+  } finally { s.close(); }
+});
+
+test('v3 a positive partial sale remains filled when its network fee makes recovery negative', async () => {
+  const s = setup(); try {
+    await buy(s); const original = { ...position(s) };
+    s.engine.onAccount(mint, 21, account(1000n)); s.snapshot(account(1000n), 21);
+    await s.engine.tick(); const { quote, closed } = assertTerminal(s, original, 'partial_sale');
+    assert.equal(quote.gross, '1000'); assert.equal(quote.swapFee, '13'); assert.equal(quote.net, '-9013');
+    assert.equal(quote.writeOffReason, null); assert.ok(BigInt(quote.soldTokens) > 0n);
+    assert.equal(BigInt(closed.pnl_lamports), -9013n - BigInt(original.entry_cost_lamports));
+  } finally { s.close(); }
+});
+
+test('v3 restored baseline authorization survives transaction coverage changes during confirmation', async () => {
+  const s = setup({ holdSlots: 3 }); try {
+    await buy(s); const original = { ...position(s) }; s.engine.onSlot(23); await restartEngine(s);
+    s.engine.onAccount(mint, 24, account(), 'baseline'); const order = pending(s), wait = deferred();
+    s.rpc.accounts = () => wait.promise; const work = s.engine.reconcile(order);
+    const since = s.engine.states.get(mint).since;
+    s.engine.onSlot(25); s.engine.coverage(mint);
+    assert.notEqual(s.engine.states.get(mint).since, since);
+    wait.resolve(snapshotOf(account(), 25)); await work;
+    assertTerminal(s, original, 'full_sale');
+  } finally { s.close(); }
+});
+
+test('v3 same-slot observation races reject the old confirmation and require a new event authorization', async () => {
+  const s = setup({ holdSlots: 3 }); try {
+    await buy(s); const original = { ...position(s) }; s.engine.onSlot(23);
+    const oldOrder = pending(s), wait = deferred(); let calls = 0;
+    s.rpc.accounts = () => { calls++; return wait.promise; };
+    const work = s.engine.reconcile(oldOrder);
+    s.engine.onAccount(mint, 23, account(1000000n));
+    wait.resolve(snapshotOf(account(), 23)); await work;
+    assert.ok(position(s)); assert.equal(canceled(s, oldOrder.id), 'awaiting_account_update');
+    assert.equal(lastExit(s).fill_json, null);
+    s.rpc.accounts = async () => { calls++; return snapshotOf(account(1000000n), 24); };
+    await s.engine.tick(); assertTerminal(s, original, 'partial_sale'); assert.equal(calls, 2);
+    await s.engine.tick(); assert.equal(calls, 2);
+  } finally { s.close(); }
+});
+
+test('v3 settlement rejects inconsistent outcome, original quantity and negative fee evidence', async () => {
+  const s = setup(); try {
+    await buy(s); const original = { ...position(s) }, sale = terminalExitQuote(reserves(account()), original, config);
+    s.engine.paper.request(mint, 'sell', 'timeout', sale, null, 101000); const order = pending(s);
+    const partial = terminalExitQuote(reserves(account(1000000n)), original, config);
+    const invalidQuotes = [
+      { ...sale, tokens: '1' },
+      { ...sale, terminalOutcome: 'partial_sale' },
+      { ...partial, terminalOutcome: 'full_sale' },
+      { ...sale, soldTokens: '0', burnedTokens: original.tokens_raw },
+      { ...sale, gross: '-1', net: (-1n - BigInt(sale.swapFee) - BigInt(sale.networkFee)).toString() },
+      { ...sale, swapFee: '-1', net: (BigInt(sale.gross) + 1n - BigInt(sale.networkFee)).toString() },
+    ];
+    for (const invalid of invalidQuotes) {
+      assert.throws(() => s.engine.paper.fill(order, invalid, 101000), /Invalid terminal settlement/,
+        `accepted inconsistent evidence: ${JSON.stringify(invalid)}`);
+      assert.deepEqual(pending(s), order); assert.deepEqual({ ...position(s) }, original);
+    }
+  } finally { s.close(); }
+});
+
+test('v3 write-off rolls back its inserted order and accounting when closing the position fails', async () => {
+  const s = setup(); try {
+    await buy(s); const original = { ...position(s) }, quote = writeOffQuote(original, config, 'missing_observation');
+    const before = s.store.all('SELECT * FROM paper_orders ORDER BY id'), beforeWatch = watch(s);
+    s.store.db.exec(`CREATE TRIGGER reject_terminal_close BEFORE UPDATE OF status ON paper_positions
+      WHEN NEW.status='closed' BEGIN SELECT RAISE(ABORT,'test_close_failure'); END`);
+    assert.throws(() => s.engine.paper.writeOff(mint, 'timeout', quote, 101000), /test_close_failure/);
+    assert.deepEqual(s.store.all('SELECT * FROM paper_orders ORDER BY id'), before);
+    assert.deepEqual({ ...position(s) }, original); assert.deepEqual(watch(s), beforeWatch);
+    assert.equal(s.engine.paper.exposure().total, BigInt(original.entry_cost_lamports));
+    s.store.db.exec('DROP TRIGGER reject_terminal_close');
+    assert.equal(s.engine.paper.writeOff(mint, 'timeout', quote, 101001), true);
+    assert.equal(position(s), undefined); assert.equal(lastExit(s).status, 'written_off');
+  } finally { s.close(); }
 });
 
 test('agent reports preserve integer evidence and support missing new sample table in read-only legacy views', () => {

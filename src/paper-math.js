@@ -114,6 +114,66 @@ export function exitQuote(state, position, cfg) {
   if (net <= 0n) throw new Error('fees_exceed_output');
   return { tokens: position.tokens_raw, gross: result.gross.toString(), net: net.toString(), mc: cap(state) };
 }
+// Terminal settlement is intentionally separate from strict full-sale/entry math.
+function terminalInteger(value, error) {
+  if (typeof value !== 'bigint' && !(typeof value === 'string' && /^\d+$/.test(value)) &&
+      !(typeof value === 'number' && Number.isSafeInteger(value))) throw new Error(error);
+  const result = BigInt(value);
+  if (result < 0n) throw new Error(error);
+  return result;
+}
+function terminalPositionTokens(position) {
+  if (typeof position?.tokens_raw !== 'string') throw new Error('invalid_terminal_position');
+  const tokens = terminalInteger(position.tokens_raw, 'invalid_terminal_position');
+  if (tokens <= 0n) throw new Error('invalid_terminal_position');
+  return tokens;
+}
+export function writeOffQuote(position, cfg, reason) {
+  terminalPositionTokens(position);
+  const networkFee = terminalInteger(cfg?.networkFeeLamports, 'invalid_terminal_network_fee');
+  if (typeof reason !== 'string' || !reason.trim()) throw new Error('invalid_write_off_reason');
+  return { tokens: position.tokens_raw, originalTokens: position.tokens_raw,
+    soldTokens: '0', burnedTokens: position.tokens_raw, remainingTokens: '0',
+    gross: '0', swapFee: '0', networkFee: networkFee.toString(), net: (-networkFee).toString(),
+    accountClosed: true, entryOrderId: position.entry_order_id, terminalOutcome: 'write_off',
+    model: 'hypothetical_zero_recovery_write_off', writeOffReason: reason };
+}
+export function terminalExitQuote(state, position, cfg) {
+  const original = terminalPositionTokens(position);
+  const networkFee = terminalInteger(cfg?.networkFeeLamports, 'invalid_terminal_network_fee');
+  const swapFeeBps = terminalInteger(cfg?.swapFeeBps, 'invalid_terminal_swap_fee');
+  if (swapFeeBps > BPS) throw new Error('invalid_terminal_swap_fee');
+  if (!state || state.complete !== false ||
+      ['realSol', 'realTokens', 'virtualSol', 'virtualTokens'].some(key =>
+        typeof state[key] !== 'bigint' || state[key] < 0n) ||
+      state.virtualSol === 0n || state.virtualTokens === 0n) throw new Error('invalid_terminal_reserves');
+  const evidence = { reserveEvidence: { realSol: state.realSol.toString(), realTokens: state.realTokens.toString(),
+    virtualSol: state.virtualSol.toString(), virtualTokens: state.virtualTokens.toString() } };
+  if (typeof state.supply === 'bigint' && state.supply > 0n) {
+    const mc = cap(state);
+    if (Number.isFinite(mc)) evidence.mc = mc;
+  }
+  // Search gross only: sell() also rejects fee dust, which is not a monotone predicate.
+  let low = 0n, high = original;
+  while (low < high) {
+    const mid = (low + high + 1n) / 2n;
+    if (fullSaleGross(state, mid) <= state.realSol) low = mid;
+    else high = mid - 1n;
+  }
+  const gross = low === 0n ? 0n : fullSaleGross(state, low);
+  if (gross === 0n || fee(gross, swapFeeBps) >= gross) {
+    return { ...writeOffQuote(position, cfg, gross === 0n ? 'insufficient_real_liquidity' : 'fees_exceed_output'),
+      ...evidence };
+  }
+  const result = sell(state, low, swapFeeBps);
+  return { tokens: position.tokens_raw, originalTokens: position.tokens_raw,
+    soldTokens: low.toString(), burnedTokens: (original - low).toString(), remainingTokens: '0',
+    gross: result.gross.toString(), swapFee: (result.gross - result.net).toString(),
+    networkFee: networkFee.toString(), net: (result.net - networkFee).toString(),
+    accountClosed: true, entryOrderId: position.entry_order_id,
+    terminalOutcome: low === original ? 'full_sale' : 'partial_sale',
+    model: 'hypothetical_terminal_liquidation', writeOffReason: null, ...evidence };
+}
 export function profitable(quote, position, cfg) {
   return BigInt(quote.net) * BPS > BigInt(position.entry_cost_lamports) * (BPS + BigInt(cfg.profitBps));
 }

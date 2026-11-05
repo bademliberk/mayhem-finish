@@ -34,7 +34,8 @@ export function paperConfig(env = process.env, profile = null) {
     entriesEnabled: env.PAPER_ENTRIES_ENABLED !== 'false',
     ...(profile === null ? {} : { maxWatches: 10, ...trialProfiles[profile] }),
     ...(profile !== 'agent-sell-liquidity' ? {} : {
-      version: 'agent_sell_liquidity_v2_event_only',
+      version: 'agent_sell_liquidity_v3_terminal_exit',
+      maxWatches: number('PAPER_AGENT_MAX_WATCHES', 20, 1, 1000),
       fractionBps: number('PAPER_AGENT_FRACTION_BPS', 1200, 1, 10000),
       maxSwapBudgetLamports: String(number('PAPER_AGENT_MAX_SWAP_LAMPORTS', 10000000, 1, 1e12)),
       minRealSolLamports: String(number('PAPER_AGENT_MIN_REAL_SOL_LAMPORTS', 10000000, 1, 1e12)),
@@ -319,32 +320,64 @@ export class PaperStore {
     return this.store.run("UPDATE paper_orders SET status='canceled',settled_at_ms=?,error=?,diagnostics_json=? WHERE id=? AND status='pending'",
       now, reason, JSON.stringify(value), id);
   }
-  fill(order, quote, now) {
-    this.store.atomic(() => {
-      const pending = this.store.get("SELECT diagnostics_json FROM paper_orders WHERE id=? AND status='pending'", order.id);
-      if (!pending) return;
-      if (order.side === 'buy' && !this.exposureAllows(BigInt(quote.cost), order.id)) {
-        this.cancel(order.id, now, 'exposure_cap'); return;
-      }
-      if (order.side === 'buy' && this.cfg.strategy === 'agent-sell-liquidity' &&
-          (!Number.isSafeInteger(quote.slot) || !Number.isSafeInteger(quote.slot + this.cfg.holdSlots))) {
-        this.cancel(order.id, now, 'invalid_fill_slot'); return;
-      }
-      if (pending.diagnostics_json != null) this.diagnose(order.id, { stage: 'filled', updatedAtMs: now });
-      this.store.run("UPDATE paper_orders SET status='filled',settled_at_ms=?,fill_json=? WHERE id=?", now, JSON.stringify(quote), order.id);
-      if (order.side === 'buy') {
-        this.store.run(`INSERT INTO paper_positions(mint,tokens_raw,entry_cost_lamports,entry_order_id,opened_at_ms)
-          VALUES(?,?,?,?,?)`, order.mint, quote.tokens, quote.cost, order.id, now);
-        if (this.cfg.strategy === 'agent-sell-liquidity') this.store.run(
-          'UPDATE paper_positions SET entry_snapshot_slot=?,timeout_slot=? WHERE mint=?', quote.slot, quote.slot + this.cfg.holdSlots, order.mint);
-        this.store.run("UPDATE paper_watches SET status='holding',reason=NULL WHERE mint=?", order.mint);
-      } else {
-        const position = this.position(order.mint);
-        this.store.run(`UPDATE paper_positions SET status='closed',exit_order_id=?,closed_at_ms=?,exit_net_lamports=?,pnl_lamports=? WHERE mint=?`,
-          order.id, now, quote.net, (BigInt(quote.net) - BigInt(position.entry_cost_lamports)).toString(), order.mint);
-        this.store.run("UPDATE paper_watches SET status='closed',reason=? WHERE mint=?", order.reason, order.mint);
-      }
+  writeOff(mint, reason, quote, now) {
+    return this.store.atomic(() => {
+      const position = this.position(mint);
+      if (!position || position.entry_order_id !== quote.entryOrderId || quote.terminalOutcome !== 'write_off') return false;
+      const id = this.requestWithinTransaction(mint, 'sell', reason, quote, null, now);
+      if (!id) return false;
+      return this.fillWithinTransaction(this.store.get('SELECT * FROM paper_orders WHERE id=?', id), quote, now);
     });
+  }
+  fill(order, quote, now) {
+    return this.store.atomic(() => this.fillWithinTransaction(order, quote, now));
+  }
+  fillWithinTransaction(order, quote, now) {
+    const pending = this.store.get("SELECT mint,side,diagnostics_json FROM paper_orders WHERE id=? AND status='pending'", order.id);
+    if (!pending || pending.mint !== order.mint || pending.side !== order.side) return false;
+    if (order.side === 'buy' && !this.exposureAllows(BigInt(quote.cost), order.id)) {
+      this.cancel(order.id, now, 'exposure_cap'); return false;
+    }
+    if (order.side === 'buy' && this.cfg.strategy === 'agent-sell-liquidity' &&
+        (!Number.isSafeInteger(quote.slot) || !Number.isSafeInteger(quote.slot + this.cfg.holdSlots))) {
+      this.cancel(order.id, now, 'invalid_fill_slot'); return false;
+    }
+    const position = order.side === 'sell' ? this.position(order.mint) : null;
+    if (order.side === 'sell' && !position) return false;
+    if (quote.terminalOutcome) {
+      const sold = BigInt(quote.soldTokens), burned = BigInt(quote.burnedTokens);
+      const gross = BigInt(quote.gross), swapFee = BigInt(quote.swapFee);
+      const writeOff = quote.terminalOutcome === 'write_off';
+      if (order.side !== 'sell' || this.cfg.strategy !== 'agent-sell-liquidity' ||
+          this.cfg.version !== 'agent_sell_liquidity_v3_terminal_exit' ||
+          position.entry_order_id !== quote.entryOrderId || quote.originalTokens !== position.tokens_raw ||
+          quote.tokens !== position.tokens_raw || !['full_sale', 'partial_sale', 'write_off'].includes(quote.terminalOutcome) ||
+          sold < 0n || burned < 0n || sold + burned !== BigInt(position.tokens_raw) ||
+          quote.remainingTokens !== '0' || quote.accountClosed !== true || gross < 0n || swapFee < 0n ||
+          BigInt(quote.net) !== gross - swapFee - BigInt(quote.networkFee) ||
+          quote.networkFee !== String(this.cfg.networkFeeLamports) ||
+          (quote.terminalOutcome === 'full_sale' && burned !== 0n) ||
+          (quote.terminalOutcome === 'partial_sale' && burned === 0n) ||
+          (writeOff ? sold !== 0n || gross !== 0n || swapFee !== 0n || !quote.writeOffReason :
+            sold <= 0n || gross <= swapFee || !quote.reserveEvidence || gross > BigInt(quote.reserveEvidence.realSol))) {
+        throw new Error('Invalid terminal settlement');
+      }
+    }
+    const status = quote.terminalOutcome === 'write_off' ? 'written_off' : 'filled';
+    if (pending.diagnostics_json != null) this.diagnose(order.id, { stage: status, updatedAtMs: now });
+    this.store.run('UPDATE paper_orders SET status=?,settled_at_ms=?,fill_json=? WHERE id=?', status, now, JSON.stringify(quote), order.id);
+    if (order.side === 'buy') {
+      this.store.run(`INSERT INTO paper_positions(mint,tokens_raw,entry_cost_lamports,entry_order_id,opened_at_ms)
+        VALUES(?,?,?,?,?)`, order.mint, quote.tokens, quote.cost, order.id, now);
+      if (this.cfg.strategy === 'agent-sell-liquidity') this.store.run(
+        'UPDATE paper_positions SET entry_snapshot_slot=?,timeout_slot=? WHERE mint=?', quote.slot, quote.slot + this.cfg.holdSlots, order.mint);
+      this.store.run("UPDATE paper_watches SET status='holding',reason=NULL WHERE mint=?", order.mint);
+    } else {
+      this.store.run(`UPDATE paper_positions SET status='closed',exit_order_id=?,closed_at_ms=?,exit_net_lamports=?,pnl_lamports=? WHERE mint=?`,
+        order.id, now, quote.net, (BigInt(quote.net) - BigInt(position.entry_cost_lamports)).toString(), order.mint);
+      this.store.run("UPDATE paper_watches SET status='closed',reason=? WHERE mint=?", order.reason, order.mint);
+    }
+    return true;
   }
   positionHealth(position, now) {
     const watch = this.watch(position.mint);
@@ -389,13 +422,15 @@ export class PaperStore {
       mode: 'paper', assumptions: this.cfg, capacity: this.capacity(), feedHealth: readFeedHealth(this.store, now),
       ...(this.cfg.strategy !== 'agent-sell-liquidity' ? {} : {
         policyMigrations: (() => {
-          const saved = this.store.get("SELECT value FROM metadata WHERE key='paper_trial_policy_migration'")?.value;
-          return saved ? [JSON.parse(saved)] : [];
+          return this.store.all("SELECT value FROM metadata WHERE key IN ('paper_trial_policy_migration','paper_trial_terminal_exit_migration')")
+            .map(row => JSON.parse(row.value)).sort((a, b) => a.atMs - b.atMs);
         })(),
         exposure: Object.fromEntries(Object.entries(this.exposure()).map(([key, value]) => [`${key}Lamports`, value.toString()])),
         recentAgentEvents: this.store.get("SELECT 1 FROM sqlite_master WHERE name='paper_agent_events'") ?
           this.store.all('SELECT * FROM paper_agent_events ORDER BY id DESC LIMIT 25') : [],
-        agentStrategyNote: 'Budget includes swap fees; total entry cost adds modeled network fees. Rent and non-fill attempt fees excluded. Events are live confirmed signals, not recovered history. Timeout attempts do not guarantee exits.',
+        agentStrategyNote: this.cfg.version === 'agent_sell_liquidity_v3_terminal_exit'
+          ? 'Mandatory exits recover supported liquidity and model burning the remainder; unavailable reserves are zero-recovery write-offs. One network fee models combined sell/burn/account closure; no rent credit. Not actual sales, burns or account closures. Entry screening still requires a full modeled exit.'
+          : 'Budget includes swap fees; total entry cost adds modeled network fees. Rent and non-fill attempt fees excluded. Events are live confirmed signals, not recovered history. Timeout attempts do not guarantee exits.',
       }),
       performance: paperPerformance(this.store, positions, openPositionHealth),
       coverage: this.store.all(`SELECT mint,status,last_cap,last_change_ms,last_observed_ms,account_error,preprocessed FROM paper_watches
@@ -423,7 +458,9 @@ export class PaperStore {
       counters: this.store.all('SELECT * FROM paper_counters ORDER BY name'),
       blocked: this.store.all("SELECT * FROM paper_watches WHERE status='exit_blocked'"),
       usage: this.store.all("SELECT * FROM usage WHERE source IN ('preprocessed','preprocessed_bytes','paper_agent') OR method IN ('paper_account_received_bytes','paper_agent_received_bytes') ORDER BY day,source,method"),
-      note: 'Hypothetical fills using later executed reserves and configured fees; not actual trades, balances or achievable returns. Unsupported transactions are skipped. Graduation exits require manual attention; no AMM execution.',
+      note: this.cfg.version === 'agent_sell_liquidity_v3_terminal_exit'
+        ? 'Paper results include confirmed-state modeled sales and explicit zero-recovery write-offs, not actual trades, balances or achievable returns. Burn/account closure is modeled with one network fee and no rent credit. No AMM execution or proceeds are assumed.'
+        : 'Hypothetical fills using later executed reserves and configured fees; not actual trades, balances or achievable returns. Unsupported transactions are skipped. Graduation exits require manual attention; no AMM execution.',
     };
   }
 }

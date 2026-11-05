@@ -24,8 +24,22 @@ export function paperPerformance(store, positions, openHealth = []) {
     row.oldestHeldMs = Math.max(row.oldestHeldMs, health.heldMs);
     grouped.set(key, row);
   }
+  const terminalSettlements = store.all(`SELECT p.mint,p.pnl_lamports,o.id orderId,o.reason,o.status,o.fill_json
+    FROM paper_positions p JOIN paper_orders o ON o.id=p.exit_order_id WHERE p.status='closed' AND o.fill_json IS NOT NULL`)
+    .flatMap(({ fill_json, ...row }) => {
+      const quote = JSON.parse(fill_json);
+      if (!quote.terminalOutcome) return [];
+      return [{ ...row, outcome: quote.terminalOutcome, model: quote.model, soldTokens: quote.soldTokens,
+        burnedTokens: quote.burnedTokens, remainingTokens: quote.remainingTokens, grossLamports: quote.gross,
+        swapFeeLamports: quote.swapFee, networkFeeLamports: quote.networkFee, netLamports: quote.net,
+        accountClosed: quote.accountClosed, writeOffReason: quote.writeOffReason ?? null }];
+    });
   return {
-    scope: 'entire_database', closedTrades: closed.length, wins, losses, breakevens: closed.length - wins - losses,
+    scope: 'entire_database',
+    terminalSettlements,
+    partialLiquidations: terminalSettlements.filter(row => row.outcome === 'partial_sale').length,
+    writeOffs: terminalSettlements.filter(row => row.outcome === 'write_off').length,
+    modeledSellFills: store.get("SELECT COUNT(*) n FROM paper_orders WHERE side='sell' AND status='filled'").n, closedTrades: closed.length, wins, losses, breakevens: closed.length - wins - losses,
     closedOnlyWinRate: closed.length ? wins / closed.length : null,
     meanWinLamports: average(gains, wins), meanLossLamports: average(lossTotal, losses),
     realizedExpectancyLamportsPerClosedTrade: average(realized, closed.length),
@@ -39,6 +53,6 @@ export function paperPerformance(store, positions, openHealth = []) {
     orderFunnel: store.all('SELECT side,status,error,COUNT(*) count FROM paper_orders GROUP BY side,status,error'),
     signalFunnel: store.all('SELECT outcome,COUNT(*) count FROM paper_signals GROUP BY outcome'),
     agentSignalFunnel: store.all("SELECT name,count FROM paper_counters WHERE name LIKE 'agent:%' ORDER BY name"),
-    note: 'Closed-only statistics exclude unresolved returns. Drawdown is realized-only, not equity drawdown. Zero recovery is a scenario, not a fill. Credits are an application estimate, not an invoice. Averages truncate to whole lamports.',
+    note: 'Closed-position statistics include explicit write-off losses and exclude unresolved returns; write-offs are not sell fills. Drawdown is realized-only, not equity drawdown. ZeroRecoveryScenarioPnl applies an additional zero-recovery scenario only to still-open positions. Burns and account closures are modeled, with no rent credit. Credits are an application estimate, not an invoice. Averages truncate to whole lamports.',
   };
 }

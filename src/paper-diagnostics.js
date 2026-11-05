@@ -1,6 +1,6 @@
 // Fixed-size order evidence only: never raw RPC errors, messages, URLs or payloads.
 const stages = new Set(['requested', 'status_pending', 'status_unconfirmed', 'status_confirmed', 'status_failed',
-  'status_invalid', 'account_pending', 'snapshot_behind', 'snapshot_changed', 'entry_rejected', 'ready_to_fill', 'filled', 'canceled', 'unavailable']);
+  'status_invalid', 'account_pending', 'snapshot_behind', 'snapshot_changed', 'entry_rejected', 'ready_to_fill', 'filled', 'written_off', 'canceled', 'unavailable']);
 const integers = ['signalSlot', 'currentSlot', 'executedSlot', 'snapshotSlot', 'requiredSlot', 'peakSlot', 'windowStartSlot',
   'createdAtMs', 'updatedAtMs', 'elapsedMs', 'statusElapsedMs', 'accountElapsedMs', 'statusAttempts', 'accountAttempts',
   'eventIndex', 'triggerRevision', 'triggerToRequestSlots', 'triggerToFillSlots'];
