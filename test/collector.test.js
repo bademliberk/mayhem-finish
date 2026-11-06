@@ -4,6 +4,7 @@ import { PublicKey } from '@solana/web3.js';
 import { decodeLogs, transactionEvents, decodeCurve, classify, decodeCreationsBeforeTruncation, recoverableCreations } from '../src/chain.js';
 import { Store } from '../src/store.js';
 import { Collector } from '../src/collector.js';
+import { Recovery } from '../src/recovery.js';
 import { report } from '../src/report.js';
 import { PUMP, MAYHEM, MINT_AUTHORITY, addresses } from '../src/config.js';
 import { discoveryParams, discoveryEvents, discoveryRecovery } from '../src/stream.js';
@@ -227,4 +228,42 @@ test('partial recovery rolls back creation and paper handoff if quarantine persi
   assert.equal(s.get('SELECT COUNT(*) n FROM paper_discoveries WHERE handled=0').n, 1);
   assert.equal(s.get('SELECT COUNT(*) n FROM queue').n, 0);
   s.close();
+});
+
+test('bounded discovery drain gives due recovery another turn before a slow queue completes', async () => {
+  const s = new Store(':memory:', cfg); let clock = 100000, scans = 0;
+  const events = [], c = new Collector(s, {}, cfg);
+  try {
+    for (let i = 0; i < 10; i++) s.enqueue(`queued${i}`, i, 100);
+    c.ingest = async signature => { events.push(signature); clock += 2000; };
+    c.scan = async () => { events.push('recovery'); return ++scans === 2; };
+    const recovery = new Recovery({ store: s, collector: c, programs: ['address'], retrySeconds: 0, now: () => clock / 1000 });
+    recovery.begin({ lastHeartbeat: 90, now: 100 }); recovery.reconnected(90, 100);
+    for (let i = 0; i < 2; i++) {
+      await recovery.run();
+      await c.drain(5, { maxDurationMs: 1000, now: () => clock });
+    }
+    assert.deepEqual(events, ['recovery', 'queued0', 'recovery', 'queued1']);
+    assert.equal(recovery.pending, false);
+    assert.equal(s.get('SELECT COUNT(*) n FROM queue').n, 8);
+    assert.equal(s.get('SELECT SUM(attempts) n FROM queue').n, 0);
+    assert.equal(s.get("SELECT COUNT(*) n FROM coverage WHERE kind='backfill' AND ended_at IS NULL").n, 0);
+  } finally { s.close(); }
+});
+
+test('drain item limits and shutdown leave unattempted durable queue rows unchanged', async () => {
+  const s = new Store(':memory:', cfg), c = new Collector(s, {}, cfg); let stopping = false;
+  try {
+    for (let i = 0; i < 10; i++) s.enqueue(`queued${i}`, i, 100);
+    c.ingest = async () => {};
+    await c.drain(5, { maxDurationMs: 1000, now: () => 0 });
+    assert.equal(s.get('SELECT COUNT(*) n FROM queue').n, 5);
+    c.ingest = async () => { stopping = true; throw new Error('retry me'); };
+    await c.drain(5, { shouldStop: () => stopping });
+    assert.equal(s.get('SELECT COUNT(*) n FROM queue').n, 5);
+    assert.equal(s.get('SELECT SUM(attempts) n FROM queue').n, 1);
+    const before = s.all('SELECT * FROM queue ORDER BY slot');
+    await c.drain(5, { shouldStop: () => stopping });
+    assert.deepEqual(s.all('SELECT * FROM queue ORDER BY slot'), before);
+  } finally { s.close(); }
 });

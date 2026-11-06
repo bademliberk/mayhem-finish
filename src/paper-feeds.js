@@ -2,6 +2,7 @@ import WebSocket from 'ws';
 import { PUMP } from './config.js';
 import { FeedHealth, SLOT_PROGRESS_MS } from './feed-health.js';
 import { PaperAgentFeed } from './paper-agent-feed.js';
+import { PaperBaselines } from './paper-baselines.js';
 
 const validSubscription = id => Number.isSafeInteger(id) && id >= 0;
 const failureCategory = reason => reason.replace(/^(standard_|preprocessed_)/, '').replace(/^(slot_|account_)subscribe_failed$/, 'subscribe_failed');
@@ -79,6 +80,7 @@ export class PaperFeeds {
     this.subscriptions = new Map();  // subscription id -> watch
     this.slotRequest = null; this.slotSubscription = null;
     this.sequence = 0; this.tasks = new Set();
+    this.baselines = new PaperBaselines(this);
     this.started = false; this.stopped = false; this.ready = false; this.gapPending = false;
   }
 
@@ -109,8 +111,10 @@ export class PaperFeeds {
       && watch.lastSlot >= 0 && this.agent.covers(watch.curve));
     return Boolean(watch?.preprocessed && watch.covered && this.preprocessed.conn?.curves.includes(watch.curve));
   }
-  notifyCoverage() {
-    for (const watch of this.watches.values()) {
+  notifyCoverage(changedWatch) {
+    if (this.stopped) return;
+    for (const watch of changedWatch ? [changedWatch] : this.watches.values()) {
+      if (this.watches.get(watch.mint) !== watch) continue;
       const included = this.agentMode
         ? this.standard.acked && watch.subscription != null && watch.lastSlot >= 0 && this.agent.covers(watch.curve)
         : watch.preprocessed && this.preprocessed.conn?.curves.includes(watch.curve);
@@ -154,9 +158,18 @@ export class PaperFeeds {
     this.connect(standard); this.reconcile();
   }
   flushHealth() {
-    this.health.standard.update({ pendingAcks: this.ackDeadlines.size });
-    if (this.agentMode) this.agent.flushHealth([...this.watches.values()].filter(w => !this.covers(w.mint)).length);
-    else this.health.preprocessed.update({ pending: [...this.watches.values()].filter(w => w.preprocessed && !this.covers(w.mint)).length });
+    this.health.standard.update({ pendingAcks: this.ackDeadlines.size, ...this.baselines.counts() });
+    if (this.agentMode) {
+      const watches = [...this.watches.values()];
+      const coveredMints = watches.filter(w => this.covers(w.mint)).length;
+      const uncoveredMints = watches.length - coveredMints;
+      // These describe different, overlapping coverage requirements, not 1 RPC per mint.
+      this.agent.flushHealth({ pending: uncoveredMints, desiredMints: watches.length, coveredMints, uncoveredMints,
+        agentAckedMints: watches.filter(w => this.agent.covers(w.curve)).length,
+        accountAckedMints: watches.filter(w => w.subscription != null).length,
+        baselinePendingMints: watches.filter(w => w.subscription != null && w.lastSlot < 0).length,
+        ...this.baselines.counts() });
+    } else this.health.preprocessed.update({ pending: [...this.watches.values()].filter(w => w.preprocessed && !this.covers(w.mint)).length });
   }
   flushUsage() {
     const { standard, preprocessed } = this;
@@ -302,6 +315,7 @@ export class PaperFeeds {
     this.clearTimer(link.heartbeat); this.clearTimer(link.ackTimer); this.clearTimer(link.retry);
     link.heartbeat = null; link.ackTimer = null; link.retry = null;
     link.socket = null; link.acked = false; link.generation++;
+    this.baselines.clear();
     this.agent?.reset();
     this.requests.clear(); this.subscriptions.clear(); this.ackDeadlines.clear();
     this.clearTimer(this.slotWatchdog); this.slotWatchdog = null; this.lastSlot = -1;
@@ -385,7 +399,7 @@ export class PaperFeeds {
     // A live valid notification is a full account state: it satisfies the baseline and ends any request or retry.
     this.cancelBaseline(watch);
     this.safe('onAccount', watch.mint, slot, result.value);
-    if (this.agentMode) this.notifyCoverage();
+    if (this.agentMode) this.notifyCoverage(watch);
   }
   // ---- preprocessed stream: one candidate-only filtered connection, replaced make-before-break ----
   scheduleSync() {
@@ -529,56 +543,12 @@ export class PaperFeeds {
     this.health.preprocessed.update({ phase: pre.conn ? 'subscribed' : 'backoff', nextRetryAt: this.now() + delay });
     pre.retry = this.setTimer(() => { pre.retry = null; this.reconcile(); }, delay);
   }
-  // Aborts the in-flight baseline request and its retry timer and invalidates any late result.
-  cancelBaseline(watch) {
-    watch.baseline?.abort(); watch.baseline = null;
-    if (watch.baselineRetry != null) this.clearTimer(watch.baselineRetry);
-    watch.baselineRetry = null; watch.attempts = 0; watch.seq = (watch.seq ?? 0) + 1;
-  }
+  // Cancel just this member; other watches may share its baseline RPC batch.
+  cancelBaseline(watch) { this.baselines.cancel(watch); }
   // Sanitized counters only (no error text, no URLs).
   baselineUsage(method) {
     try { this.store.usage('paper_baseline', method); } catch { /* store may already be closed */ }
   }
-  // One baseline fetch per account acknowledgment (never per notification). A failed fetch retries this watch alone
-  // with bounded backoff, at most one request or retry timer at a time; it never drops the healthy socket.
-  snapshot(watch, attempts = 0) {
-    this.cancelBaseline(watch);
-    watch.attempts = attempts;
-    const controller = new AbortController(); watch.baseline = controller;
-    const link = this.standard;
-    const generation = link.generation, subscription = watch.subscription, seq = watch.seq;
-    const current = () => !this.stopped && link.generation === generation && watch.seq === seq
-      && this.watches.get(watch.mint) === watch && watch.subscription === subscription;
-    const task = (async () => {
-      try {
-        const result = await this.rpc.accounts([watch.curve], {
-          commitment: this.agentMode ? 'confirmed' : 'processed', deadlineMs: this.now() + 5000, signal: controller.signal,
-        });
-        const slot = result?.context?.slot;
-        if (!Number.isSafeInteger(slot) || slot < 0 || !Array.isArray(result.value)) throw new Error('Malformed snapshot');
-        if (!current() || controller.signal.aborted) return; // stale generation, or cancelled by a newer state
-        if (slot > watch.lastSlot) {
-          watch.lastSlot = slot;
-          this.safe('onAccount', watch.mint, slot, result.value[0] ?? null, 'baseline');
-        }
-        watch.attempts = 0;
-        if (this.agentMode) this.notifyCoverage();
-      } catch {
-        if (!current() || controller.signal.aborted) return;
-        this.baselineUsage('failed');
-        const retries = watch.attempts;
-        const delay = Math.min(RETRY_MAX_MS, RETRY_MIN_MS * 2 ** retries);
-        const timer = this.setTimer(() => {
-          if (watch.baselineRetry !== timer) return; // superseded or cancelled
-          watch.baselineRetry = null;
-          if (current()) this.snapshot(watch, retries + 1);
-        }, delay);
-        watch.baselineRetry = timer;
-      } finally {
-        if (watch.baseline === controller) watch.baseline = null;
-      }
-    })();
-    this.tasks.add(task);
-    task.finally(() => this.tasks.delete(task));
-  }
+  // Baselines are requested on subscription/gap only, never for ordinary freshness polling.
+  snapshot(watch) { this.baselines.request(watch); }
 }

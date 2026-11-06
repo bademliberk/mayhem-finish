@@ -32,7 +32,7 @@ function setup({ accounts, watches = [['m1', 'curve1', false]] } = {}) {
   const feeds = new PaperFeeds(store, {
     // Deliberately no API key: legacy constructor derivation would throw.
     wsUrl: 'wss://confirmed.example.test/',
-    accounts: async (...args) => { calls.push(args); return accounts ? accounts(...args) : { context: { slot: 50 }, value: [{}] }; },
+    accounts: async (...args) => { calls.push(args); return accounts ? accounts(...args) : { context: { slot: 50 }, value: args[0].map(() => ({})) }; },
   }, {
     agentMode: true,
     onAccount: (...args) => events.push(['account', ...args]),
@@ -105,6 +105,7 @@ test('coverage requires fresh account baseline plus standard and confirmed ackno
   t.feeds.start(); const a = t.socket('standard'), b = t.socket('agent'); a.open(); b.open();
   b.ack('transactionSubscribe', 4); a.ack('accountSubscribe', 20);
   assert.equal(t.feeds.covers('m1'), false);
+  await settle(); // Account acknowledgments coalesce before the baseline batch dispatches.
   resolve({ context: { slot: 50 }, value: [{}] }); await settle();
   assert.equal(t.feeds.covers('m1'), false);
   a.ack('slotSubscribe', 9);
@@ -155,6 +156,7 @@ test('active confirmed gap cancels through onGap and rebaselines before coverage
   const [a, b] = await t.bringUp(); b.terminate();
   assert.equal(t.feeds.covers('m1'), false); assert.equal(t.feeds.isReady(), false);
   assert.deepEqual(t.of('gap'), [['gap', 'agent_disconnected']]);
+  await settle();
   assert.equal(a.readyState, 1); assert.equal(t.calls.length, 2);
   t.advance(1000); const c = t.socket('agent'); c.open(); c.ack('transactionSubscribe', 5);
   assert.equal(t.feeds.covers('m1'), false);
@@ -229,10 +231,13 @@ test('obsolete pending replacements, timers, resync and stop cannot deliver or r
   t.feeds.add('m2', 'curve2'); t.advance(100); const b = t.socket('agent'); b.open();
   const staleAck = t.timers.get(t.feeds.agent.next.ackTimer).fn;
   const staleBeat = t.timers.get(t.feeds.agent.next.heartbeat).fn;
-  t.feeds.add('m3', 'curve3'); t.advance(100); const c = t.socket('agent'); c.open();
-  b.ack('transactionSubscribe', 5); staleAck(); staleBeat();
-  assert.equal(b.readyState, 3); assert.equal(c.readyState, 1);
-  c.ack('transactionSubscribe', 6);
+  t.feeds.add('m3', 'curve3'); t.advance(100);
+  assert.equal(t.socket('agent'), b, 'in-flight subscription is not starved by membership changes');
+  b.ack('transactionSubscribe', 5);
+  const c = t.socket('agent'); c.open();
+  assert.equal(b.readyState, 1); assert.equal(c.readyState, 1);
+  c.ack('transactionSubscribe', 6); staleAck(); staleBeat();
+  assert.equal(b.readyState, 3);
   assert.deepEqual(c.request('transactionSubscribe').params[0].accountInclude, ['curve1', 'curve2', 'curve3']);
   t.feeds.resync(); assert.equal(c.readyState, 3); assert.equal(t.feeds.covers('m1'), false);
   const count = t.sockets.length;
@@ -277,9 +282,9 @@ test('account baseline failure never grants coverage; a live confirmed state can
   const t = setup({ accounts: async () => { throw new Error('offline'); } });
   const [a] = await t.bringUp();
   assert.equal(t.feeds.covers('m1'), false); assert.equal(t.of('coverage').length, 0);
-  const watch = t.feeds.watches.get('m1'); assert.ok(watch.baselineRetry != null);
+  const watch = t.feeds.watches.get('m1'); assert.ok(t.feeds.baselines.pending.has(watch));
   a.text({ method: 'accountNotification', params: { subscription: 20, result: { context: { slot: 60 }, value: {} } } });
-  assert.equal(watch.baselineRetry, null); assert.equal(t.feeds.covers('m1'), true);
+  assert.equal(t.feeds.baselines.pending.has(watch), false); assert.equal(t.feeds.covers('m1'), true);
   assert.deepEqual(t.of('coverage'), [['coverage', 'm1']]);
   await t.feeds.stop();
 });
@@ -295,4 +300,65 @@ test('confirmed health and usage stay separate from preprocessed and byte billin
   t.feeds.add('m2', 'curve2', false); t.feeds.flushHealth();
   assert.equal(readFeedHealth(t.store, t.now()).agent.state, 'degraded');
   await t.feeds.stop(); assert.equal(readFeedHealth(t.store, t.now()).agent.state, 'stopped');
+});
+
+test('continuous pre-ack rotation coalesces without starving first or replacement coverage', async () => {
+  const t = setup(); t.feeds.start();
+  const standard = t.socket('standard'), first = t.socket('agent');
+  standard.open(); standard.ack('slotSubscribe', 9); standard.ack('accountSubscribe', 20);
+  first.open();
+  for (let i = 0; i < 100; i++) {
+    if (i) t.feeds.remove(`rotating${i - 1}`);
+    t.feeds.add(`rotating${i}`, `curve${i + 2}`, false); t.advance(100);
+    standard.ack('accountSubscribe', 21 + i, i + 1);
+    assert.equal(t.socket('agent'), first);
+  }
+  await settle();
+  assert.equal(t.sockets.filter(s => s.kind === 'agent').length, 1);
+  first.ack('transactionSubscribe', 4);
+  const replacement = t.socket('agent'); replacement.open();
+  assert.notEqual(replacement, first);
+  assert.equal(t.feeds.covers('m1'), true);
+  assert.equal(t.feeds.covers('rotating99'), false);
+  assert.deepEqual(replacement.request('transactionSubscribe').params[0].accountInclude, ['curve1', 'curve101']);
+  for (let i = 100; i < 150; i++) {
+    t.feeds.remove(`rotating${i - 1}`); t.feeds.add(`rotating${i}`, `curve${i + 2}`, false);
+    t.advance(100); standard.ack('accountSubscribe', 21 + i, i + 1);
+    assert.equal(t.socket('agent'), replacement);
+  }
+  await settle();
+  replacement.ack('transactionSubscribe', 5);
+  assert.equal(t.feeds.covers('rotating149'), false);
+  const latest = t.socket('agent'); latest.open(); latest.ack('transactionSubscribe', 6);
+  assert.deepEqual(latest.request('transactionSubscribe').params[0].accountInclude, ['curve1', 'curve151']);
+  assert.equal(t.feeds.covers('rotating149'), true);
+  assert.equal(t.feeds.covers('rotating99'), false);
+  assert.equal(t.sockets.filter(s => s.kind === 'agent').length, 3);
+  assert.equal(t.sockets.filter(s => s.kind === 'agent' && s.readyState !== 3).length, 1);
+  await t.feeds.stop(); assert.equal(t.timers.size, 0);
+});
+
+test('1000 mints share one agent filter and ten baseline batches; health separates missing coverage', async () => {
+  const watches = Array.from({ length: 1000 }, (_, i) => [`m${i}`, `curve${i}`, false]);
+  const t = setup({ watches }); t.feeds.start();
+  const standard = t.socket('standard'), agent = t.socket('agent');
+  standard.open(); standard.ack('slotSubscribe', 9); agent.open(); agent.ack('transactionSubscribe', 4);
+  for (let i = 0; i < watches.length; i++) standard.ack('accountSubscribe', 20 + i, i);
+  t.feeds.flushHealth();
+  let health = JSON.parse(t.rows.get('feed_health_agent'));
+  assert.equal(health.pending, 1000); assert.equal(health.desiredMints, 1000);
+  assert.equal(health.agentAckedMints, 1000); assert.equal(health.accountAckedMints, 1000);
+  assert.equal(health.baselinePendingMints, 1000); assert.equal(health.coveredMints, 0);
+  assert.equal(health.baselineQueued, 1000);
+  assert.equal(agent.sent.filter(r => r.method === 'transactionSubscribe').length, 1);
+  await settle(); t.feeds.flushHealth();
+  health = JSON.parse(t.rows.get('feed_health_agent'));
+  assert.equal(t.calls.length, 10); assert.ok(t.calls.every(([addresses]) => addresses.length === 100));
+  assert.equal(t.of('coverage').length, 1000);
+  assert.equal(health.pending, 0); assert.equal(health.uncoveredMints, 0); assert.equal(health.coveredMints, 1000);
+  assert.equal(health.baselineQueued, 0); assert.equal(health.baselineInFlight, 0);
+  standard.terminate(); t.feeds.flushHealth();
+  health = JSON.parse(t.rows.get('feed_health_agent'));
+  assert.equal(health.pending, 1000); assert.equal(health.agentAckedMints, 0); assert.equal(health.accountAckedMints, 0);
+  await t.feeds.stop(); assert.equal(t.timers.size, 0);
 });

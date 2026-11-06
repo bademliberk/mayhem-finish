@@ -46,7 +46,7 @@ export class PaperAgentFeed {
     try { this.callbacks[name](...args); }
     catch { this.health.failure('callback_failed'); }
   }
-  covers(curve) { return Boolean(this.conn?.curves.includes(curve)); }
+  covers(curve) { return this.conn?.curveSet.has(curve) ?? false; }
   setCurves(curves) {
     if (this.stopped) return;
     this.curves = [...new Set(curves)].sort();
@@ -56,12 +56,11 @@ export class PaperAgentFeed {
     if (this.stopped) return;
     const key = this.curves.join(',');
     if (!key) { this.reset(); return; }
-    if (this.conn?.key === key) {
-      const stale = this.next; this.next = null; this.close(stale);
-      this.safe('onCoverage'); return;
-    }
-    if (this.next?.key === key || this.retry != null) return;
-    const stale = this.next; this.next = null; this.close(stale);
+    // An immutable in-flight filter must get a chance to acknowledge. Continually
+    // replacing it on discovery/rotation can otherwise prevent any coverage forever.
+    // Its acknowledgment reconciles once more against the latest desired curves.
+    if (this.next || this.retry != null) return;
+    if (this.conn?.key === key) { this.safe('onCoverage'); return; }
     this.open([...this.curves], key);
   }
   open(curves, key) {
@@ -70,7 +69,7 @@ export class PaperAgentFeed {
     let socket;
     try { socket = this.socketFactory(this.rpc.wsUrl, 'agent'); }
     catch (error) { this.failed(null, 'connect_failed', error); return; }
-    const conn = { socket, curves, key, request: null, subscription: null, heartbeat: null, ackTimer: null, alive: true };
+    const conn = { socket, curves, curveSet: new Set(curves), key, request: null, subscription: null, heartbeat: null, ackTimer: null, alive: true };
     this.next = conn;
     const live = () => !this.stopped && (this.conn === conn || this.next === conn);
     socket.on('open', () => {
@@ -169,7 +168,7 @@ export class PaperAgentFeed {
     for (const conn of old) this.close(conn);
     this.health.update({ phase: this.stopped ? 'stopped' : 'idle', nextRetryAt: null });
   }
-  flushHealth(pending) { this.health.update({ pending }); }
+  flushHealth(coverage) { this.health.update(coverage); }
   flushUsage() {
     if (this.bytes) this.store.usage('websocket', 'paper_agent_received_bytes', this.bytes);
     if (this.transactions) this.store.usage('paper_agent', 'transactions', this.transactions);

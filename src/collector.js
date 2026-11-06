@@ -56,9 +56,13 @@ export class Collector {
     }
     return false;
   }
-  async drain(limit = 50) {
+  // Cooperative slices let the caller revisit due recovery between slow ingests.
+  // The time budget is checked between rows; it does not interrupt an active RPC.
+  async drain(limit = 50, { maxDurationMs = Infinity, shouldStop = () => false, now = Date.now } = {}) {
+    const started = now();
     const rows = this.store.all('SELECT * FROM queue WHERE retry_at<=? ORDER BY slot LIMIT ?', nowSeconds(), limit);
     for (const row of rows) {
+      if (shouldStop() || now() - started >= maxDurationMs) break;
       try {
         await this.ingest(row.signature);
         // Already processed rows may have survived a crash before queue deletion.

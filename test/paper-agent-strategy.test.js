@@ -466,7 +466,10 @@ test('v2 compatibility: subscription baseline authorizes one attempt without pol
       agentMode: true, now: () => 100000, socketFactory: () => { throw new Error('No sockets allowed'); },
       onAccount: (...args) => { source = args[3]; s.engine.onAccount(...args); },
     });
-    feeds.add(mint, watch(s).curve_address); feeds.snapshot(feeds.watches.get(mint));
+    feeds.add(mint, watch(s).curve_address);
+    const subscribed = feeds.watches.get(mint); subscribed.subscription = 1;
+    feeds.snapshot(subscribed);
+    await new Promise(resolve => setImmediate(resolve));
     await Promise.all([...feeds.tasks]); assert.equal(source, 'baseline');
     await s.engine.tick(); assert.equal(calls, 1);
     for (const now of [100100, 101000, 110000, 1000000]) {

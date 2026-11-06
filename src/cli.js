@@ -105,7 +105,9 @@ async function start(rpc) {
       const tick = nowSeconds();
       store.run("INSERT INTO metadata VALUES('discovery_started_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", String(tick));
       await recovery.run(tick);
-      if (!stopping) await collector.drain();
+      if (!stopping) await collector.drain(cfg.paperMode ? 5 : 50, {
+        maxDurationMs: cfg.paperMode ? 1000 : Infinity, shouldStop: () => stopping,
+      });
       if (!stopping) store.run("INSERT INTO metadata VALUES('discovery_completed_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", String(nowSeconds()));
       if (!stopping) await sleep(1000);
     }

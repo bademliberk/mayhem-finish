@@ -31,7 +31,7 @@ function setup({ accounts, watches = [['m1', CURVE]] } = {}) {
     wsUrl: STD,
     accounts: async (...args) => {
       rpcCalls.push(args);
-      return accounts ? accounts(...args) : { context: { slot: 50 }, value: [{ lamports: 1 }] };
+      return accounts ? accounts(...args) : { context: { slot: 50 }, value: args[0].map(() => ({ lamports: 1 })) };
     },
   };
   const feeds = new PaperFeeds(store, rpc, {
@@ -418,7 +418,10 @@ test('snapshot failure retries that watch only, without gap, reconnect or leakin
   } finally { console.error = original; }
 });
 
-const retryTimer = (t, mint = 'm1') => t.timers.get(t.feeds.watches.get(mint).baselineRetry);
+const retryTimer = (t, mint = 'm1') => {
+  const member = t.feeds.baselines.pending.get(t.feeds.watches.get(mint));
+  return member && !member.batch ? t.timers.get(t.feeds.baselines.timer) : undefined;
+};
 
 test('baseline retry uses bounded per-watch backoff and recovers on success', async () => {
   let calls = 0;
@@ -431,12 +434,12 @@ test('baseline retry uses bounded per-watch backoff and recovers on success', as
   for (let i = 0; i < 6; i++) {
     assert.equal(t.rpcCalls.length, i + 1);
     assert.ok(retryTimer(t)); // exactly one retry timer, no request in flight
-    assert.equal(watch.baseline, null);
+    assert.equal(t.feeds.baselines.active, null);
     t.advanceWithSlots(15000); await settle();
   }
   assert.equal(t.rpcCalls.length, 7);
   assert.deepEqual(t.of('account'), [['account', 'm1', 77, { lamports: 7 }]]);
-  assert.equal(watch.baselineRetry, null); assert.equal(watch.baseline, null); assert.equal(watch.attempts, 0);
+  assert.equal(t.feeds.baselines.pending.has(watch), false); assert.equal(t.feeds.baselines.active, null); assert.equal(watch.attempts, 0);
   assert.deepEqual(t.of('gap'), []); assert.equal(t.std().length, 1); assert.equal(a.readyState, 1);
   await t.feeds.stop();
 });
@@ -450,7 +453,7 @@ test('negative baseline slots are rejected and retried as malformed responses', 
     assert.deepEqual(t.usage.filter(u => u[0] === 'paper_baseline'), [['paper_baseline', 'failed', 1]]);
     t.advance(1000); await settle();
     assert.equal(calls, 2); assert.deepEqual(t.of('account'), [['account', 'm1', 0, { lamports: 7 }]]);
-    assert.equal(t.feeds.watches.get('m1').baselineRetry, null);
+    assert.equal(t.feeds.baselines.pending.has(t.feeds.watches.get('m1')), false);
   } finally { await t.feeds.stop(); }
 });
 
@@ -480,7 +483,8 @@ test('baseline failures are isolated per watch', async () => {
     },
   });
   const [a] = await t.bringUp({ account: false });
-  a.ack('accountSubscribe', 21, 0); a.ack('accountSubscribe', 22, 1); await settle();
+  a.ack('accountSubscribe', 21, 0); await settle();
+  a.ack('accountSubscribe', 22, 1); await settle();
   assert.ok(retryTimer(t, 'm1')); assert.equal(retryTimer(t, 'm2'), undefined);
   assert.deepEqual(t.of('account'), [['account', 'm2', 12, { ok: true }]]);
   assert.equal(a.readyState, 1); assert.deepEqual(t.of('gap'), []);
@@ -493,7 +497,7 @@ test('a live valid notification satisfies the baseline and cancels the retry tim
   const watch = t.feeds.watches.get('m1');
   assert.ok(retryTimer(t));
   a.text({ method: 'accountNotification', params: { subscription: 21, result: { context: { slot: 90 }, value: { live: 1 } } } });
-  assert.equal(watch.baselineRetry, null); assert.equal(watch.attempts, 0);
+  assert.equal(t.feeds.baselines.pending.has(watch), false); assert.equal(watch.attempts, 0);
   t.advanceWithSlots(60000); await settle();
   assert.equal(t.rpcCalls.length, 1); // never retried
   assert.deepEqual(t.of('account'), [['account', 'm1', 90, { live: 1 }]]);
@@ -510,7 +514,7 @@ test('a live valid notification aborts the in-flight baseline request and discar
   assert.equal(signal.aborted, true);
   release({ context: { slot: 500 }, value: [{ late: true }] }); await settle();
   assert.deepEqual(t.of('account'), [['account', 'm1', 40, { live: 1 }]]);
-  assert.equal(t.feeds.watches.get('m1').baselineRetry, null);
+  assert.equal(t.feeds.baselines.pending.has(t.feeds.watches.get('m1')), false);
   assert.equal(t.feeds.tasks.size, 0);
   await t.feeds.stop();
 });
@@ -519,7 +523,7 @@ test('baseline retry timer is cancelled on remove, standard drop, resync and sto
   // remove
   let t = setup({ accounts: async () => { throw new Error('rpc down'); } });
   await t.bringUp();
-  let id = t.feeds.watches.get('m1').baselineRetry;
+  let id = t.feeds.baselines.timer;
   assert.ok(t.timers.has(id));
   t.feeds.remove('m1');
   assert.equal(t.timers.has(id), false);
@@ -530,17 +534,17 @@ test('baseline retry timer is cancelled on remove, standard drop, resync and sto
   // standard socket drop: retry cancelled, fresh baseline only after resubscription
   t = setup({ accounts: async () => { throw new Error('rpc down'); } });
   const [a] = await t.bringUp();
-  id = t.feeds.watches.get('m1').baselineRetry;
+  id = t.feeds.baselines.timer;
   a.terminate();
   assert.equal(t.timers.has(id), false);
-  assert.equal(t.feeds.watches.get('m1').baselineRetry, null);
+  assert.equal(t.feeds.baselines.pending.has(t.feeds.watches.get('m1')), false);
   assert.equal(t.rpcCalls.length, 1);
   await t.feeds.stop();
 
   // resync
   t = setup({ accounts: async () => { throw new Error('rpc down'); } });
   await t.bringUp();
-  id = t.feeds.watches.get('m1').baselineRetry;
+  id = t.feeds.baselines.timer;
   t.feeds.resync();
   assert.equal(t.timers.has(id), false);
   assert.equal(t.rpcCalls.length, 1);
@@ -550,7 +554,7 @@ test('baseline retry timer is cancelled on remove, standard drop, resync and sto
   t = setup({ accounts: async () => { throw new Error('rpc down'); } });
   const watch = t.feeds.watches.get('m1');
   await t.bringUp();
-  id = watch.baselineRetry;
+  id = t.feeds.baselines.timer;
   assert.ok(t.timers.has(id));
   await t.feeds.stop();
   assert.equal(t.timers.has(id), false);
@@ -568,7 +572,7 @@ test('a stale retry timer after a reconnect never fires an old-generation reques
   assert.equal(t.rpcCalls.length, 2);
   stale(); await settle();
   assert.equal(t.rpcCalls.length, 2); // generation/seq checks reject it
-  assert.ok(watch.baselineRetry); // only the new generation's single timer remains
+  assert.ok(t.feeds.baselines.pending.has(watch)); // only the new generation's requirement remains
   await t.feeds.stop();
 });
 
@@ -579,7 +583,7 @@ test('at most one baseline request or retry timer per watch under repeated snaps
   const before = t.timers.size;
   for (let i = 0; i < 5; i++) { t.feeds.snapshot(watch); await settle(); }
   assert.ok(retryTimer(t));
-  assert.equal(watch.baseline, null);
+  assert.equal(t.feeds.baselines.active, null);
   assert.equal(t.timers.size, before); // each snapshot replaced the previous retry timer
   assert.equal(t.rpcCalls.length, 6);
   await t.feeds.stop();
@@ -1191,4 +1195,35 @@ test('paper diagnostics persist only safe bounded fields separately from billed 
   assert.ok(!JSON.stringify([...rows]).includes(KEY)); assert.equal(rows.size, 2);
   t.feeds.flushUsage(); assert.deepEqual(t.usage, []);
   await t.feeds.stop();
+});
+
+test('1000 account acknowledgments keep one baseline job in the real RPC queue and yield to recovery', { timeout: 5000 }, async context => {
+  const usage = [], delivered = []; let releaseBlocker;
+  context.mock.method(globalThis, 'fetch', async (_url, options) => {
+    const body = JSON.parse(options.body), addresses = body.params[0];
+    delivered.push(addresses);
+    if (addresses[0] === 'blocker') await new Promise(resolve => { releaseBlocker = resolve; });
+    return { ok: true, json: async () => ({ result: { context: { slot: 50 }, value: addresses.map(() => ({})) } }) };
+  });
+  const rpc = new Rpc({ key: 'test', rpcInterval: 0 }, { usage: (...args) => usage.push(args) });
+  const blocker = rpc.accounts(['blocker']);
+  const t = setup({ watches: Array.from({ length: 1000 }, (_, i) => [`m${i}`, `curve${i}`]),
+    accounts: (...args) => rpc.accounts(...args) });
+  context.after(async () => { rpc.stop(); releaseBlocker?.(); await t.feeds.stop(); });
+  const [a] = await t.bringUp({ account: false });
+  for (let i = 0; i < 1000; i++) a.ack('accountSubscribe', 20 + i, i);
+  await settle();
+  assert.equal(t.rpcCalls.length, 1); assert.equal(rpc.queue.length, 1);
+  assert.deepEqual(t.feeds.baselines.counts(), { baselineQueued: 900, baselineInFlight: 100 });
+  const recovery = rpc.accounts(['recovery']); // Existing non-baseline work shares the same FIFO worker.
+  let finish; const complete = new Promise(resolve => { finish = resolve; }); let received = 0;
+  t.feeds.callbacks.onAccount = () => { if (++received === 1000) finish(); };
+  releaseBlocker(); await blocker; await recovery; await complete; await settle();
+  assert.equal(t.rpcCalls.length, 10);
+  assert.ok(t.rpcCalls.every(([addresses]) => addresses.length === 100));
+  assert.deepEqual(delivered[2], ['recovery'], 'recovery runs before the second baseline batch');
+  assert.equal(usage.filter(([source, method]) => source === 'rpc_queue' && method === 'overflow').length, 0);
+  assert.equal(t.feeds.tasks.size, 0); assert.equal(t.feeds.baselines.pending.size, 0);
+  t.advanceWithSlots(120000); await settle(); assert.equal(t.rpcCalls.length, 10, 'no fallback polling');
+  await t.feeds.stop(); assert.equal(t.timers.size, 0);
 });

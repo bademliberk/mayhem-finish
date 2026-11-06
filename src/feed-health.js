@@ -11,7 +11,9 @@ const networkCodes = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFO
   'ENETUNREACH', 'EPIPE', 'ECONNABORTED', 'ERR_TLS_CERT_ALTNAME_INVALID', 'CERT_HAS_EXPIRED',
   'DEPTH_ZERO_SELF_SIGNED_CERT', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE']);
 const numericFields = ['updatedAt', 'startedAt', 'attempts', 'failureStreak', 'lastAckAt', 'lastPayloadAt',
-  'lastProgressAt', 'lastSlot', 'nextRetryAt', 'pending', 'cutoff', 'stoppedAt', 'pendingAcks', 'pendingProgress'];
+  'lastProgressAt', 'lastSlot', 'nextRetryAt', 'pending', 'cutoff', 'stoppedAt', 'pendingAcks', 'pendingProgress',
+  'desiredMints', 'agentAckedMints', 'accountAckedMints', 'baselinePendingMints', 'coveredMints', 'uncoveredMints',
+  'baselineQueued', 'baselineInFlight'];
 const nonnegative = value => Number.isSafeInteger(value) && value >= 0;
 
 export function safeFailure(category, error = {}, at = Date.now()) {

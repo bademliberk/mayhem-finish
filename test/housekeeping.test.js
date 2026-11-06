@@ -112,3 +112,24 @@ test('old databases, malformed saved health and unknown components are not prese
   assert.throws(() => new FeedHealth(store, 'SECRET'), /Unknown feed health component/);
   store.close();
 });
+
+test('coverage counters remain bounded numeric metadata and legacy pending remains readable', () => {
+  const store = new Store(':memory:', {});
+  try {
+    new FeedHealth(store, 'process', () => 100000).update({ phase: 'running' });
+    const agent = new FeedHealth(store, 'agent', () => 100000);
+    agent.update({ phase: 'subscribed', pending: 1000 });
+    assert.equal(readFeedHealth(store, 100000).agent.desiredMints, undefined);
+    agent.update({ desiredMints: 1000, agentAckedMints: 1000, accountAckedMints: 1000,
+      baselinePendingMints: 1000, coveredMints: 0, uncoveredMints: 1000, baselineQueued: 900, baselineInFlight: 100 });
+    let value = readFeedHealth(store, 100000).agent;
+    assert.equal(value.pending, value.uncoveredMints); assert.equal(value.state, 'degraded');
+    assert.equal(value.agentAckedMints, 1000); assert.equal(value.baselineInFlight, 100);
+    agent.update({ desiredMints: 'SECRET', agentAckedMints: -1, baselineQueued: Infinity, coveredMints: 1.5,
+      baselinePendingMints: { secret: 'SECRET' } });
+    value = readFeedHealth(store, 100000).agent;
+    assert.equal(value.desiredMints, 1000); assert.equal(value.agentAckedMints, 1000);
+    assert.equal(value.baselineQueued, 900); assert.equal(value.coveredMints, 0);
+    assert.ok(!JSON.stringify(value).includes('SECRET'));
+  } finally { store.close(); }
+});
