@@ -1,5 +1,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 
+const QUOTA_MESSAGE = /credits?|quota|payment|billing|max usage/i;
+
 export class DownloadError extends Error {
   constructor(code, retryable = false, retryAfter = 0) {
     super(code);
@@ -88,7 +90,9 @@ export class DownloadRpc {
             let detail;
             try { detail = await response.json(); } catch { /* A plain rate limit still backs off. */ }
             const message = detail?.error?.message ?? detail?.message ?? (typeof detail?.error === 'string' ? detail.error : '');
-            if (/credits?|quota|payment|billing/i.test(String(message))) throw new DownloadError('PROVIDER_QUOTA');
+            // Helius reports exhausted credits as HTTP 429 "max usage reached". Code -32429 alone is not
+            // quota: Helius also uses it for plain rate limits, which must back off on the same key.
+            if (QUOTA_MESSAGE.test(String(message))) throw new DownloadError('PROVIDER_QUOTA');
           }
           try { Promise.resolve(response.body?.cancel()).catch(() => {}); } catch { /* Best effort. */ }
           if ([401, 403].includes(response.status)) throw new DownloadError('AUTH_OR_ACCESS_DENIED');
@@ -100,9 +104,9 @@ export class DownloadRpc {
           const code = Number(body.error.code);
           // Inspect provider text only for classification; never persist or print it.
           const message = String(body.error.message ?? '');
-          if (/credit|quota|payment|billing/i.test(message)) throw new DownloadError('PROVIDER_QUOTA');
+          if (QUOTA_MESSAGE.test(message)) throw new DownloadError('PROVIDER_QUOTA');
           if (/unauthorized|forbidden|api.?key/i.test(message)) throw new DownloadError('AUTH_OR_ACCESS_DENIED');
-          if (code === 429 || /rate.limit|too many requests/i.test(message)) throw new DownloadError('RATE_LIMIT', true);
+          if (code === 429 || code === -32429 || /rate.limit|too many requests/i.test(message)) throw new DownloadError('RATE_LIMIT', true);
           throw new DownloadError(`RPC_${Number.isFinite(code) ? code : 'ERROR'}`, [-32005, -32603].includes(code));
         }
         if (!Object.hasOwn(body, 'result')) throw new DownloadError('INVALID_RPC_RESPONSE', true);

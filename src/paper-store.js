@@ -8,7 +8,9 @@ import { safeOrderDiagnostics, readOrderDiagnostics } from './paper-diagnostics.
 
 export function paperConfig(env = process.env, profile = null) {
   const number = (name, fallback, min, max, integer = true) => {
-    const value = Number(env[name] ?? fallback);
+    // Blank values (e.g. `PAPER_SWAP_FEE_BPS=`) mean unset, never Number('') === 0.
+    const raw = env[name];
+    const value = Number(raw == null || String(raw).trim() === '' ? fallback : raw);
     if (!Number.isFinite(value) || value < min || value > max || (integer && !Number.isSafeInteger(value))) throw new Error(`Invalid ${name}`);
     return value;
   };

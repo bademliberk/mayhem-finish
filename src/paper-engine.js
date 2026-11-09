@@ -168,15 +168,34 @@ export class PaperEngine {
     this.coverageSlots.clear(); this.lookups.clear();
     this.paper.count(`gap:${reason}`);
     for (const order of this.paper.pending()) this.cancel(order.id, this.now(), 'feed_gap');
+    if (this.terminalExits) {
+      // A gap is missing data, not evidence of zero recovery: hold write-offs until feeds recover (see onReady).
+      for (const watch of this.paper.active()) {
+        if (watch.reason !== 'graduated_no_amm_exit' && this.paper.position(watch.mint)) this.startupExitGrace.set(watch.mint, Infinity);
+      }
+    }
   }
-  onReady() { if (!this.stopped) this.ready = true; }
+  onReady() {
+    if (this.stopped) return;
+    this.ready = true;
+    // After a gap, the reconnection baseline gets one order TTL to arrive, as on restart.
+    for (const [mint, until] of this.startupExitGrace) {
+      if (until === Infinity) this.startupExitGrace.set(mint, this.now() + this.cfg.orderTtlMs);
+    }
+  }
   onSlot(slot) {
     if (this.stopped || !Number.isSafeInteger(slot) || slot < 0) return;
-    if (this.slot && slot > this.slot + 8) {
-      this.gap('slot_progress_gap'); this.feeds.resync?.(); return;
-    }
     if (slot < this.slot) return;
+    const jumped = this.slot && slot > this.slot + 8;
     this.slot = slot; this.slotAt = this.now();
+    if (jumped) {
+      // Skipped leader slots or dropped slot notifications are not lost account or transaction data:
+      // sockets that actually fail report their own gaps. Restart only local signal windows so no
+      // entry spans the discontinuity, without tearing down feeds or canceling orders.
+      this.paper.count('slot_discontinuity');
+      // Only mints that already had coverage: a jump must not grant coverage the feeds never acknowledged.
+      for (const mint of [...this.coverageSlots.keys()]) this.coverage(mint);
+    }
     for (const order of this.paper.pending()) this.expire(order);
     if (this.agentMode) this.checkAgentExits();
     if (slot) {
@@ -225,7 +244,9 @@ export class PaperEngine {
       if (!state.complete) row.history.push({ state, slot, at: row.at });
       // Several writes in one slot have no transaction index; retain their observed peak only.
       if (row.history.length > 1000) { this.paper.count('history_overflow'); row.history = []; row.since = slot; }
-      this.states.set(mint, row); this.startupExitGrace.delete(mint);
+      this.states.set(mint, row);
+      // A gap hold (Infinity) lasts until feeds are ready again; data alone does not end it.
+      if (this.startupExitGrace.get(mint) !== Infinity) this.startupExitGrace.delete(mint);
       this.store.run('UPDATE paper_watches SET last_slot=?,last_cap=?,account_error=NULL,last_observed_ms=? WHERE mint=?', slot, state.complete ? null : cap(state), this.now(), mint);
       const fingerprint = account.data[0];
       const changed = fingerprint !== watch.fingerprint;
@@ -282,8 +303,10 @@ export class PaperEngine {
         const pending = this.paper.pending().find(order => order.mint === watch.mint);
         // Cache age alone must not abort a still-valid confirmation.
         if (pending && !this.expire(pending)) continue;
-        const unavailable = watch.account_error || (!row ? 'missing_observation' :
-          this.now() < row.at || this.now() - row.at > this.cfg.maxStateAgeMs ? 'stale_observation' : null);
+        // A quiet but covered curve gets its one event-driven attempt at the unchanged reserves before any write-off.
+        const usable = row && (this.observationFresh(row) ||
+          (this.quietCovered(watch.mint, row) && this.exitAttemptAvailable(watch.mint, position, row)));
+        const unavailable = watch.account_error || (!row ? 'missing_observation' : !usable ? 'stale_observation' : null);
         if (unavailable) {
           if (this.now() < (this.startupExitGrace.get(watch.mint) ?? 0)) continue;
           this.writeOff(watch.mint, reason, unavailable, { observedSlot: row?.slot ?? watch.last_slot,
@@ -293,6 +316,15 @@ export class PaperEngine {
       }
       if (row && position) this.requestExit(watch.mint, row.state, this.exitIntent(watch.mint, row.state) ?? 'profit', null);
     }
+  }
+  observationFresh(row) {
+    return Boolean(row) && this.now() >= row.at && this.now() - row.at <= this.cfg.maxStateAgeMs;
+  }
+  // v3 only: accountSubscribe notifies on change, so silence on a live, covered subscription means unchanged
+  // reserves, not unknown ones. Gaps and invalid accounts clear cached rows, so a cached row implies neither since.
+  quietCovered(mint, row) {
+    return this.terminalExits && this.ready && Boolean(row) && this.now() >= row.at && this.feeds.covers(mint) &&
+      this.slotAt > 0 && this.now() >= this.slotAt && this.now() - this.slotAt <= this.cfg.maxStateAgeMs;
   }
   exitAttemptAvailable(mint, position, observation) {
     if (!position || !Number.isSafeInteger(observation?.exitRevision)) return false;
@@ -330,8 +362,10 @@ export class PaperEngine {
   requestExit(mint, state, reason, signal, observation = this.states.get(mint)) {
     const position = this.paper.position(mint), watch = this.paper.watch(mint);
     if (this.stopped || !position || watch.reason === 'graduated_no_amm_exit' || state.complete ||
-        watch.account_error || !observation || this.now() < observation.at ||
-        this.now() - observation.at > this.cfg.maxStateAgeMs || (!signal && state !== observation.state)) return;
+        watch.account_error || !observation ||
+        !(this.observationFresh(observation) ||
+          (this.quietCovered(mint, observation) && this.exitIntent(mint, observation.state))) ||
+        (!signal && state !== observation.state)) return;
     // Predictions may request profit, but only observed (or freshly confirmed) reserves latch risk.
     const intent = this.exitIntent(mint, observation.state);
     if (intent) {
@@ -686,7 +720,7 @@ export class PaperEngine {
     // Cancellation happens before feed teardown; wait for all continuations, including failed teardown.
     this.stopPromise = Promise.allSettled([
       ...[...this.reconciliations.values()].map(active => active.promise),
-      Promise.resolve().then(() => this.feeds.stop()), Promise.resolve().then(() => this.lookups.stop()),
+      Promise.resolve().then(() => this.feeds?.stop()), Promise.resolve().then(() => this.lookups.stop()),
     ]).then(results => {
       const failed = results.find(result => result.status === 'rejected');
       if (failed) throw failed.reason;

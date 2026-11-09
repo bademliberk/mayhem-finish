@@ -323,7 +323,7 @@ test('idle reactivation socket factory failure refreshes reserves without resubs
   await t.feeds.stop();
 });
 
-test('repeated gaps while not ready are reported once; backoff grows and resets after ack', async () => {
+test('repeated gaps while not ready are reported once; backoff grows and resets after a stable connection', async () => {
   const t = setup();
   t.feeds.start();
   t.std()[0].terminate();
@@ -333,22 +333,34 @@ test('repeated gaps while not ready are reported once; backoff grows and resets 
   t.advance(1999); assert.equal(t.std().length, 2);
   t.advance(1); assert.equal(t.std().length, 3);
   const a = t.std()[2]; a.open(); a.ack('slotSubscribe', 1); a.ack('accountSubscribe', 21);
-  a.terminate();
-  t.advance(1000); assert.equal(t.std().length, 4); // reset after ack
+  a.terminate(); // acked then dropped at once: backoff keeps growing, no reconnect storm
+  t.advance(3999); assert.equal(t.std().length, 3);
+  t.advance(1); assert.equal(t.std().length, 4);
+  const b = t.std()[3]; b.open(); b.ack('slotSubscribe', 1); b.ack('accountSubscribe', 22);
+  t.advanceWithSlots(30000); b.terminate();
+  t.advance(1000); assert.equal(t.std().length, 5); // reset after a stable connection
   await t.feeds.stop();
 });
 
-test('account subscription rejection preserves backoff despite successful slot acknowledgments', async () => {
-  const t=setup();const errors=[];t.feeds.callbacks.onSubscriptionError=detail=>errors.push(detail);
+test('account subscription rejection retries only that watch with backoff on the same socket', async () => {
+  const t=setup({watches:[['m1',CURVE],['m2','Curve2']]});const errors=[];t.feeds.callbacks.onSubscriptionError=detail=>errors.push(detail);
   t.feeds.start();
+  const a=t.std()[0];a.open();t.pre()[0].open();a.ack('slotSubscribe',9);t.pre()[0].ack('preprocessedSubscribe',3);
+  a.ack('accountSubscribe',22,1);await settle();
   for(const delay of [1000,2000,4000]) {
-    const a=t.std().at(-1);a.open();a.ack('slotSubscribe',9);
-    a.text({id:a.find('accountSubscribe').id,error:{code:-32005,message:STD}});
-    const count=t.std().length;t.advance(delay-1);assert.equal(t.std().length,count);
-    t.advance(1);assert.equal(t.std().length,count+1);
+    a.text({id:t.feeds.watches.get('m1').request,error:{code:-32005,message:STD}});
+    const sent=a.sent.filter(m=>m.method==='accountSubscribe').length;
+    t.advance(delay-1);assert.equal(a.sent.filter(m=>m.method==='accountSubscribe').length,sent);
+    t.advance(1);assert.equal(a.sent.filter(m=>m.method==='accountSubscribe').length,sent+1);
   }
+  // No socket teardown and no gap: the other watch keeps its subscription.
+  assert.equal(t.std().length,1);assert.equal(a.readyState,1);assert.deepEqual(t.of('gap'),[]);
+  assert.equal(t.feeds.watches.get('m2').subscription,22);assert.equal(t.feeds.covers('m1'),false);
+  a.text({jsonrpc:'2.0',id:t.feeds.watches.get('m1').request,result:21});assert.equal(t.feeds.watches.get('m1').subscription,21);assert.equal(t.feeds.watches.get('m1').rejections,0);
   assert.deepEqual(errors,Array(3).fill({method:'accountSubscribe',code:-32005}));
-  assert.ok(!JSON.stringify(errors).includes(KEY));await t.feeds.stop();
+  assert.ok(!JSON.stringify(errors).includes(KEY));
+  t.feeds.remove('m1');assert.equal(t.feeds.watches.size,1);
+  await t.feeds.stop();assert.equal(t.timers.size,0);
 });
 
 test('baseline cancellation reaches RPC on replacement, removal and shutdown', async () => {
@@ -376,7 +388,7 @@ test('reconnect churn removes obsolete baselines from the real RPC queue', async
   for(let i=0;i<30;i++) {
     assert.equal(rpc.queue.length,1);
     t.std().at(-1).terminate();await settle();assert.equal(rpc.queue.length,0);
-    t.advance(1000);
+    t.advance(15000); // capped backoff: ack-then-drop churn never resets it
     const a=t.std().at(-1);a.open();a.ack('slotSubscribe',9);a.ack('accountSubscribe',21);await settle();
     assert.equal(t.feeds.tasks.size,1);
   }
@@ -722,7 +734,9 @@ test('subscription error responses and transport errors are gaps', async () => {
   t.feeds.start();
   const a = t.std()[0]; a.open();
   a.text({ id: a.find('accountSubscribe').id, error: { code: -32602 } });
-  assert.deepEqual(t.of('gap').map(e => e[1]), ['account_subscribe_failed']);
+  assert.deepEqual(t.of('gap'), []); assert.equal(a.readyState, 1);
+  a.text({ id: a.find('slotSubscribe').id, error: { code: -32602 } });
+  assert.deepEqual(t.of('gap').map(e => e[1]), ['slot_subscribe_failed']);
   const b = t.pre()[0]; b.open();
   b.emit('error', new Error(`ECONNRESET ${PRE}`));
   assert.equal(b.readyState, 3);
@@ -1226,4 +1240,19 @@ test('1000 account acknowledgments keep one baseline job in the real RPC queue a
   assert.equal(t.feeds.tasks.size, 0); assert.equal(t.feeds.baselines.pending.size, 0);
   t.advanceWithSlots(120000); await settle(); assert.equal(t.rpcCalls.length, 10, 'no fallback polling');
   await t.feeds.stop(); assert.equal(t.timers.size, 0);
+});
+
+test('an ack timer that fires before the wall-clock deadline re-arms instead of disarming', async () => {
+  const t = setup();
+  t.feeds.start(); t.std()[0].open(); // Preprocessed stays unopened so only the standard ack deadline is pending.
+  // Fire the pending ack timer 1 ms early, as libuv can relative to Date.now().
+  const fireEarly = () => {
+    const id = t.feeds.standard.ackTimer, timer = t.timers.get(id);
+    t.advance(timer.at - t.now() - 1); t.timers.delete(id); timer.fn();
+  };
+  fireEarly();
+  assert.deepEqual(t.of('gap'), []); assert.notEqual(t.feeds.standard.ackTimer, null);
+  t.advance(1);
+  assert.deepEqual(t.of('gap').map(e => e[1]), ['standard_ack_timeout']);
+  await t.feeds.stop();
 });

@@ -16,14 +16,16 @@ export function addresses(mint) {
 }
 export function config() {
   try { loadEnvFile(); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  // Blank values (e.g. `DB_PATH=`) mean unset: '' would otherwise be 0, or an anonymous temporary database.
+  const env = name => (process.env[name]?.trim() ? process.env[name] : undefined);
   const positive = (name, fallback) => {
-    const value = Number(process.env[name] ?? fallback);
+    const value = Number(env(name) ?? fallback);
     if (!Number.isFinite(value) || value <= 0) throw new Error(`Invalid ${name}`);
     return value;
   };
   return {
-    key: process.env.HELIUS_API_KEY ?? process.env.HELIUS_KEY,
-    db: process.env.DB_PATH ?? 'data/collector.sqlite',
+    key: env('HELIUS_API_KEY') ?? env('HELIUS_KEY'),
+    db: env('DB_PATH') ?? 'data/collector.sqlite',
     firstCheck: positive('FIRST_CHECK_SECONDS', 30),
     recheck: positive('RECHECK_SECONDS', 30),
     horizon: positive('OBSERVATION_SECONDS', 86400),

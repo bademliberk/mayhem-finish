@@ -73,3 +73,12 @@ test('screeningPolicy is stable, versioned and secret-free', () => {
   assert.ok(!text.includes('SECRET-KEY') && !text.includes('private'));
   assert.equal(JSON.parse(screeningPolicy({ ...c, minCap: 3 })).minCap, 3);
 });
+
+test('blank environment values fall back to defaults instead of zero, a temporary database or a missing key', () => {
+  const c = defaults({ DB_PATH: '', HELIUS_API_KEY: '', HELIUS_KEY: 'legacy', FIRST_CHECK_SECONDS: ' ', MIN_LIQUIDITY_SOL: '' });
+  assert.equal(c.db, 'data/collector.sqlite');
+  assert.equal(c.key, 'legacy');
+  assert.equal(c.firstCheck, 30);
+  assert.equal(c.minLiquidity, 0.005);
+  assert.equal(defaults({ HELIUS_API_KEY: 'primary', HELIUS_KEY: 'legacy' }).key, 'primary');
+});

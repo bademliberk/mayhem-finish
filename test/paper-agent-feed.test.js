@@ -362,3 +362,15 @@ test('1000 mints share one agent filter and ten baseline batches; health separat
   assert.equal(health.pending, 1000); assert.equal(health.agentAckedMints, 0); assert.equal(health.accountAckedMints, 0);
   await t.feeds.stop(); assert.equal(t.timers.size, 0);
 });
+
+test('agent ack-then-close churn keeps growing backoff', async () => {
+  const t = setup(); await t.bringUp();
+  for (const delay of [1000, 2000, 4000, 8000]) {
+    const current = t.socket('agent'); current.terminate();
+    const count = t.sockets.length;
+    t.advance(delay - 1); assert.equal(t.sockets.length, count);
+    t.advance(1); assert.equal(t.sockets.length, count + 1);
+    const next = t.socket('agent'); next.open(); next.ack('transactionSubscribe', 8);
+  }
+  await t.feeds.stop();
+});

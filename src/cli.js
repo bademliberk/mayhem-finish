@@ -61,46 +61,52 @@ async function start(rpc) {
   const tracker = cfg.paperMode
     ? new PaperEngine(store, rpc, paperCfg, { project: projectTransaction })
     : new CandidateTracker(store, rpc);
-  if (cfg.paperMode) {
-    tracker.attach(new PaperFeeds(store, rpc, {
-      agentMode: paperCfg.strategy === 'agent-sell-liquidity',
-      onAgentTransaction: tx => tracker.agentTransaction(tx),
-      onAccount: (...args) => tracker.onAccount(...args), onTransaction: raw => tracker.enqueue(raw),
-      onGap: reason => tracker.gap(reason), onReady: () => tracker.onReady(), onSlot: slot => tracker.onSlot(slot),
-      onCoverage: mint => tracker.coverage(mint),
-      onSubscriptionError: detail => tracker.paper.rejection('subscription_error', detail, Date.now()),
-    }));
-    store.onDiscovery = () => tracker.discover();
-    tracker.start();
-  } else tracker.recover();
-  const collector = new Collector(store, rpc, cfg, mint => tracker.add(mint));
-  let stopping = false;
-  const lastConnected = { value: lastHeartbeat };
-  const recovery = new Recovery({ store, collector, programs: [MINT_AUTHORITY], retrySeconds: cfg.backfillSeconds });
-  // onReady fires on first connect and every reconnect; recovery derives the cutoff from the
-  // actual disconnect (websocket_gap start) / last connected time, never from a prior recovery.
-  const stream = new Stream(store, rpc, () => recovery.reconnected(lastConnected.value));
-  recovery.begin({ lastHeartbeat, now });
-  let trackerStopped;
-  const stop = () => { stopping = true; stream.stop(); trackerStopped ??= tracker.stop(); rpc.stop(); };
+  let stopping = false, stream = null, trackerStopped, stopError;
+  // Every component that may already own sockets/timers is stopped, even if a later one failed to construct,
+  // and one failing stop step (e.g. SQLite busy) never skips the others or escapes a signal listener.
+  const stopStep = fn => { try { fn(); } catch (error) { stopError ??= error; } };
+  const stop = () => {
+    stopping = true;
+    stopStep(() => stream?.stop());
+    stopStep(() => { trackerStopped ??= Promise.resolve(tracker.stop()).catch(error => { stopError ??= error; }); });
+    stopStep(() => rpc.stop());
+  };
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
-  stream.start();
-  console.log(JSON.stringify({ event: 'started', database: cfg.db, firstCheckSeconds: cfg.firstCheck,
-    recheckSeconds: cfg.recheck, horizonSeconds: cfg.horizon,
-    note: cfg.paperMode ? 'Paper trading only; no signing or transaction submission' : 'Read-only collector; no trading' }));
-  let paperError;
-  const paperWorker = cfg.paperMode ? (async () => {
-    while (!stopping) { await tracker.tick(); if (!stopping) await sleep(100); }
-  })().catch(error => { paperError = error; stop(); }) : Promise.resolve();
-  let workerError;
-  const worker = cfg.paperMode ? Promise.resolve() : checkLoop(collector, () => stopping).catch(error => {
-    workerError = error;
-    stop();
-  });
-  let housekeepingError;
-  const stopHousekeeping = startHousekeeping({ store, session, stream, tracker, recovery,
-    paperMode: cfg.paperMode, lastConnected, onError: error => { housekeepingError = error; stop(); } });
+  let paperError, workerError, housekeepingError;
+  let worker = Promise.resolve(), paperWorker = Promise.resolve(), stopHousekeeping = () => {};
   try {
+    if (cfg.paperMode) {
+      tracker.attach(new PaperFeeds(store, rpc, {
+        agentMode: paperCfg.strategy === 'agent-sell-liquidity',
+        onAgentTransaction: tx => tracker.agentTransaction(tx),
+        onAccount: (...args) => tracker.onAccount(...args), onTransaction: raw => tracker.enqueue(raw),
+        onGap: reason => tracker.gap(reason), onReady: () => tracker.onReady(), onSlot: slot => tracker.onSlot(slot),
+        onCoverage: mint => tracker.coverage(mint),
+        onSubscriptionError: detail => tracker.paper.rejection('subscription_error', detail, Date.now()),
+      }));
+      store.onDiscovery = () => tracker.discover();
+      tracker.start();
+    } else tracker.recover();
+    const collector = new Collector(store, rpc, cfg, mint => tracker.add(mint));
+    const lastConnected = { value: lastHeartbeat };
+    const recovery = new Recovery({ store, collector, programs: [MINT_AUTHORITY], retrySeconds: cfg.backfillSeconds });
+    // onReady fires on first connect and every reconnect; recovery derives the cutoff from the
+    // actual disconnect (websocket_gap start) / last connected time, never from a prior recovery.
+    stream = new Stream(store, rpc, () => recovery.reconnected(lastConnected.value));
+    recovery.begin({ lastHeartbeat, now });
+    if (!stopping) stream.start();
+    console.log(JSON.stringify({ event: 'started', database: cfg.db, firstCheckSeconds: cfg.firstCheck,
+      recheckSeconds: cfg.recheck, horizonSeconds: cfg.horizon,
+      note: cfg.paperMode ? 'Paper trading only; no signing or transaction submission' : 'Read-only collector; no trading' }));
+    paperWorker = cfg.paperMode ? (async () => {
+      while (!stopping) { await tracker.tick(); if (!stopping) await sleep(100); }
+    })().catch(error => { paperError = error; stop(); }) : Promise.resolve();
+    worker = cfg.paperMode ? Promise.resolve() : checkLoop(collector, () => stopping).catch(error => {
+      workerError = error;
+      stop();
+    });
+    stopHousekeeping = startHousekeeping({ store, session, stream, tracker, recovery,
+      paperMode: cfg.paperMode, lastConnected, onError: error => { housekeepingError = error; stop(); } });
     while (!stopping) {
       const tick = nowSeconds();
       store.run("INSERT INTO metadata VALUES('discovery_started_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", String(tick));
@@ -113,20 +119,20 @@ async function start(rpc) {
     }
   } finally {
     stop();
-    try { stopHousekeeping(); }
-    finally {
-      await worker;
-      await paperWorker;
-      await trackerStopped;
-    }
-    stream.flushUsage();
-    if (cfg.paperMode) tracker.feeds.flushUsage(); else tracker.flushUsage();
-    store.run('UPDATE coverage SET ended_at=? WHERE id=?', nowSeconds(), session);
+    stopStep(stopHousekeeping);
+    await worker;
+    await paperWorker;
+    await trackerStopped;
+    // Durable usage and the session end are recorded even if a stop step failed.
+    stopStep(() => stream?.flushUsage());
+    stopStep(() => { if (cfg.paperMode) tracker.feeds?.flushUsage(); else tracker.flushUsage(); });
+    stopStep(() => store.run('UPDATE coverage SET ended_at=? WHERE id=?', nowSeconds(), session));
     process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
   }
   if (housekeepingError) throw housekeepingError;
   if (workerError) throw workerError;
   if (paperError) throw paperError;
+  if (stopError) throw stopError;
 }
 
 try {

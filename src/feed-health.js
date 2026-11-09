@@ -2,6 +2,9 @@
 const PREFIX = 'feed_health_';
 export const HEALTH_STALE_MS = 5000;
 export const SLOT_PROGRESS_MS = 30000;
+// Reconnect backoff resets only after a connection stays up this long, not at the first acknowledgment:
+// a provider that acks and then closes (rate limit, quota) must not get a reconnect storm.
+export const STABLE_CONNECTION_MS = 30000;
 const components = new Set(['process', 'discovery', 'standard', 'preprocessed', 'agent', 'recovery']);
 const phases = new Set(['starting', 'connecting', 'subscribing', 'subscribed', 'backoff', 'idle', 'running', 'stopped', 'waiting', 'recovering', 'complete']);
 const categories = new Set(['connect_failed', 'transport_error', 'http_rejected', 'disconnected', 'ack_timeout',

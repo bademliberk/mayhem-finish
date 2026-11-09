@@ -1,7 +1,7 @@
 import WebSocket from 'ws';
 import { MINT_AUTHORITY, MAYHEM } from './config.js';
 import { decodeLogs, recoverableCreations } from './chain.js';
-import { FeedHealth, safeFailure } from './feed-health.js';
+import { FeedHealth, safeFailure, STABLE_CONNECTION_MS } from './feed-health.js';
 
 const ACK_TIMEOUT_MS = 15000;
 const RETRY_MIN_MS = 1000;
@@ -45,7 +45,7 @@ export class Stream {
     this.now = now; this.setTimer = setTimer; this.clearTimer = clearTimer; this.socketFactory = socketFactory; this.log = log;
     this.stopped = false; this.gap = null; this.subscriptions = new Set();
     this.receivedBytes = 0; this.sequence = 0; this.failures = 0;
-    this.socket = null; this.timer = null; this.heartbeat = null; this.ackTimer = null;
+    this.socket = null; this.timer = null; this.heartbeat = null; this.ackTimer = null; this.stableTimer = null;
     this.health = new FeedHealth(store, 'discovery', now);
   }
   seconds() { return Math.floor(this.now() / 1000); }
@@ -97,7 +97,9 @@ export class Stream {
           if (message.error || !validSubscription(message.result)) {
             this.failed(socket, 'subscribe_failed', { subscriptionCode: message.error?.code }); return;
           }
-          ready = true; this.failures = 0;
+          ready = true;
+          this.clearTimer(this.stableTimer);
+          this.stableTimer = this.setTimer(() => { this.stableTimer = null; if (current()) this.failures = 0; }, STABLE_CONNECTION_MS);
           this.subscriptions.add(message.result);
           this.clearTimer(this.ackTimer); this.ackTimer = null;
           this.health.update({ phase: 'subscribed', lastAckAt: this.now(), failureStreak: 0, nextRetryAt: null });
@@ -136,8 +138,8 @@ export class Stream {
   failed(socket, category, error) {
     if (this.stopped || this.socket !== socket || this.timer) return;
     this.socket = null; this.subscriptions.clear();
-    this.clearTimer(this.heartbeat); this.clearTimer(this.ackTimer);
-    this.heartbeat = null; this.ackTimer = null;
+    this.clearTimer(this.heartbeat); this.clearTimer(this.ackTimer); this.clearTimer(this.stableTimer);
+    this.heartbeat = null; this.ackTimer = null; this.stableTimer = null;
     this.ensureGap();
     this.health.failure(category, error);
     this.log(JSON.stringify({ event: 'discovery_failure', ...safeFailure(category, error, this.now()) }));
@@ -154,8 +156,8 @@ export class Stream {
   stop() {
     if (this.stopped) return;
     this.stopped = true;
-    this.clearTimer(this.timer); this.clearTimer(this.heartbeat); this.clearTimer(this.ackTimer);
-    this.timer = null; this.heartbeat = null; this.ackTimer = null;
+    this.clearTimer(this.timer); this.clearTimer(this.heartbeat); this.clearTimer(this.ackTimer); this.clearTimer(this.stableTimer);
+    this.timer = null; this.heartbeat = null; this.ackTimer = null; this.stableTimer = null;
     const socket = this.socket; this.socket = null; this.subscriptions.clear();
     try { socket?.terminate(); } catch { /* already closed */ }
     this.health.stop(); this.flushUsage();

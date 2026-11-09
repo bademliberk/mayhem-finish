@@ -79,6 +79,7 @@ test('failed handshakes retry once with capped backoff and zero billed payload u
   assert.equal(t.store.get("SELECT COUNT(*) n FROM coverage WHERE kind='websocket_gap'").n, 1);
   const a = t.sockets.at(-1); a.open(); a.ack();
   assert.equal(t.health().failureStreak, 0); assert.equal(t.health().phase, 'subscribed');
+  t.advance(30000); a.emit('pong'); // backoff resets only after a stable connection
   a.terminate(); assert.equal([...t.timers.values()][0].delay, 1000);
   assert.ok(!JSON.stringify([t.logs, t.health()]).includes('SECRET'));
   t.close();
@@ -145,5 +146,15 @@ test('restart adopts oldest unfinished discovery gap; ack leaves original rows o
   assert.equal(t.store.get('SELECT ended_at FROM coverage WHERE id=?', old).ended_at, 1000);
   assert.equal(t.store.get('SELECT ended_at FROM coverage WHERE id=?', finished).ended_at, 70);
   assert.equal(t.store.get('SELECT detail FROM coverage WHERE id=?', old).detail, 'original interrupted gap');
+  t.close();
+});
+
+test('a provider that acknowledges and then closes keeps growing backoff instead of reconnecting every second', () => {
+  const t = setup(); t.stream.start();
+  for (const delay of [1000, 2000, 4000, 8000]) {
+    const a = t.sockets.at(-1); a.open(); a.ack(); a.emit('close', 1008);
+    assert.equal(t.timers.size, 1); assert.equal([...t.timers.values()][0].delay, delay);
+    t.advance(delay);
+  }
   t.close();
 });

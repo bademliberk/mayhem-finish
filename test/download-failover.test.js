@@ -75,3 +75,30 @@ test('concurrent primary failures share backup without skipping or cycling keys'
   assert.deepEqual(await Promise.all([rpc.call('getBlock', [1]), rpc.call('getBlock', [2])]), [42, 42]);
   assert.deepEqual(keys, ['primary', 'primary', 'backup', 'backup']);
 });
+
+test("Helius 'max usage reached' quota responses fail over to the backup key", async () => {
+  const bodies = [
+    { ok: false, status: 429, json: async () => ({ jsonrpc: '2.0', error: { code: -32429, message: 'max usage reached' }, id: 1 }) },
+    { ok: true, json: async () => ({ jsonrpc: '2.0', error: { code: -32429, message: 'max usage reached' }, id: 1 }) },
+    { ok: true, json: async () => ({ error: { code: -32000, message: 'Max usage reached' } }) },
+  ];
+  for (const body of bodies) {
+    let calls = 0;
+    const { rpc, used } = setup(async () => ++calls === 1 ? body : ok());
+    assert.equal(await rpc.call('getBlock'), 42);
+    assert.equal(rpc.keyIndex, 1); assert.equal(used(), 2);
+  }
+});
+
+test('Helius -32429 rate limits without quota text back off on the same key', async () => {
+  const bodies = [
+    { ok: false, status: 429, headers: { get: () => null }, json: async () => ({ error: { code: -32429, message: 'rate limited' } }) },
+    { ok: true, json: async () => ({ error: { code: -32429, message: 'rate limited' } }) },
+  ];
+  for (const body of bodies) {
+    let calls = 0;
+    const { rpc, used } = setup(async () => ++calls === 1 ? body : ok(), Infinity, { retries: 1 });
+    assert.equal(await rpc.call('getBlock'), 42);
+    assert.equal(rpc.keyIndex, 0); assert.equal(rpc.exhaustedKeys.size, 0); assert.equal(used(), 2);
+  }
+});

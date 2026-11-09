@@ -720,7 +720,7 @@ test('v3 stale or missing timeout state writes off with exact losses and immedia
       const saved = watch(s).fingerprint; assert.ok(saved);
       s.rpc.accounts = async () => { calls++; throw new Error('No fallback account reads'); };
       if (missing) s.engine.states.delete(mint);
-      else s.now(106000);
+      else { s.now(106000); s.covered(false); } // Old reserves without live coverage are unknown, not unchanged.
       s.engine.onSlot(23); await s.engine.tick();
       const { quote, closed } = assertTerminal(s, original, 'write_off');
       assert.equal(quote.writeOffReason, missing ? 'missing_observation' : 'stale_observation');
@@ -836,6 +836,11 @@ test('v3 gapped expired mandatory intent writes off without an additional RPC', 
     s.engine.onSlot(23); const work = s.engine.tick(), order = pending(s);
     s.engine.gap('test'); assert.equal(signal.aborted, true);
     s.now(102000); wait.resolve(snapshotOf(account(), 24)); await work; await s.engine.tick();
+    // Disconnected: the gap alone is not evidence of zero recovery.
+    assert.ok(position(s)); assert.equal(canceled(s, order.id), 'feed_gap');
+    s.engine.onReady(); s.now(102999); await s.engine.tick(); assert.ok(position(s));
+    // No reconnection baseline within one order TTL of recovery: explicit write-off.
+    s.now(103001); await s.engine.tick();
     assertTerminal(s, original, 'write_off'); assert.equal(canceled(s, order.id), 'feed_gap');
     for (let i = 0; i < 5; i++) await s.engine.tick();
     assert.equal(calls, 1);
@@ -1013,5 +1018,83 @@ test('agent reports preserve integer evidence and support missing new sample tab
     assert.equal(report.recentOrders[0].diagnostics.referenceRealSolLamports, '40000000');
     const readonly = Object.assign(Object.create(PaperStore.prototype), { store: s.store, cfg: config });
     s.store.db.exec('DROP TABLE paper_agent_events'); assert.deepEqual(readonly.report().recentAgentEvents, []);
+  } finally { s.close(); }
+});
+
+test('v3 transient feed gap does not write off held positions before the reconnection baseline', async () => {
+  // Timeout latched before the gap, and timeout first reached after the gap.
+  for (const latchedFirst of [true, false]) {
+    const s = setup({ holdSlots: 3 }); try {
+      await buy(s); const original = { ...position(s) };
+      s.rpc.accounts = async () => snapshotOf(account(), 24);
+      if (latchedFirst) { s.engine.onSlot(23); s.engine.cancel(pending(s).id, 100000, 'test'); assert.equal(watch(s).reason, 'timeout'); }
+      s.engine.gap('test'); await s.engine.tick(); assert.ok(position(s));
+      s.engine.onReady(); s.engine.onSlot(24); await s.engine.tick();
+      assert.ok(position(s)); assert.equal(watch(s).reason, 'timeout');
+      // The reconnection baseline arrives and the exit sells against real reserves instead of writing off.
+      s.engine.onAccount(mint, 24, account(), 'baseline'); await s.engine.tick();
+      const { quote } = assertTerminal(s, original, 'full_sale');
+      assert.ok(BigInt(quote.gross) > 0n);
+    } finally { s.close(); }
+  }
+});
+
+test('v3 quiet but covered curve exits at unchanged reserves instead of a stale write-off', async () => {
+  const s = setup({ holdSlots: 3 }); try {
+    await buy(s); const original = { ...position(s) }; let calls = 0;
+    s.rpc.accounts = async () => { calls++; return snapshotOf(account(), 23); };
+    // No trades for 6s, but the subscription and slot heartbeat are live.
+    s.now(106000); s.engine.onSlot(23); await s.engine.tick();
+    const { quote } = assertTerminal(s, original, 'full_sale');
+    assert.ok(BigInt(quote.gross) > 0n); assert.equal(calls, 1);
+  } finally { s.close(); }
+});
+
+test('v3 quiet covered curve gets one confirmation attempt, then writes off without polling', async () => {
+  const s = setup({ holdSlots: 3 }); try {
+    await buy(s); const original = { ...position(s) }; let calls = 0;
+    s.rpc.accounts = async () => { calls++; throw new Error('unavailable'); };
+    s.now(106000); s.engine.onSlot(23); await s.engine.tick();
+    assert.equal(calls, 1); assert.ok(position(s));
+    s.engine.onSlot(24); await s.engine.tick();
+    const { quote } = assertTerminal(s, original, 'write_off');
+    assert.equal(quote.writeOffReason, 'stale_observation'); assert.equal(calls, 1);
+  } finally { s.close(); }
+});
+
+test('blank paper environment values use defaults instead of zero', () => {
+  const blank = { PAPER_SWAP_FEE_BPS: '', PAPER_NETWORK_FEE_LAMPORTS: '', PAPER_SELL_SLIPPAGE_BPS: ' ', PAPER_AGENT_PROFIT_BPS: '\t' };
+  assert.equal(trialIdentity(paperConfig(blank, 'agent-sell-liquidity')), trialIdentity(config));
+  assert.equal(trialIdentity(paperConfig(blank)), trialIdentity(paperConfig({})));
+  assert.equal(paperConfig({ PAPER_SWAP_FEE_BPS: '0' }).swapFeeBps, 0);
+});
+
+test('v3 account data during a transaction-feed-only gap does not end the hold before feeds are ready', async () => {
+  const s = setup({ holdSlots: 3 }); try {
+    await buy(s); let calls = 0;
+    s.rpc.accounts = async () => { calls++; throw new Error('unavailable'); };
+    // Agent feed drops; the standard socket stays up and delivers a re-baseline, then the curve goes quiet.
+    s.engine.gap('agent_transaction_failed'); s.covered(false);
+    s.engine.onAccount(mint, 21, account(), 'baseline');
+    s.now(106000); s.engine.onSlot(23); await s.engine.tick();
+    assert.ok(position(s)); assert.equal(watch(s).reason, 'timeout'); assert.equal(calls, 0);
+  } finally { s.close(); }
+});
+
+test('a slot jump restarts signal windows without a gap, resync or canceled orders', async () => {
+  const s = setup(); try {
+    let resyncs = 0, jumps = 0; s.engine.feeds.resync = () => { resyncs++; };
+    const count = s.engine.paper.count.bind(s.engine.paper);
+    s.engine.paper.count = name => { if (name === 'slot_discontinuity') jumps++; return count(name); };
+    await buy(s); s.engine.onAccount(mint, 20, account());
+    s.engine.paper.request(mint, 'sell', 'profit', { net: '1' }, null, 100000);
+    const order = pending(s); assert.ok(order);
+    s.engine.onSlot(40);
+    assert.equal(resyncs, 0); assert.equal(s.engine.ready, true); assert.equal(s.engine.slot, 40);
+    assert.equal(pending(s)?.id, order.id); assert.ok(s.engine.states.has(mint));
+    // A sell signal from before the jump cannot create an entry across it.
+    assert.equal(s.engine.coverageSlots.get(mint2), 40);
+    s.engine.agentTransaction(tx('pre-jump', 30, [event(mint2)])); assert.equal(s.engine.paper.pending().filter(o => o.mint === mint2).length, 0);
+    assert.equal(jumps, 1);
   } finally { s.close(); }
 });

@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 import { MAYHEM } from './config.js';
-import { FeedHealth } from './feed-health.js';
+import { FeedHealth, STABLE_CONNECTION_MS } from './feed-health.js';
 
 const MAX_FRAME_BYTES = 1024 * 1024;
 const ACK_TIMEOUT_MS = 15000;
@@ -69,7 +69,7 @@ export class PaperAgentFeed {
     let socket;
     try { socket = this.socketFactory(this.rpc.wsUrl, 'agent'); }
     catch (error) { this.failed(null, 'connect_failed', error); return; }
-    const conn = { socket, curves, curveSet: new Set(curves), key, request: null, subscription: null, heartbeat: null, ackTimer: null, alive: true };
+    const conn = { socket, curves, curveSet: new Set(curves), key, request: null, subscription: null, heartbeat: null, ackTimer: null, stableTimer: null, alive: true };
     this.next = conn;
     const live = () => !this.stopped && (this.conn === conn || this.next === conn);
     socket.on('open', () => {
@@ -118,7 +118,12 @@ export class PaperAgentFeed {
       }
       conn.subscription = message.result;
       this.clearTimer(conn.ackTimer); conn.ackTimer = null;
-      this.clearTimer(this.retry); this.retry = null; this.attempts = 0;
+      this.clearTimer(this.retry); this.retry = null;
+      // Replacement failures share this counter; reset only if nothing failed while this connection was up.
+      const attempts = this.attempts;
+      conn.stableTimer = this.setTimer(() => {
+        conn.stableTimer = null; if (this.conn === conn && !this.stopped && this.attempts === attempts) this.attempts = 0;
+      }, STABLE_CONNECTION_MS);
       const old = this.conn;
       this.conn = conn; this.next = null;
       this.close(old);
@@ -153,8 +158,8 @@ export class PaperAgentFeed {
   }
   close(conn) {
     if (!conn) return;
-    this.clearTimer(conn.heartbeat); this.clearTimer(conn.ackTimer);
-    conn.heartbeat = null; conn.ackTimer = null;
+    this.clearTimer(conn.heartbeat); this.clearTimer(conn.ackTimer); this.clearTimer(conn.stableTimer);
+    conn.heartbeat = null; conn.ackTimer = null; conn.stableTimer = null;
     if (conn.subscription != null && conn.socket.readyState === WebSocket.OPEN) {
       try { conn.socket.send(JSON.stringify({ jsonrpc: '2.0', id: ++this.sequence, method: 'transactionUnsubscribe', params: [conn.subscription] })); }
       catch { /* The socket is terminated below regardless. */ }

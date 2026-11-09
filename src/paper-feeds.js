@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 import { PUMP } from './config.js';
-import { FeedHealth, SLOT_PROGRESS_MS } from './feed-health.js';
+import { FeedHealth, SLOT_PROGRESS_MS, STABLE_CONNECTION_MS } from './feed-health.js';
 import { PaperAgentFeed } from './paper-agent-feed.js';
 import { PaperBaselines } from './paper-baselines.js';
 
@@ -34,7 +34,7 @@ const toBuffer = raw => {
 };
 const noop = () => {};
 const newLink = kind => ({
-  kind, socket: null, retry: null, heartbeat: null, ackTimer: null, alive: true,
+  kind, socket: null, retry: null, heartbeat: null, ackTimer: null, stableTimer: null, alive: true,
   attempts: 0, generation: 0, acked: false, bytes: 0, transactions: 0,
 });
 
@@ -92,7 +92,8 @@ export class PaperFeeds {
       if (existing.curve === curveAddress) return;
       this.remove(mint);
     }
-    const watch = { mint, curve: curveAddress, preprocessed, covered: false, request: null, subscription: null, lastSlot: -1, seq: 0 };
+    const watch = { mint, curve: curveAddress, preprocessed, covered: false, request: null, subscription: null, lastSlot: -1, seq: 0,
+      retry: null, rejections: 0 };
     this.watches.set(mint, watch);
     if (this.standard.socket?.readyState === WebSocket.OPEN) this.subscribe(watch);
     this.scheduleSync();
@@ -128,6 +129,7 @@ export class PaperFeeds {
     const watch = this.watches.get(mint);
     if (!watch) return;
     this.cancelBaseline(watch);
+    this.clearTimer(watch.retry); watch.retry = null;
     this.watches.delete(mint);
     // A still-pending request stays in this.requests so a late acknowledgment is unsubscribed.
     if (watch.subscription != null) {
@@ -280,7 +282,12 @@ export class PaperFeeds {
     if (!link.socket) return;
     this.health.standard.update({ pendingAcks: this.ackDeadlines.size });
     if (!this.pending(link)) {
-      link.attempts = 0; this.health.standard.update({ failureStreak: 0 }); return;
+      this.health.standard.update({ failureStreak: 0 });
+      if (link.attempts && !link.stableTimer) {
+        const socket = link.socket;
+        link.stableTimer = this.setTimer(() => { link.stableTimer = null; if (link.socket === socket && !this.stopped) link.attempts = 0; }, STABLE_CONNECTION_MS);
+      }
+      return;
     }
     if (!this.ackDeadlines.size) return;
     const socket = link.socket;
@@ -289,7 +296,9 @@ export class PaperFeeds {
       if (link.ackTimer !== timer || link.socket !== socket || this.stopped) return;
       link.ackTimer = null;
       if ([...this.ackDeadlines.values()].some(at => at <= this.now())) this.fail(link, 'standard_ack_timeout');
-    }, Math.max(0, deadline - this.now()));
+      // Timers can fire slightly before the wall-clock deadline; never leave pending acks unguarded.
+      else this.armAck(link);
+    }, Math.max(1, deadline - this.now()));
     link.ackTimer = timer;
   }
   armSlotWatchdog() {
@@ -312,8 +321,8 @@ export class PaperFeeds {
   }
   // Forget all per-connection state; the socket itself is terminated by the caller.
   drop(link) {
-    this.clearTimer(link.heartbeat); this.clearTimer(link.ackTimer); this.clearTimer(link.retry);
-    link.heartbeat = null; link.ackTimer = null; link.retry = null;
+    this.clearTimer(link.heartbeat); this.clearTimer(link.ackTimer); this.clearTimer(link.retry); this.clearTimer(link.stableTimer);
+    link.heartbeat = null; link.ackTimer = null; link.retry = null; link.stableTimer = null;
     link.socket = null; link.acked = false; link.generation++;
     this.baselines.clear();
     this.agent?.reset();
@@ -324,6 +333,7 @@ export class PaperFeeds {
     // lastSlot resets so the baseline after resubscription is always delivered.
     for (const watch of this.watches.values()) {
       this.cancelBaseline(watch);
+      this.clearTimer(watch.retry); watch.retry = null;
       watch.request = null; watch.subscription = null; watch.lastSlot = -1;
     }
     this.ready = false;
@@ -336,8 +346,21 @@ export class PaperFeeds {
     this.health.standard.update({ phase: 'backoff', nextRetryAt: this.now() + delay });
     link.retry = this.setTimer(() => { link.retry = null; this.connect(link); }, delay);
   }
+  rejectSubscription(link, watch) {
+    watch.request = null; watch.covered = false;
+    const delay = Math.min(RETRY_MAX_MS, RETRY_MIN_MS * 2 ** Math.min(watch.rejections ?? 0, 16));
+    watch.rejections = (watch.rejections ?? 0) + 1;
+    this.health.standard.failure('subscribe_failed');
+    const socket = link.socket;
+    watch.retry = this.setTimer(() => {
+      watch.retry = null;
+      if (this.stopped || link.socket !== socket || this.watches.get(watch.mint) !== watch) return;
+      this.subscribe(watch);
+    }, delay);
+    this.armAck(link); this.checkReady();
+  }
   subscribe(watch) {
-    if (watch.request != null || watch.subscription != null) return;
+    if (watch.request != null || watch.subscription != null || watch.retry != null) return;
     const id = this.send(this.standard, 'accountSubscribe', [watch.curve, { commitment: this.agentMode ? 'confirmed' : 'processed', encoding: 'base64' }]);
     if (id == null) return;
     watch.request = id; this.requests.set(id, watch);
@@ -364,14 +387,18 @@ export class PaperFeeds {
       if (!watch) return;
       this.requests.delete(message.id); this.ackDeadlines.delete(message.id);
       if (message.error || !validSubscription(message.result)) {
-        this.subscriptionError('accountSubscribe', message.error); this.fail(link, 'account_subscribe_failed', { subscriptionCode: message.error?.code }); return;
+        this.subscriptionError('accountSubscribe', message.error);
+        // One rejected account must not gap every other watch; retry only it, with its own backoff.
+        if (this.watches.get(watch.mint) === watch && watch.request === message.id) this.rejectSubscription(link, watch);
+        else this.armAck(link);
+        return;
       }
       if (this.watches.get(watch.mint) !== watch || watch.request !== message.id) {
         this.send(link, 'accountUnsubscribe', [message.result]); // removed or replaced while the ack was in flight
         this.armAck(link);
         return;
       }
-      watch.request = null; watch.subscription = message.result;
+      watch.request = null; watch.subscription = message.result; watch.rejections = 0;
       this.subscriptions.set(message.result, watch);
       this.armAck(link);
       this.snapshot(watch);
@@ -433,7 +460,7 @@ export class PaperFeeds {
     health.update({ phase: pre.conn ? 'subscribed' : 'connecting', attempts: health.value.attempts + 1, nextRetryAt: null });
     try { socket = this.socketFactory(this.preprocessedUrl, 'preprocessed'); }
     catch (error) { this.connFailed(null, 'preprocessed_connect_failed', error); return; }
-    const conn = { socket, key, curves, request: null, acked: false, alive: true, heartbeat: null, ackTimer: null };
+    const conn = { socket, key, curves, request: null, acked: false, alive: true, heartbeat: null, ackTimer: null, stableTimer: null };
     pre.next = conn;
     const live = () => !this.stopped && (pre.conn === conn || pre.next === conn);
     socket.on('open', () => {
@@ -493,7 +520,12 @@ export class PaperFeeds {
     }
     if (message.id == null || message.id !== conn.request || conn.acked) return;
     if (!validSubscription(message.result) && !(typeof message.result === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(message.result))) throw new Error('Malformed ack');
-    conn.acked = true; pre.attempts = 0;
+    conn.acked = true;
+    // Replacement failures share this counter; reset only if nothing failed while this connection was up.
+    const attempts = pre.attempts;
+    conn.stableTimer = this.setTimer(() => {
+      conn.stableTimer = null; if (pre.conn === conn && !this.stopped && pre.attempts === attempts) pre.attempts = 0;
+    }, STABLE_CONNECTION_MS);
     this.health.preprocessed.update({ phase: 'subscribed', lastAckAt: this.now(), failureStreak: 0, nextRetryAt: null });
     this.clearTimer(conn.ackTimer); conn.ackTimer = null;
     // Make-before-break: the replacement takes over only now, then the old connection is closed silently.
@@ -506,8 +538,8 @@ export class PaperFeeds {
   }
   closeConn(conn) {
     if (!conn) return;
-    this.clearTimer(conn.heartbeat); this.clearTimer(conn.ackTimer);
-    conn.heartbeat = null; conn.ackTimer = null;
+    this.clearTimer(conn.heartbeat); this.clearTimer(conn.ackTimer); this.clearTimer(conn.stableTimer);
+    conn.heartbeat = null; conn.ackTimer = null; conn.stableTimer = null;
     try { conn.socket.terminate(); } catch { /* already closed */ }
   }
   closePreprocessed() {
