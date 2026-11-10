@@ -21,11 +21,18 @@ export function trialPath(profile, root = 'data/paper-trials', normalPath = 'dat
   return path;
 }
 
+export function livePath(dryRun, root = 'data/live-trials', normalPath = 'data/collector.sqlite') {
+  const path = resolve(join(root || 'data/live-trials', dryRun ? 'agent-sell-liquidity-dry-run.sqlite' : 'agent-sell-liquidity.sqlite'));
+  if (path === resolve(normalPath)) throw new Error('Live database must differ from the normal database');
+  return path;
+}
+
 // All persisted inputs are nonsecret. Key order does not affect identity.
 export function trialIdentity(cfg) {
   return JSON.stringify(Object.fromEntries(Object.entries(cfg).sort(([a], [b]) => a.localeCompare(b))));
 }
 function mismatchMessage(cfg, prefix) {
+  if (cfg.mode && cfg.mode !== 'paper') return `${prefix}; use a new LIVE_TRIAL_DIR (open positions in the old database still need handling)`;
   return cfg.profile === 'agent-sell-liquidity'
     ? `${prefix}; no policy was changed. Stop all trial processes, then explicitly migrate the otherwise-identical v1 or v2 trial to v3 terminal-exit policy with: node src/cli.js paper-trial agent-sell-liquidity --migrate-exit-policy --confirm-offline (same PAPER_TRIAL_DIR and configuration)`
     : `${prefix}; use a new trial directory`;

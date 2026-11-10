@@ -70,6 +70,10 @@ export function buyExactInput(state, budget, feeBps, v3 = false) {
   if (quote.cost > budget) throw new Error('budget_exceeded');
   return quote;
 }
+// True when the fraction-based budget reaches the swap cap (the uncapped fraction is at least the cap).
+export function budgetCapped(realSol, cfg) {
+  return realSol * BigInt(cfg.fractionBps) / BPS >= BigInt(cfg.maxSwapBudgetLamports);
+}
 export function liquidityBudget(realSol, cfg) {
   const fraction = realSol * BigInt(cfg.fractionBps) / BPS;
   const maximum = BigInt(cfg.maxSwapBudgetLamports);

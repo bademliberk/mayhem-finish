@@ -1,9 +1,14 @@
 // Fixed-size order evidence only: never raw RPC errors, messages, URLs or payloads.
 const stages = new Set(['requested', 'status_pending', 'status_unconfirmed', 'status_confirmed', 'status_failed',
-  'status_invalid', 'account_pending', 'snapshot_behind', 'snapshot_changed', 'entry_rejected', 'ready_to_fill', 'filled', 'written_off', 'canceled', 'unavailable']);
+  'status_invalid', 'account_pending', 'snapshot_behind', 'snapshot_changed', 'entry_rejected', 'ready_to_fill', 'filled', 'written_off', 'canceled', 'unavailable',
+  // Live execution: the signature is persisted before broadcast; `live_unknown` may still land on-chain.
+  'live_submitted', 'live_unknown', 'live_filled']);
 const integers = ['signalSlot', 'currentSlot', 'executedSlot', 'snapshotSlot', 'requiredSlot', 'peakSlot', 'windowStartSlot',
   'createdAtMs', 'updatedAtMs', 'elapsedMs', 'statusElapsedMs', 'accountElapsedMs', 'statusAttempts', 'accountAttempts',
-  'eventIndex', 'triggerRevision', 'triggerToRequestSlots', 'triggerToFillSlots'];
+  'eventIndex', 'triggerRevision', 'triggerToRequestSlots', 'triggerToFillSlots',
+  'liveSubmittedAtMs', 'liveLastValidBlockHeight', 'liveResolveAttempts', 'liveUnitsConsumed'];
+const liveStatuses = new Set(['ok', 'failed', 'unknown', 'rejected', 'simulated', 'no_tokens']);
+const BASE58 = /^[1-9A-HJ-NP-Za-km-z]+$/;
 const transactionKinds = new Set(['AccountInUse', 'AccountLoadedTwice', 'AccountNotFound', 'ProgramAccountNotFound',
   'InsufficientFundsForFee', 'InvalidAccountForFee', 'AlreadyProcessed', 'BlockhashNotFound', 'CallChainTooDeep',
   'MissingSignatureForFee', 'InvalidAccountIndex', 'SignatureFailure', 'InvalidProgramForExecution', 'SanitizeFailure',
@@ -37,6 +42,15 @@ export function safeOrderDiagnostics(value) {
   if (['buy', 'sell'].includes(value.triggerSide)) result.triggerSide = value.triggerSide;
   if (['processed', 'confirmed', 'finalized', 'unknown'].includes(value.confirmationStatus)) result.confirmationStatus = value.confirmationStatus;
   for (const key of integers) if (nonnegative(value[key])) result[key] = value[key];
+  // Live evidence: public chain identifiers and fixed codes only, never messages or payloads.
+  if (typeof value.liveSignature === 'string' && value.liveSignature.length >= 64 && value.liveSignature.length <= 88 &&
+      BASE58.test(value.liveSignature)) result.liveSignature = value.liveSignature;
+  if (typeof value.liveTokenProgram === 'string' && value.liveTokenProgram.length >= 32 && value.liveTokenProgram.length <= 44 &&
+      BASE58.test(value.liveTokenProgram)) result.liveTokenProgram = value.liveTokenProgram;
+  if (liveStatuses.has(value.liveStatus)) result.liveStatus = value.liveStatus;
+  if (typeof value.liveError === 'string' && /^[a-z0-9_-]{1,64}$/.test(value.liveError)) result.liveError = value.liveError;
+  if (Number.isSafeInteger(value.liveErrorCode) && Math.abs(value.liveErrorCode) <= 1e6) result.liveErrorCode = value.liveErrorCode;
+  if (typeof value.liveCostLamports === 'string' && /^-?(0|[1-9][0-9]{0,39})$/.test(value.liveCostLamports)) result.liveCostLamports = value.liveCostLamports;
   for (const key of ['requestedBudgetLamports', 'referenceRealSolLamports', 'currentRealSolLamports', 'exposureLamports']) {
     if (typeof value[key] === 'string' && /^(0|[1-9][0-9]{0,39})$/.test(value[key])) result[key] = value[key];
   }

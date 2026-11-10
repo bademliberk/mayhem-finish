@@ -210,6 +210,7 @@ budget = min(maxSwapBudgetLamports, eventRealSolLamports * fractionBps / 10000)
 | Fraction of post-sell real SOL | 12% | `PAPER_AGENT_FRACTION_BPS=1200` |
 | Maximum swap budget | 0.01 SOL | `PAPER_AGENT_MAX_SWAP_LAMPORTS=10000000` |
 | Minimum real SOL at signal and fill | 0.01 SOL | `PAPER_AGENT_MIN_REAL_SOL_LAMPORTS=10000000` |
+| Skip entries whose budget reaches the swap cap (opt-in) | off | `PAPER_AGENT_SKIP_CAPPED=true` |
 | Open entry cost plus pending-buy reservations | 0.05 SOL | `PAPER_AGENT_MAX_EXPOSURE_LAMPORTS=50000000` |
 | Holding deadline from confirmed entry-fill snapshot | 80 slots | `PAPER_AGENT_HOLD_SLOTS=80` |
 | Net profit target | +30% | `PAPER_AGENT_PROFIT_BPS=3000` |
@@ -305,6 +306,31 @@ Quote-layout evidence is pinned in [the schema fixture](test/fixtures/pump-curve
 `accountFaultSummary.totalEvents` counts rejected observations, not distinct mints: 100 rejected updates for one mint are 100 events. `retainedSamples` and `distinctMintsInRetainedSamples` cover only the newest 100 fault samples. They do not reconstruct the all-run number of affected mints.
 
 `paper-report` also exposes `frames_processed`, `projections_decoded`, and recent rejection metadata. Subscription failures retain only the subscription method and numeric provider error code in those bounded samples, never raw error messages. The aggregate `stale_or_already_executed` outcome remains, with separate `stale:slot_behind`, `stale:slot_ahead`, `stale:slot_heartbeat_stale`, `stale:reserve_stale`, and `stale:already_applied` counters; multiple causes can apply to one signal. `paper_signals.detail` records the associated slots and ages. `rpc_queue` usage counters describe overflow/cancellation/expiry events, not billed RPC calls. `paper_rejections` retains at most 100 samples with public signature/slot and bounded program/discriminator metadata, never full raw frames or RPC error strings. Zero orders with zero decoded projections is a decoder-coverage failure, not evidence of no opportunities. The two public confirmed transaction fixtures test actual legacy/v1 layouts offline against synthetic reserves; they are not historical signal/fill replays.
+
+## Live agent trial (real money)
+
+`npm run live:trial` runs the `agent-sell-liquidity` strategy with real Pump bonding-curve orders sent through Helius Sender. It uses the same signals, sizing, exits and `PAPER_AGENT_*` settings as the paper trial, with separate databases under `LIVE_TRIAL_DIR` (default `data/live-trials/`). See `.env.example` for every `LIVE_*` / `AS_*` setting.
+
+Always start with a dry run:
+
+```sh
+LIVE_DRY_RUN=true AS_WALLET_SECRET=... npm run live:trial
+```
+
+Dry run simulates each buy against mainnet (`simulateTransaction`) and records passing buys at the modeled quote. Sells are built but not simulated, because the wallet holds no tokens. Nothing is broadcast. A funded wallet is still needed for the balance checks.
+
+Live behaviour:
+
+- **Settlement from chain only.** A transaction's signature is saved before it is sent. A send that is not seen in time stays pending (`live_unknown`); gaps, restarts and shutdowns never cancel it. It is resolved from chain on later ticks and dropped only once its blockhash can no longer land. A confirmed fill is always recorded, even past the modeled exposure cap.
+- **Costs.** Entry cost and exit proceeds are the wallet's SOL change, excluding the refundable token-account rent, so PnL and the profit target compare like with like. Tip, priority and base fees are included.
+- **Buy cost.** The buy budget is a hard cap on swap SOL. `PAPER_BUY_SLIPPAGE_BPS` is taken as fewer tokens than quoted, never as more SOL; past that tolerance the program rejects the buy.
+- **Priority fee.** By default, a Helius estimate for Pump program traffic, refreshed every 5 s in the background (estimates older than 60 s fall back to the floor), at `AS_PRIORITY_LEVEL` (default `High`), clamped between `AS_MIN_PRIORITY_MICROLAMPORTS` and `AS_MAX_PRIORITY_MICROLAMPORTS`. Set `AS_PRIORITY_MICROLAMPORTS` for a fixed price.
+- **Risk limits.** Entries halt when the wallet would drop below `LIVE_MIN_WALLET_SOL`. No buy is sent if realized loss, plus all open entry costs, plus the new buy, plus worst-case fees for the buy and every exit, could exceed `LIVE_MAX_LOSS_SOL`. Only one live buy is in flight at a time. Open positions keep exiting after a halt.
+- **Exits.** Timeout and liquidity-risk exits sell at a fresh quote less `LIVE_EXIT_SLIPPAGE_BPS`, never at an unbounded zero minimum. Failed exits back off (2 s doubling to 60 s). Only the tokens the trial bought are sold.
+- **Halts persist.** A halt (wallet floor, loss limit, missing tokens, failed recording, 10 failed exits on one mint) is saved in the database and survives restarts. Clear it with `npm run live:trial -- --resume-entries` once you have checked the cause.
+- **Failed transactions** that land still pay fees; those fees count toward `LIVE_MAX_LOSS_SOL`.
+- **Manual action.** A graduated curve cannot be sold here (no AMM), and a position whose tokens are missing from the wallet is never filled. Both are logged as `live_manual_action` and left open in the database.
+- **Startup.** The process refuses to start if the database has open positions the wallet no longer holds. Other wallet tokens (airdrops) are ignored, and their mints are excluded from entries. Tokens left over after an exit are excluded from entries the same way, immediately.
 
 ## Dependencies and tests
 

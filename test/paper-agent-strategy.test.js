@@ -1098,3 +1098,29 @@ test('a slot jump restarts signal windows without a gap, resync or canceled orde
     assert.equal(jumps, 1);
   } finally { s.close(); }
 });
+
+test('PAPER_AGENT_SKIP_CAPPED skips entries whose budget reaches the swap cap and keeps uncapped ones', () => {
+  const skip = paperConfig({ PAPER_AGENT_SKIP_CAPPED: 'true' }, 'agent-sell-liquidity');
+  assert.equal(skip.skipCappedEntries, true);
+  // Off by default and when explicitly false/blank: identity unchanged for existing trials.
+  for (const value of [undefined, '', 'false', '0']) {
+    assert.equal(trialIdentity(paperConfig(value === undefined ? {} : { PAPER_AGENT_SKIP_CAPPED: value }, 'agent-sell-liquidity')), trialIdentity(config));
+  }
+  assert.throws(() => paperConfig({ PAPER_AGENT_SKIP_CAPPED: 'yes' }, 'agent-sell-liquidity'), /PAPER_AGENT_SKIP_CAPPED/);
+  assert.notEqual(trialIdentity(skip), trialIdentity(config));
+  // 12% of real SOL vs 0.01 SOL cap: 0.0833.. SOL is the boundary.
+  const capped = 83333334n, uncapped = 83333333n;
+  for (const [real, enabled, entered] of [[40000000n, true, true], [uncapped, true, true], [capped, true, false],
+    [200000000n, true, false], [200000000n, false, true]]) {
+    const s = setup(enabled ? { skipCappedEntries: true } : {}); try {
+      // Real curves keep virtual SOL above real SOL (30 SOL virtual offset).
+      const curve = account(real, real + 30000000000n);
+      s.engine.onAccount(mint, 20, curve);
+      s.engine.agentTransaction(tx(`t-${real}-${enabled}`, 20, [event(mint, reserves(curve))]));
+      assert.equal(Boolean(pending(s)), entered, `${real} ${enabled}`);
+      const recorded = s.store.get('SELECT outcome FROM paper_agent_events WHERE signature=?', `t-${real}-${enabled}`)?.outcome;
+      assert.equal(recorded, entered ? 'buy_pending' : 'capped_budget_skipped');
+      if (entered) assert.ok(BigInt(JSON.parse(pending(s).quote_json).requestedBudgetLamports) <= 10000000n);
+    } finally { s.close(); }
+  }
+});

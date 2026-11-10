@@ -14,6 +14,12 @@ export function paperConfig(env = process.env, profile = null) {
     if (!Number.isFinite(value) || value < min || value > max || (integer && !Number.isSafeInteger(value))) throw new Error(`Invalid ${name}`);
     return value;
   };
+  const flag = name => {
+    const raw = String(env[name] ?? '').trim().toLowerCase();
+    if (raw === '' || raw === 'false' || raw === '0') return false;
+    if (raw === 'true' || raw === '1') return true;
+    throw new Error(`Invalid ${name}`);
+  };
   if (profile !== null && !Object.hasOwn(trialProfiles, profile)) throw new Error('Unknown paper trial profile');
   return {
     mode: 'paper', version: 'creation_staged_v2', buyLamports: '10000000',
@@ -46,8 +52,19 @@ export function paperConfig(env = process.env, profile = null) {
       profitBps: number('PAPER_AGENT_PROFIT_BPS', 3000, 0, 100000),
       liquidityExitMultiple: number('PAPER_AGENT_EXIT_MULTIPLE', 2, 0, 100),
       swapFeeBps: number('PAPER_SWAP_FEE_BPS', 125, 0, 2000),
+      // Opt-in: skip entries whose fraction-based budget would reach PAPER_AGENT_MAX_SWAP_LAMPORTS.
+      // Omitted when off so existing trial identities are unchanged.
+      ...(flag('PAPER_AGENT_SKIP_CAPPED') ? { skipCappedEntries: true } : {}),
     }),
   };
+}
+
+// Live agent trial: same strategy assumptions, separate identity so paper and live (or dry-run) databases never mix.
+// Risk limits (wallet floor, max loss) are runtime settings, not identity, so they can change without a new database.
+export function liveConfig(env = process.env) {
+  const raw = String(env.LIVE_DRY_RUN ?? '').trim().toLowerCase();
+  if (!['', 'false', '0', 'true', '1'].includes(raw)) throw new Error('Invalid LIVE_DRY_RUN');
+  return { ...paperConfig(env, 'agent-sell-liquidity'), mode: ['true', '1'].includes(raw) ? 'live_dry_run' : 'live' };
 }
 
 const FAULT_CODES = ['missing_account', 'wrong_owner', 'invalid_data', 'invalid_curve', 'not_mayhem', 'processing_error'];
@@ -331,13 +348,14 @@ export class PaperStore {
       return this.fillWithinTransaction(this.store.get('SELECT * FROM paper_orders WHERE id=?', id), quote, now);
     });
   }
-  fill(order, quote, now) {
-    return this.store.atomic(() => this.fillWithinTransaction(order, quote, now));
+  // `live`: a confirmed on-chain fill is a fact, so modeled exposure limits can no longer veto recording it.
+  fill(order, quote, now, { live = false } = {}) {
+    return this.store.atomic(() => this.fillWithinTransaction(order, quote, now, live));
   }
-  fillWithinTransaction(order, quote, now) {
+  fillWithinTransaction(order, quote, now, live = false) {
     const pending = this.store.get("SELECT mint,side,diagnostics_json FROM paper_orders WHERE id=? AND status='pending'", order.id);
     if (!pending || pending.mint !== order.mint || pending.side !== order.side) return false;
-    if (order.side === 'buy' && !this.exposureAllows(BigInt(quote.cost), order.id)) {
+    if (order.side === 'buy' && !live && !this.exposureAllows(BigInt(quote.cost), order.id)) {
       this.cancel(order.id, now, 'exposure_cap'); return false;
     }
     if (order.side === 'buy' && this.cfg.strategy === 'agent-sell-liquidity' &&
@@ -421,7 +439,7 @@ export class PaperStore {
     const evidenceColumns = [['curve_discriminator_matches', 'curveDiscriminatorMatches'], ['quote_layout', 'quoteLayout'], ['quote_mint_observed', 'quoteMintObserved']]
       .map(([column, alias]) => `${faultColumns.has(column) ? column : 'NULL'} ${alias}`).join(',');
     return {
-      mode: 'paper', assumptions: this.cfg, capacity: this.capacity(), feedHealth: readFeedHealth(this.store, now),
+      mode: this.cfg.mode ?? 'paper', assumptions: this.cfg, capacity: this.capacity(), feedHealth: readFeedHealth(this.store, now),
       ...(this.cfg.strategy !== 'agent-sell-liquidity' ? {} : {
         policyMigrations: (() => {
           return this.store.all("SELECT value FROM metadata WHERE key IN ('paper_trial_policy_migration','paper_trial_terminal_exit_migration')")

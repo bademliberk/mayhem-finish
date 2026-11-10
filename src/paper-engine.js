@@ -3,7 +3,7 @@ import { agentSellEvents } from './chain.js';
 import { LookupCache } from './paper-lookups.js';
 import { PaperStore } from './paper-store.js';
 import { transactionFailure, readOrderDiagnostics } from './paper-diagnostics.js';
-import { reserves, cap, entryQuote, entryQuality, exitQuote, terminalExitQuote, writeOffQuote, liquidityRisk, liquidityBudget, profitable, meetsDrop, higher } from './paper-math.js';
+import { reserves, cap, entryQuote, entryQuality, exitQuote, terminalExitQuote, writeOffQuote, liquidityRisk, liquidityBudget, budgetCapped, profitable, meetsDrop, higher } from './paper-math.js';
 
 const mandatoryExit = reason => ['floor', 'liquidity_risk', 'timeout'].includes(reason);
 const exitPriority = reason => ({ profit: 0, liquidity_risk: 1, timeout: 2, floor: 3, graduated_no_amm_exit: 4 }[reason] ?? -1);
@@ -20,8 +20,16 @@ function validateAccount(account) {
 }
 
 export class PaperEngine {
-  constructor(store, rpc, cfg, { now = Date.now, project } = {}) {
+  constructor(store, rpc, cfg, { now = Date.now, project, executor = null, log = console.error } = {}) {
     this.store = store; this.rpc = rpc; this.cfg = cfg; this.now = now; this.project = project;
+    // Live mode: a real executor replaces the simulated fill. Orders in `submitted` may already be on-chain:
+    // only chain results settle them, never gaps, stops, supersedes or TTLs.
+    this.executor = executor; this.log = log; this.submitted = new Set(); this.liveHalted = null;
+    this.liveForeign = new Set(); this.liveExitFailures = new Map(); this.liveResolveAt = new Map(); this.liveBuying = null;
+    const live = ['live', 'live_dry_run'].includes(cfg.mode);
+    if (Boolean(executor) !== live) throw new Error('Live configurations require an executor, and an executor requires a live configuration');
+    if (live && (cfg.strategy !== 'agent-sell-liquidity' || !cfg.live)) throw new Error('Live execution supports only agent-sell-liquidity with live limits');
+    this.dryRun = cfg.mode === 'live_dry_run';
     this.paper = new PaperStore(store, cfg); this.states = new Map(); this.ready = false;
     this.agentMode = cfg.strategy === 'agent-sell-liquidity'; this.observationRevision = 0;
     this.terminalExits = this.agentMode && cfg.version === 'agent_sell_liquidity_v3_terminal_exit';
@@ -54,6 +62,7 @@ export class PaperEngine {
     this.paper.diagnose(order.id, update);
   }
   cancel(id, now, reason, diagnostics = {}) {
+    if (this.submitted.has(id)) { this.paper.count(`live:cancel_blocked:${reason}`); return; }
     const active = this.reconciliations.get(id);
     const order = this.store.get("SELECT * FROM paper_orders WHERE id=? AND status='pending'", id);
     if (order) {
@@ -65,6 +74,7 @@ export class PaperEngine {
     active?.controller.abort();
   }
   expire(order) {
+    if (this.submitted.has(order.id)) return false;
     const expiryCause = this.now() >= order.expires_at_ms ? 'clock' :
       order.side === 'buy' && this.slot > order.signal_slot + (this.cfg.signalValiditySlots ?? 5) - 1 ? 'slot' : null;
     if (expiryCause) this.cancel(order.id, this.now(), 'signal_expired', { expiryCause });
@@ -134,7 +144,14 @@ export class PaperEngine {
     const excess = unheld.slice(this.cfg.maxWatches - monitoredHeld.length);
     this.store.atomic(() => {
       // Unknown pending fills are canceled on restart, not assumed to have happened.
-      for (const order of this.paper.pending()) this.cancel(order.id, this.now(), 'restart_unreconciled');
+      // Live submissions may be on-chain: keep them blocked and resolve them from chain in tick().
+      for (const order of this.paper.pending()) {
+        const stage = readOrderDiagnostics(order.diagnostics_json)?.stage;
+        if (this.executor && ['live_submitted', 'live_unknown'].includes(stage)) {
+          this.submitted.add(order.id);
+          if (stage === 'live_submitted') this.paper.diagnose(order.id, { stage: 'live_unknown', updatedAtMs: this.now() });
+        } else this.cancel(order.id, this.now(), 'restart_unreconciled');
+      }
       for (const row of excess) {
         this.store.run("UPDATE paper_watches SET status='stopped',reason='subscription_cap',preprocessed=0 WHERE mint=?", row.mint);
         this.paper.count('restart_subscription_cap');
@@ -283,6 +300,9 @@ export class PaperEngine {
     const position = this.paper.position(mint);
     if (!this.terminalExits || this.stopped || !position ||
         (!mandatoryExit(reason) && reason !== 'graduated_no_amm_exit')) return false;
+    // Live: no modeled burn. Sell everything on-chain for whatever the curve gives; a graduated curve has no
+    // curve market (no AMM here), so it stays held and is reported for manual handling.
+    if (this.executor && !this.dryRun) return this.liveExit(mint, reason, cause, evidence);
     for (const order of this.paper.pending().filter(row => row.mint === mint)) this.cancel(order.id, this.now(), 'terminal_write_off');
     const quote = { ...writeOffQuote(position, this.cfg, cause), evidence };
     const closed = this.paper.writeOff(mint, reason, quote, this.now());
@@ -373,6 +393,7 @@ export class PaperEngine {
       this.latchExit(mint, reason);
     } else if (mandatoryExit(reason)) return;
     if (this.paper.pending().some(order => order.mint === mint)) return;
+    if (this.executor && this.liveBackoff(mint)) return;
     const eventDriven = this.agentMode && mandatoryExit(reason);
     if (eventDriven) {
       if (!this.exitAttemptAvailable(mint, position, observation)) return;
@@ -422,10 +443,13 @@ export class PaperEngine {
         if (!this.agentFresh(event.mint, event.slot)) return reject('coverage_or_state_stale');
         if (watch.status !== 'watching' || this.paper.position(event.mint) || !this.cfg.entriesEnabled ||
             !this.paper.capacity().remaining) return reject('entries_disabled_or_cap');
+        if (this.liveHalted) return reject('live_halted');
+        if (this.liveForeign.has(event.mint)) return reject('live_foreign_holding');
         try {
           const state = { ...this.states.get(event.mint).state,
             ...Object.fromEntries(Object.entries(event.reserves).map(([key, value]) => [key, BigInt(value)])) };
           if (state.complete || state.realSol < BigInt(this.cfg.minRealSolLamports)) return reject('minimum_real_liquidity');
+          if (this.cfg.skipCappedEntries && budgetCapped(state.realSol, this.cfg)) return reject('capped_budget_skipped');
           const budget = liquidityBudget(state.realSol, this.cfg);
           if (budget <= 0n) return reject('budget_too_small');
           const quote = entryQuote(state, this.cfg, budget);
@@ -471,9 +495,13 @@ export class PaperEngine {
           this.requestExit(watch.mint, row.state, watch.reason, null);
         }
       }
+      if (this.executor && this.submitted.size) await this.liveResolveUnknown();
       for (const order of this.paper.pending()) {
         if (this.stopped) break;
-        await this.reconcile(order);
+        if (this.submitted.has(order.id)) continue;
+        // Live sends wait for confirmation; awaiting them here would block every other exit meanwhile.
+        if (this.executor) this.reconcile(order).catch(() => this.paper.count('live:reconcile_error'));
+        else await this.reconcile(order);
       }
     } finally { this.working = false; }
   }
@@ -702,6 +730,7 @@ export class PaperEngine {
         this.onAccount(order.mint, slot, snapshot.value[0], 'rpc');
         if (!this.current(order, active)) return;
       }
+      if (this.executor) { await this.liveFill(order, quote, active, order.side === 'buy' ? snapshot.value[0] : null); return; }
       this.paper.fill(order, quote, this.now());
       if (order.side === 'sell') this.unwatch(order.mint);
     } catch {
@@ -711,6 +740,317 @@ export class PaperEngine {
       this.diagnose(order, { ...timing, lastStage: active.diagnostics.stage, stage: 'unavailable' });
       this.paper.count('reconciliation_unavailable');
     }
+  }
+
+  // ---- live execution ----
+  // Live: chain results settle submitted orders. Dry run: buys are simulated against the real chain and, when the
+  // simulation passes, recorded at the modeled quote; sells are built (curve read + instructions) but cannot be
+  // simulated without real tokens, so they are recorded at the modeled quote too. Dry-run orders never become `submitted`.
+  liveBackoff(mint) {
+    const entry = this.liveExitFailures.get(mint);
+    return entry && this.now() < entry.until ? entry : null;
+  }
+  liveExitFailed(mint, code) {
+    const failures = (this.liveExitFailures.get(mint)?.failures ?? 0) + 1;
+    if (failures === 10) {
+      this.liveHalt('exit_failing');
+      this.log(JSON.stringify({ event: 'live_manual_action', mint, reason: 'exit_failing', failures, lastError: code,
+        note: 'Exits keep retrying every 60 s; check the curve and sell manually if needed.' }));
+    }
+    const delay = Math.min(60000, 2000 * 2 ** Math.min(failures - 1, 5));
+    this.liveExitFailures.set(mint, { failures, until: this.now() + delay, code });
+    this.paper.count('live:exit_retry_backoff');
+  }
+  /** Confirmed on-chain result -> recorded quote. Refundable token-account rent is excluded on both sides, so
+   * PnL and profit targets compare like with like; the tip, priority and base fees are real costs and included. */
+  liveQuote(order, modeled, result) {
+    const base = { model: 'live_fill', slot: result.slot, signature: result.signature,
+      modeled: { cost: modeled.cost ?? null, net: modeled.net ?? null, tokens: modeled.tokens ?? null, slot: modeled.slot ?? null },
+      solDeltaLamports: result.lamports.toString(), ataLamports: result.ataLamports.toString(),
+      transactionFeeLamports: result.fee.toString(), tokensDelta: result.tokens.toString(),
+      tokenProgram: result.tokenProgram ?? null };
+    if (order.side === 'buy') {
+      return { ...base, tokens: result.tokens.toString(), cost: (-(result.lamports + result.ataLamports)).toString(),
+        requestedBudgetLamports: modeled.requestedBudgetLamports };
+    }
+    return { ...base, tokens: (-result.tokens).toString(), gross: modeled.gross ?? null,
+      net: (result.lamports + result.ataLamports).toString() };
+  }
+  async liveTokenProgram(mint) {
+    const position = this.paper.position(mint);
+    const entry = position && this.store.get('SELECT fill_json FROM paper_orders WHERE id=?', position.entry_order_id);
+    const saved = entry?.fill_json ? JSON.parse(entry.fill_json).tokenProgram : null;
+    return saved || this.executor.mintTokenProgram(mint);
+  }
+  /** Build and sign (no network send). Returns a prepared transaction or { status: 'no_tokens' }. */
+  async liveBuild(order, modeled, confirmed = null) {
+    if (order.side === 'buy') return this.executor.prepareBuy(order.mint, BigInt(modeled.requestedBudgetLamports), this.cfg.buySlippageBps, confirmed);
+    const position = this.paper.position(order.mint);
+    if (!position) throw new Error('no_position');
+    const owned = BigInt(position.tokens_raw);
+    let tokens = owned, close = true;
+    if (!this.dryRun) {
+      const held = await this.executor.tokenBalance(order.mint, await this.liveTokenProgram(order.mint));
+      if (held <= 0n) return { status: 'no_tokens' };
+      // Sell only what this trial bought; keep (and do not close) any balance it did not open.
+      if (held < owned) tokens = held;
+      else if (held > owned) close = false;
+    }
+    // The confirmed snapshot showed the curve cannot pay for the whole balance: sell only the payable part.
+    if (modeled.terminalOutcome === 'partial_sale' && /^[0-9]+$/.test(modeled.soldTokens ?? '')) {
+      const payable = BigInt(modeled.soldTokens);
+      if (payable > 0n && payable < tokens) { tokens = payable; close = false; }
+    }
+    // Profit exits keep the modeled minimum; mandatory exits take a fresh quote with a wider tolerance.
+    const min = order.reason === 'profit' ? BigInt(modeled.net) * BigInt(10000 - this.cfg.sellSlippageBps) / 10000n : null;
+    return this.executor.prepareSell(order.mint, tokens, min !== null && min < 0n ? 0n : min, close, this.cfg.live.exitSlippageBps);
+  }
+  async liveFill(order, modeled, active, confirmed = null) {
+    if (order.side === 'sell' && this.liveBackoff(order.mint)) { this.cancel(order.id, this.now(), 'live_exit_backoff'); return; }
+    if (order.side === 'buy') {
+      if (this.liveBuying !== null) { this.cancel(order.id, this.now(), 'live_buy_in_flight'); return; }
+      this.liveBuying = order.id;
+    }
+    try { await this.liveFillUnlocked(order, modeled, active, confirmed); }
+    finally { if (this.liveBuying === order.id) this.liveBuying = null; }
+  }
+  async liveFillUnlocked(order, modeled, active, confirmed) {
+    // Checks and the (send-free) build run together: every RPC here delays the send inside a ~5-slot signal window.
+    const [blocked, built] = await Promise.all([
+      order.side === 'buy' ? this.liveBuyBlocked(order, BigInt(modeled.requestedBudgetLamports)) : null,
+      this.liveBuild(order, modeled, confirmed).then(value => ({ value }), error => ({ error })),
+    ]);
+    if (blocked) { this.cancel(order.id, this.now(), blocked); return; }
+    if (order.side === 'buy' && !this.current(order, active)) return;
+    let prepared = built.value;
+    if (built.error) {
+      const error = built.error;
+      // Nothing was signed for broadcast: safe to cancel.
+      const code = /^[a-z0-9_]{1,64}$/.test(error?.message ?? '') ? error.message : 'build_error';
+      if (order.side === 'sell') this.liveExitFailed(order.mint, code);
+      this.cancel(order.id, this.now(), 'live_build_failed', { liveError: code });
+      return;
+    }
+    if (prepared.status === 'no_tokens') { this.liveNoTokens(order); return; }
+    // A gap, stop, expiry or supersede during the build cancels the order: then nothing may be sent or recorded.
+    if (this.stopped || !this.store.get("SELECT 1 FROM paper_orders WHERE id=? AND status='pending'", order.id)) return;
+    if (order.side === 'buy' && !this.current(order, active)) return;
+    if (this.dryRun) { await this.liveDryRun(order, modeled, prepared); return; }
+    // Persist the signature BEFORE anything leaves the process: after a crash it is resolved from chain, never canceled.
+    this.submitted.add(order.id);
+    this.diagnose(order, { stage: 'live_submitted', liveSubmittedAtMs: this.now(), liveSignature: prepared.signature,
+      liveTokenProgram: prepared.tokenProgram, liveLastValidBlockHeight: prepared.lastValidBlockHeight });
+    let result;
+    try { result = await this.executor.submit(prepared); }
+    catch { result = { signature: prepared.signature, status: 'unknown' }; }
+    await this.liveSettle(order, modeled, { tokenProgram: prepared.tokenProgram, ...result });
+  }
+  async liveDryRun(order, modeled, prepared) {
+    let simulation = null;
+    if (order.side === 'buy') {
+      const result = await this.executor.submit(prepared);
+      const error = result.simulationError;
+      this.log(JSON.stringify({ event: 'live_dry_run', side: 'buy', mint: order.mint, ok: error == null, unitsConsumed: result.unitsConsumed,
+        simulationError: error == null ? undefined : JSON.stringify(error).slice(0, 200) }));
+      if (error != null) {
+        const failure = transactionFailure(typeof error === 'string' || typeof error === 'object' ? error : 'Unknown');
+        this.diagnose(order, { stage: 'status_failed', failure, liveStatus: 'simulated' });
+        this.cancel(order.id, this.now(), 'live_simulation_failed');
+        return;
+      }
+      simulation = { unitsConsumed: result.unitsConsumed ?? null };
+      if (Number.isSafeInteger(result.unitsConsumed)) this.diagnose(order, { liveUnitsConsumed: result.unitsConsumed });
+    } else this.log(JSON.stringify({ event: 'live_dry_run', side: 'sell', reason: order.reason, mint: order.mint, built: true,
+      note: 'Sell built but not simulated (dry-run wallet holds no tokens); recorded at the modeled quote.' }));
+    this.diagnose(order, { liveStatus: 'simulated' });
+    const quote = { ...modeled, dryRun: { simulatedBuy: order.side === 'buy', simulation, tokenProgram: prepared.tokenProgram } };
+    if (this.paper.fill(order, quote, this.now()) && order.side === 'sell') { this.unwatch(order.mint); this.liveCheckLoss(); }
+  }
+  liveNoTokens(order) {
+    // The trial thinks it holds tokens the wallet does not have: never fabricate a fill. Stop managing the mint.
+    this.cancel(order.id, this.now(), 'live_no_tokens');
+    this.store.run("UPDATE paper_watches SET status='stopped',reason='live_manual_reconciliation' WHERE mint=?", order.mint);
+    this.unwatch(order.mint);
+    this.liveHalt('sell_without_tokens');
+    this.log(JSON.stringify({ event: 'live_manual_action', mint: order.mint, reason: 'position_without_wallet_tokens',
+      note: 'Open position kept in the database; reconcile manually.' }));
+  }
+  async liveSettle(order, modeled, result) {
+    const record = { liveSignature: result.signature ?? undefined, liveStatus: result.status };
+    if (result.status === 'ok') {
+      if (order.side === 'buy' && result.tokens <= 0n) {
+        // SOL left the wallet without tokens arriving: impossible for a curve buy, so stop and ask for a human.
+        this.submitted.delete(order.id);
+        this.cancel(order.id, this.now(), 'live_buy_without_tokens', record);
+        this.liveHalt('buy_without_tokens');
+        this.log(JSON.stringify({ event: 'live_manual_action', mint: order.mint, signature: result.signature, reason: 'buy_without_tokens' }));
+        return;
+      }
+      let recorded = false;
+      try {
+        const quote = this.liveQuote(order, modeled, result);
+        this.diagnose(order, { ...record, stage: 'live_filled' });
+        // A confirmed fill is a fact: modeled exposure limits cannot veto recording it.
+        recorded = this.paper.fill(order, quote, this.now(), { live: true });
+      } catch { recorded = false; }
+      if (!recorded) {
+        // Keep it submitted: the next tick re-resolves the signature and retries recording; no new entries meanwhile.
+        this.diagnose(order, { ...record, stage: 'live_unknown' });
+        this.liveHalt('record_failed');
+        this.log(JSON.stringify({ event: 'live_record_failed', side: order.side, mint: order.mint, signature: result.signature }));
+        return;
+      }
+      this.submitted.delete(order.id); this.liveExitFailures.delete(order.mint);
+      this.log(JSON.stringify({ event: 'live_fill', side: order.side, reason: order.reason, mint: order.mint,
+        signature: result.signature, solDelta: result.lamports.toString(), tokens: result.tokens.toString() }));
+      if (order.side === 'sell') {
+        this.unwatch(order.mint); this.liveCheckLoss();
+        // A partial liquidation (or a balance this trial did not open) leaves tokens behind: report, never track.
+        if (typeof result.postTokens === 'bigint' && result.postTokens > 0n) {
+          this.liveForeign.add(order.mint);
+          this.log(JSON.stringify({ event: 'live_manual_action', mint: order.mint, reason: 'residual_tokens_after_exit',
+            tokens: result.postTokens.toString(), note: 'Position closed; the remaining tokens are excluded from entries.' }));
+        }
+      }
+      return;
+    }
+    if (['rejected', 'failed'].includes(result.status)) {
+      this.submitted.delete(order.id);
+      // A failed transaction that landed still paid its base, priority and tip: real, unrecoverable cost.
+      if (result.status === 'failed' && typeof result.lamports === 'bigint' && result.lamports < 0n) {
+        this.liveAddCost(-(result.lamports + (result.ataLamports ?? 0n)));
+      }
+      if (order.side === 'sell') this.liveExitFailed(order.mint, `live_${result.status}`);
+      this.cancel(order.id, this.now(), `live_${result.status}`, { ...record,
+        ...(Number.isSafeInteger(result.errorCode) ? { liveErrorCode: result.errorCode } : {}),
+        ...(result.err ? { failure: transactionFailure(result.err) } : {}) });
+      return;
+    }
+    // Unknown: may still land. Keep it pending and blocked; tick() re-resolves it from chain.
+    this.diagnose(order, { ...record, stage: 'live_unknown' });
+    this.store.run('UPDATE paper_orders SET expires_at_ms=? WHERE id=?', Number.MAX_SAFE_INTEGER, order.id);
+    this.paper.count('live:unknown');
+  }
+  /** Re-resolve unknown submissions from chain (signature status + balances), at most every 2 s per order. */
+  async liveResolveUnknown() {
+    for (const order of this.paper.pending()) {
+      if (this.stopped) return;
+      if (!this.submitted.has(order.id) || this.reconciliations.has(order.id)) continue;
+      if (this.now() < (this.liveResolveAt.get(order.id) ?? 0)) continue;
+      this.liveResolveAt.set(order.id, this.now() + 2000);
+      const diag = readOrderDiagnostics(order.diagnostics_json) ?? {};
+      if (!diag.liveSignature) {
+        // Crashed between marking and persisting a signature: nothing could have been broadcast.
+        this.submitted.delete(order.id); this.cancel(order.id, this.now(), 'live_never_signed'); continue;
+      }
+      // Height first: if the signature is still unseen afterwards, it can never land.
+      const height = Number.isSafeInteger(diag.liveLastValidBlockHeight)
+        ? await this.executor.blockHeight().catch(() => null) : null;
+      const result = await this.executor.resolve(diag.liveSignature, order.mint).catch(() => ({ status: 'unknown' }));
+      if (result.status === 'unknown') {
+        // A signature the cluster has seen may already have landed: keep resolving it, never expire it.
+        const expired = !result.seen && (height != null ? height > diag.liveLastValidBlockHeight
+          : this.now() - (diag.liveSubmittedAtMs ?? 0) > 150000);
+        if (expired) {
+          this.submitted.delete(order.id); this.liveResolveAt.delete(order.id);
+          if (order.side === 'sell') this.liveExitFailed(order.mint, 'live_expired_unseen');
+          this.cancel(order.id, this.now(), 'live_expired_unseen', { liveSignature: diag.liveSignature });
+        }
+        continue;
+      }
+      this.liveResolveAt.delete(order.id);
+      await this.liveSettle(order, JSON.parse(order.quote_json), { ...result, tokenProgram: diag.liveTokenProgram });
+    }
+  }
+  async liveBuyBlocked(order, budget) {
+    if (this.liveHalted) return `live_halted_${this.liveHalted}`;
+    if (this.liveForeign.has(order.mint)) return 'live_foreign_holding';
+    // One live buy at a time keeps wallet-balance and exposure checks exact.
+    if (this.liveBuying !== null && this.liveBuying !== order.id) return 'live_buy_in_flight';
+    for (const id of this.submitted) if (this.store.get('SELECT side FROM paper_orders WHERE id=?', id)?.side === 'buy') return 'live_buy_in_flight';
+    // Worst case: every open position and this buy go to zero, after paying the buy's and every exit's overhead.
+    // The buy budget is a hard cap on swap SOL (executor), so this bound is exact up to the priority-fee ceiling.
+    const openCount = BigInt(this.store.get("SELECT COUNT(*) n FROM paper_positions WHERE status='open'").n);
+    const overhead = this.executor.maxOverheadLamports('buy') + (openCount + 1n) * this.executor.maxOverheadLamports('sell');
+    const worst = -this.liveRealizedLamports() + this.paper.exposure(order.id).open + budget + overhead;
+    if (worst > BigInt(this.cfg.live.maxLossLamports)) return 'live_loss_budget';
+    let balance;
+    try { balance = await this.executor.balance(); } catch { return 'live_balance_unavailable'; }
+    const reserve = budget + BigInt(this.cfg.live.perTradeReserveLamports);
+    if (balance - reserve < BigInt(this.cfg.live.minWalletLamports)) { this.liveHalt('wallet_floor'); return 'live_wallet_floor'; }
+    return null;
+  }
+  liveRealizedLamports() {
+    const failed = BigInt(this.store.get("SELECT value FROM metadata WHERE key='live_failed_tx_cost_lamports'")?.value ?? '0');
+    return this.store.all("SELECT pnl_lamports FROM paper_positions WHERE status='closed' AND pnl_lamports IS NOT NULL")
+      .reduce((sum, row) => sum + BigInt(row.pnl_lamports), 0n) - failed;
+  }
+  /** Persisted, so failed-transaction fees count toward LIVE_MAX_LOSS_SOL across restarts. */
+  liveAddCost(lamports) {
+    if (lamports <= 0n) return;
+    const key = 'live_failed_tx_cost_lamports';
+    const total = BigInt(this.store.get('SELECT value FROM metadata WHERE key=?', key)?.value ?? '0') + lamports;
+    this.store.run('INSERT INTO metadata VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', key, total.toString());
+    this.liveCheckLoss();
+  }
+  liveCheckLoss() {
+    if (-this.liveRealizedLamports() >= BigInt(this.cfg.live.maxLossLamports)) this.liveHalt('max_loss');
+  }
+  liveHalt(reason) {
+    if (this.liveHalted) return;
+    this.liveHalted = reason; this.paper.count(`live:halted:${reason}`);
+    // Persisted: a restart must not silently resume entries after a halt that needs a human.
+    this.store.run("INSERT INTO metadata VALUES('live_halted',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", reason);
+    this.log(JSON.stringify({ event: 'live_entries_halted', reason, note: 'Open positions still exit normally.' }));
+  }
+  /** Live mandatory exit: a real full sale at whatever a fresh quote supports (within LIVE_EXIT_SLIPPAGE_BPS). */
+  liveExit(mint, reason, cause, evidence) {
+    if (this.stopped || this.paper.pending().some(order => order.mint === mint) || this.liveBackoff(mint)) return false;
+    if (cause === 'graduated_no_amm_exit') {
+      this.store.run("UPDATE paper_watches SET status='stopped',reason='graduated_live_unsellable' WHERE mint=?", mint);
+      this.paper.count('live:graduated_unsellable');
+      this.log(JSON.stringify({ event: 'live_manual_action', mint, reason: 'graduated_held_tokens', note: 'Curve completed; sell on PumpSwap manually.' }));
+      this.unwatch(mint);
+      return true;
+    }
+    const id = this.request(mint, 'sell', reason, { net: '0', model: 'live_mandatory_full_sale', liveCause: cause, evidence }, null);
+    if (!id) return false;
+    const order = this.store.get('SELECT * FROM paper_orders WHERE id=?', id);
+    const active = { controller: new AbortController(), order, epoch: this.epoch, diagnostics: {} };
+    this.reconciliations.set(id, active);
+    active.promise = this.liveFill(order, JSON.parse(order.quote_json), active)
+      .catch(() => { this.paper.count('live:exit_error'); this.liveExitFailed(mint, 'exit_error'); })
+      .finally(() => this.reconciliations.delete(id));
+    return false;
+  }
+  /** Startup: the wallet and this database must agree before any order is sent. */
+  async liveStartupChecks({ resume = false } = {}) {
+    const halted = this.store.get("SELECT value FROM metadata WHERE key='live_halted'")?.value;
+    if (halted && resume) {
+      this.store.run("DELETE FROM metadata WHERE key='live_halted'");
+      this.log(JSON.stringify({ event: 'live_halt_cleared', reason: halted }));
+    } else if (halted) {
+      this.liveHalted = halted;
+      this.log(JSON.stringify({ event: 'live_entries_halted', reason: halted, note: 'Halt persisted from a previous run; exits only. Restart with --resume-entries to clear it.' }));
+    }
+    const balance = await this.executor.balance();
+    if (balance < BigInt(this.cfg.live.minWalletLamports)) throw new Error('Wallet SOL is below LIVE_MIN_WALLET_SOL; refusing to start');
+    if (!this.dryRun) {
+      const held = await this.executor.heldMints();
+      const owned = new Set(this.store.all("SELECT mint FROM paper_positions WHERE status='open'").map(row => row.mint));
+      // A sell or buy that may have landed before a crash is resolved from chain after startup, so the wallet may
+      // legitimately disagree with the database for those mints until then.
+      const unresolved = new Set(this.paper.pending().filter(order =>
+        ['live_submitted', 'live_unknown'].includes(readOrderDiagnostics(order.diagnostics_json)?.stage)).map(order => order.mint));
+      const missing = [...owned].filter(mint => !held.has(mint) && !unresolved.has(mint) &&
+        !['live_manual_reconciliation', 'graduated_live_unsellable'].includes(this.paper.watch(mint)?.reason));
+      if (missing.length) throw new Error(`Live DB has ${missing.length} open position(s) the wallet no longer holds; manual reconciliation required (first: ${missing[0]})`);
+      // Tokens this trial did not open (airdrops, another bot) are left alone: never bought into, never sold.
+      this.liveForeign = new Set([...held].filter(mint => !owned.has(mint) && !unresolved.has(mint)));
+      if (this.liveForeign.size) this.log(JSON.stringify({ event: 'live_foreign_tokens', count: this.liveForeign.size,
+        note: 'Wallet holds tokens this trial did not open; those mints are excluded from entries.' }));
+    }
+    this.liveCheckLoss();
   }
   stop() {
     if (this.stopPromise) return this.stopPromise;

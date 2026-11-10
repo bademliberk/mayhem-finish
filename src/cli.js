@@ -11,24 +11,41 @@ import { Recovery } from './recovery.js';
 import { startHousekeeping } from './housekeeping.js';
 import { CandidateTracker } from './tracker.js';
 import { PaperEngine } from './paper-engine.js';
-import { paperConfig, PaperStore } from './paper-store.js';
+import { paperConfig, liveConfig, PaperStore } from './paper-store.js';
 import { PaperFeeds } from './paper-feeds.js';
 import { projectTransaction } from './paper-decode.js';
-import { trialPath, bindTrial, preflightTrial, migrateAgentExitPolicy } from './paper-profiles.js';
+import { trialPath, livePath, bindTrial, preflightTrial, migrateAgentExitPolicy } from './paper-profiles.js';
+import { LiveExecutor, liveSettings, loadWallet } from './live-executor.js';
 
 const cfg = config();
 const command = process.argv[2] ?? 'start';
-const trial = command === 'paper-trial';
+// `live-trial agent-sell-liquidity`: the agent strategy with real (or, with LIVE_DRY_RUN=true, simulated) orders.
+const live = command === 'live-trial';
+const resumeEntries = live && process.argv[4] === '--resume-entries';
+if (live && (process.argv[3] !== 'agent-sell-liquidity' || process.argv.length > (resumeEntries ? 5 : 4))) {
+  throw new Error('Usage: live-trial agent-sell-liquidity [--resume-entries] (set LIVE_DRY_RUN=true to simulate buys against the real chain)');
+}
+const trial = command === 'paper-trial' || live;
 const profile = trial ? process.argv[3] : null;
-const trialArgs = trial ? process.argv.slice(4) : [];
+const trialArgs = command === 'paper-trial' ? process.argv.slice(4) : [];
 const migratePolicy = trialArgs.includes('--migrate-exit-policy');
 if (trialArgs.length && !(profile === 'agent-sell-liquidity' && migratePolicy &&
     trialArgs.length === 2 && trialArgs.includes('--confirm-offline'))) {
   throw new Error('Usage: paper-trial <profile> OR paper-trial agent-sell-liquidity --migrate-exit-policy --confirm-offline (stop all trial processes first)');
 }
-if (trial) cfg.db = trialPath(profile, process.env.PAPER_TRIAL_DIR, cfg.db);
+const settings = live ? liveSettings(process.env) : null;
+// Validated before any database is opened; the secret is never logged or stored.
+const wallet = live ? loadWallet(process.env.AS_WALLET_SECRET) : null;
+if (live && !cfg.key) throw new Error('HELIUS_API_KEY is required for live trading');
+if (live) cfg.db = livePath(settings.dryRun, process.env.LIVE_TRIAL_DIR, cfg.db);
+else if (trial) cfg.db = trialPath(profile, process.env.PAPER_TRIAL_DIR, cfg.db);
 cfg.paperMode = command === 'paper' || trial;
-const paperCfg = cfg.paperMode || command === 'paper-report' ? paperConfig(process.env, profile) : null;
+// The trial identity holds strategy assumptions only; wallet floor and loss limits are runtime settings.
+const paperCfg = live ? liveConfig(process.env) :
+  cfg.paperMode || command === 'paper-report' ? paperConfig(process.env, profile) : null;
+const engineCfg = live ? { ...paperCfg, live: { minWalletLamports: String(settings.minWalletLamports),
+  maxLossLamports: String(settings.maxLossLamports), perTradeReserveLamports: String(settings.perTradeReserveLamports),
+  exitSlippageBps: settings.exitSlippageBps } } : paperCfg;
 if (trial && !migratePolicy) preflightTrial(cfg.db, paperCfg);
 const store = migratePolicy ? null : new Store(cfg.db, cfg);
 
@@ -47,10 +64,28 @@ async function inspect(rpc, mint) {
   }, null, 2));
 }
 
-async function start(rpc) {
+async function startLive() {
+  // Wallet and API key are read here only, and never logged or stored.
+  const executor = new LiveExecutor({ wallet, apiKey: cfg.key, settings });
+  try {
+    await executor.init();
+    console.log(JSON.stringify({ event: 'live_wallet', wallet: executor.owner, dryRun: settings.dryRun, database: cfg.db,
+      minWalletLamports: String(settings.minWalletLamports), maxLossLamports: String(settings.maxLossLamports) }));
+    await start(new Rpc(cfg, store), executor);
+  } finally { executor.stop(); }
+}
+
+async function start(rpc, executor = null) {
   if (trial) { new PaperStore(store, paperCfg); bindTrial(store, paperCfg); }
   else if (store.get("SELECT 1 FROM metadata WHERE key='paper_trial_config'")) {
     throw new Error('Trial database must be resumed with paper-trial and its original profile');
+  }
+  const tracker = cfg.paperMode
+    ? new PaperEngine(store, rpc, engineCfg, { project: projectTransaction, executor })
+    : new CandidateTracker(store, rpc);
+  // Wallet and database must agree before any session, feed or order starts.
+  if (executor) {
+    try { await tracker.liveStartupChecks({ resume: resumeEntries }); } catch (error) { rpc.stop(); throw error; }
   }
   const now = nowSeconds();
   store.run("INSERT OR IGNORE INTO metadata VALUES('monitoring_started_at',?)", String(now));
@@ -58,9 +93,6 @@ async function start(rpc) {
   if (lastHeartbeat < now - 5) store.coverage('process_gap', lastHeartbeat, `Restart at ${now}; backfill requested`);
   const session = store.coverage('session', now, 'Collector process heartbeat; not a guarantee of complete event coverage');
   if (!cfg.paperMode) store.activatePolicy(now);
-  const tracker = cfg.paperMode
-    ? new PaperEngine(store, rpc, paperCfg, { project: projectTransaction })
-    : new CandidateTracker(store, rpc);
   let stopping = false, stream = null, trackerStopped, stopError;
   // Every component that may already own sockets/timers is stopped, even if a later one failed to construct,
   // and one failing stop step (e.g. SQLite busy) never skips the others or escapes a signal listener.
@@ -97,7 +129,8 @@ async function start(rpc) {
     if (!stopping) stream.start();
     console.log(JSON.stringify({ event: 'started', database: cfg.db, firstCheckSeconds: cfg.firstCheck,
       recheckSeconds: cfg.recheck, horizonSeconds: cfg.horizon,
-      note: cfg.paperMode ? 'Paper trading only; no signing or transaction submission' : 'Read-only collector; no trading' }));
+      note: !executor ? (cfg.paperMode ? 'Paper trading only; no signing or transaction submission' : 'Read-only collector; no trading')
+        : settings.dryRun ? 'LIVE DRY RUN: buys simulated against mainnet, nothing broadcast' : 'LIVE TRADING: real transactions are signed and sent' }));
     paperWorker = cfg.paperMode ? (async () => {
       while (!stopping) { await tracker.tick(); if (!stopping) await sleep(100); }
     })().catch(error => { paperError = error; stop(); }) : Promise.resolve();
@@ -144,8 +177,9 @@ try {
     const saved = store.get("SELECT value FROM metadata WHERE key='paper_trial_config'")?.value;
     console.log(JSON.stringify(new PaperStore(store, saved ? JSON.parse(saved) : paperCfg).report(), null, 2));
   }
+  else if (live) await startLive();
   else if (command === 'start' || command === 'paper' || trial) await start(new Rpc(cfg, store));
-  else throw new Error('Commands: start, paper, paper-trial <profile>, paper-report, inspect <mint>, report');
+  else throw new Error('Commands: start, paper, paper-trial <profile>, live-trial agent-sell-liquidity, paper-report, inspect <mint>, report');
 } catch (error) {
   console.error(error.message);
   process.exitCode = 1;
