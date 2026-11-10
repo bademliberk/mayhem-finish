@@ -578,3 +578,24 @@ test('AS_PRIORITY_FEES_ENABLED=false prices at 1 microlamport, keeps the instruc
   assert.throws(() => liveSettings({ AS_PRIORITY_FEES_ENABLED: 'no' }), /AS_PRIORITY_FEES_ENABLED/);
   assert.throws(() => liveSettings({ AS_PRIORITY_FEES_ENABLED: 'false', AS_PRIORITY_MICROLAMPORTS: '5000' }), /cannot be set/);
 });
+
+test('a live stop-loss is a real full sale at a bounded fresh-quote minimum, never a modeled write-off', async () => {
+  const s = setup({ cfg: liveCfg({ stopLossBps: 2000, liquidityExitMultiple: 0 }) });
+  try {
+    s.ex.submitResult = bought();
+    await entry(s);
+    s.ex.tokens = 100000000n;
+    s.ex.submitResult = sold(3000000n, 100000000n);
+    s.engine.onAccount(mint, 21, account(40000000n, 47000000n));
+    assert.equal(s.engine.paper.watch(mint).reason, 'stop_loss');
+    const sell = s.engine.paper.pending()[0];
+    assert.equal(sell?.reason, 'stop_loss', 'a stop-loss sell order is requested');
+    s.rpc.accounts = async () => ({ context: { slot: 21 }, value: [account(40000000n, 47000000n)] });
+    await s.engine.reconcile(sell);
+    const call = s.ex.calls.find(c => c[0] === 'prepareSell');
+    assert.ok(call, 'a real sell was built');
+    assert.deepEqual(call.slice(2, 6), [100000000n, null, true, 2000]);
+    assert.equal(position(s), undefined);
+    assert.equal(s.store.get("SELECT reason FROM paper_orders WHERE side='sell' ORDER BY id DESC LIMIT 1").reason, 'stop_loss');
+  } finally { s.close(); }
+});
