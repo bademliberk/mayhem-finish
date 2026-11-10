@@ -3,10 +3,10 @@ import { agentSellEvents } from './chain.js';
 import { LookupCache } from './paper-lookups.js';
 import { PaperStore } from './paper-store.js';
 import { transactionFailure, readOrderDiagnostics } from './paper-diagnostics.js';
-import { reserves, cap, entryQuote, entryQuality, exitQuote, terminalExitQuote, writeOffQuote, liquidityRisk, liquidityBudget, budgetCapped, profitable, meetsDrop, higher } from './paper-math.js';
+import { reserves, cap, entryQuote, entryQuality, exitQuote, terminalExitQuote, writeOffQuote, liquidityRisk, stopLoss, liquidityBudget, budgetCapped, profitable, meetsDrop, higher } from './paper-math.js';
 
-const mandatoryExit = reason => ['floor', 'liquidity_risk', 'timeout'].includes(reason);
-const exitPriority = reason => ({ profit: 0, liquidity_risk: 1, timeout: 2, floor: 3, graduated_no_amm_exit: 4 }[reason] ?? -1);
+const mandatoryExit = reason => ['floor', 'stop_loss', 'liquidity_risk', 'timeout'].includes(reason);
+const exitPriority = reason => ({ profit: 0, stop_loss: 1, liquidity_risk: 2, timeout: 3, floor: 4, graduated_no_amm_exit: 5 }[reason] ?? -1);
 
 function validateAccount(account) {
   if (!account) return { code: 'missing_account' };
@@ -357,6 +357,8 @@ export class PaperEngine {
     if (this.agentMode && (watch.reason === 'timeout' || this.timeoutDue(position))) return 'timeout';
     if (!this.agentMode && (watch.reason === 'floor' || cap(state) <= this.cfg.floorCap)) return 'floor';
     if (watch.reason === 'liquidity_risk' || liquidityRisk(state, position, this.cfg)) return 'liquidity_risk';
+    // A triggered stop is latched like the other mandatory exits: a later bounce does not cancel it.
+    if (this.agentMode && (watch.reason === 'stop_loss' || stopLoss(state, position, this.cfg))) return 'stop_loss';
     return null;
   }
   latchExit(mint, reason) {

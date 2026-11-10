@@ -27,6 +27,17 @@ export function liquidityRisk(state, position, cfg) {
   return cfg.liquidityExitEnabled === true && !state.complete &&
     state.realSol <= BigInt(cfg.liquidityExitMultiple ?? 2) * fullSaleGross(state, BigInt(position.tokens_raw));
 }
+// Stop-loss: the full-sale net (after swap and network fees) has fallen to entry cost × (1 − stopLossBps).
+// Off unless cfg.stopLossBps is set. An unquotable full sale (no output after fees, or more than the curve's
+// real SOL) is at least as bad as any stop, so it triggers too.
+export function stopLoss(state, position, cfg) {
+  if (!cfg.stopLossBps || state.complete) return false;
+  let net;
+  // Only the sale math decides, never market cap or other fields: an unrelated error must not trigger a stop.
+  try { net = sell(state, BigInt(position.tokens_raw), cfg.swapFeeBps).net - BigInt(cfg.networkFeeLamports); }
+  catch (error) { return ['insufficient_real_liquidity', 'fees_exceed_output'].includes(error.message); }
+  return net * BPS <= BigInt(position.entry_cost_lamports) * (BPS - BigInt(cfg.stopLossBps));
+}
 export function sell(state, tokens, feeBps) {
   const gross = fullSaleGross(state, tokens);
   if (gross <= 0n || gross > state.realSol) throw new Error('insufficient_real_liquidity');

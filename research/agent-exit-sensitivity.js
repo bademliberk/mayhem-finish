@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { resolve, join } from 'node:path';
 import { paperConfig } from '../src/paper-store.js';
-import { liquidityBudget, buyBudget, entryQuality, liquidityRisk, sell, profitable,
+import { liquidityBudget, buyBudget, entryQuality, liquidityRisk, stopLoss, sell, profitable,
   terminalExitQuote } from '../src/paper-math.js';
 
 const FIELDS = ['vs', 'vt', 'rs', 'rt'];
@@ -38,6 +38,11 @@ export function variants(cfg, suite = 'exits') {
     const targets = suite === 'lower-tp' ? [1500, 2000, 2500] : [4000, 5000, 6000];
     return { baseline: { ...cfg }, ...Object.fromEntries(targets.map(profitBps =>
       [`tp${profitBps / 100}`, { ...cfg, profitBps }])) };
+  }
+  if (suite === 'stop-loss') {
+    // Each arm changes one thing from the live config: TP 60%, SL 60%, then both together.
+    return { baseline: { ...cfg }, tp60: { ...cfg, profitBps: 6000 }, sl60: { ...cfg, stopLossBps: 6000 },
+      tp60sl60: { ...cfg, profitBps: 6000, stopLossBps: 6000 } };
   }
   if (suite === 'loss-multiplier') return { baseline: { ...cfg }, lossMultiplier: { ...cfg } };
   if (suite === 'gradual-multiplier') return { baseline: { ...cfg }, lossMultiplier: { ...cfg }, gradualMultiplier: { ...cfg } };
@@ -175,14 +180,14 @@ export function simulate(tape, cfg, delaySlots = 1, continuity = 'strict', optio
   const used = new Set(), lastObservation = new Map();
   let candidates = 0, acceptedSignals = 0, peakExposure = 0n;
   const exitWindowSlots = 4;
+  let censoredCost = 0n;
   const exposure = () => {
-    const total = [...holdings.values()].reduce((n, p) => n + BigInt(p.entry_cost_lamports), 0n) +
-      records.filter(p => p.status === 'censored').reduce((n, p) => n + BigInt(p.entry_cost_lamports), 0n) +
+    const total = [...holdings.values()].reduce((n, p) => n + BigInt(p.entry_cost_lamports), 0n) + censoredCost +
       [...pending.values()].reduce((n, p) => n + p.budget + BigInt(cfg.networkFeeLamports), 0n);
     if (total > peakExposure) peakExposure = total;
   };
   const censor = (p, reason, slot) => {
-    p.status = 'censored'; p.censorReason = reason; p.censorSlot = slot;
+    p.status = 'censored'; p.censorReason = reason; p.censorSlot = slot; censoredCost += BigInt(p.entry_cost_lamports);
     holdings.delete(p.mint); records.push(p);
   };
   const request = (p, reason, slot, observation, quote = null) => {
@@ -224,7 +229,28 @@ export function simulate(tape, cfg, delaySlots = 1, continuity = 'strict', optio
         if (p.intent) p.intent.reason = 'timeout';
         else request(p, 'timeout', p.deadline, lastObservation.get(p.mint));
       }
-      if (p.intent && slot > p.intent.expires) censor(p, 'exit_observation_missing', slot);
+      if (p.intent && slot > p.intent.expires) {
+        // quietExit mirrors the live v3 engine: a covered curve with no trades has unchanged reserves, so the exit
+        // fills at the last observed state. Off by default; the strict study keeps these outcomes unknown.
+        const last = options.quietExit ? lastObservation.get(p.mint) : null;
+        // Beyond a mint's recorded horizon, missing trades mean the tape ended, not a quiet curve (~0.4 s per slot).
+        const horizon = options.horizonBt?.[p.mint];
+        const withinTape = last && (horizon == null || last.bt + Math.ceil((slot - last.slot) * 0.4) <= horizon);
+        let filled = false;
+        if (withinTape && last.vs_after && last.vt_after && last.rt_after && last.mayhem === true) {
+          try {
+            const state = stateOf(last);
+            if (p.intent.reason !== 'profit') { finish(p, terminalExitQuote(state, p, cfg), last); filled = true; }
+            else {
+              const q = strictQuote(state, p, cfg);
+              if (profitable(q, p, cfg)) { finish(p, q, last); filled = true; }
+              else { p.intent = null; filled = true; }
+            }
+          } catch { /* fall through to censoring */ }
+        }
+        if (!filled) censor(p, 'exit_observation_missing', slot);
+        else if (p.status === 'resolved') { p.quietExit = true; continue; }
+      }
     }
     const txs = tape.slots.get(slot) ?? [];
     const signals = new Map();
@@ -287,9 +313,11 @@ export function simulate(tape, cfg, delaySlots = 1, continuity = 'strict', optio
       }
       if (p) {
         const state = stateOf(e);
-        // A newly observed mandatory condition outranks a discretionary pending sale.
-        if (p.intent?.reason === 'profit' && liquidityRisk(state, p, cfg)) {
+        // A newly observed mandatory condition outranks a discretionary pending sale (and a stop yields to liquidity risk).
+        if (['profit', 'stop_loss'].includes(p.intent?.reason) && liquidityRisk(state, p, cfg)) {
           request(p, 'liquidity_risk', slot, e);
+        } else if (p.intent?.reason === 'profit' && stopLoss(state, p, cfg)) {
+          request(p, 'stop_loss', slot, e);
         }
         if (p.intent && slot >= p.intent.target) {
           const anchor = p.intent.observation;
@@ -314,7 +342,9 @@ export function simulate(tape, cfg, delaySlots = 1, continuity = 'strict', optio
             if (!p.intent) request(p, 'timeout', p.deadline, e);
             else p.intent.reason = 'timeout';
           } else if (liquidityRisk(state, p, cfg)) {
-            if (!p.intent || p.intent.reason === 'profit') request(p, 'liquidity_risk', slot, e);
+            if (!p.intent || ['profit', 'stop_loss'].includes(p.intent.reason)) request(p, 'liquidity_risk', slot, e);
+          } else if (stopLoss(state, p, cfg)) {
+            if (!p.intent || p.intent.reason === 'profit') request(p, 'stop_loss', slot, e);
           } else if (!p.intent) {
             try { const q = strictQuote(state, p, cfg);
               if (profitable(q, p, cfg)) request(p, 'profit', slot, e, q);
@@ -481,7 +511,7 @@ function sizingMarkdown(result) {
 }
 export function markdown(result) {
   if (['loss-multiplier', 'gradual-multiplier', 'multiplier-factors'].includes(result.suite)) return sizingMarkdown(result);
-  const lines = [result.suite === 'lower-tp' ? '# Lower Take Profit Sensitivity' : result.suite === 'take-profit' ? '# Take Profit Sensitivity' : '# Earlier Exit Sensitivity', '', '**Exploratory observed-state quotes, not strategy P&L or a deployment recommendation.**', '',
+  const lines = [result.suite === 'stop-loss' ? '# Stop-Loss and Take-Profit Sensitivity' : result.suite === 'lower-tp' ? '# Lower Take Profit Sensitivity' : result.suite === 'take-profit' ? '# Take Profit Sensitivity' : '# Earlier Exit Sensitivity', '', '**Exploratory observed-state quotes, not strategy P&L or a deployment recommendation.**', '',
     `Source SHA-256: ${result.sourceSha256 ?? 'fixture'}`, '',
     `${result.audit.events} events; ${result.audit.mints} mints; ${result.audit.agentSells} agent sells; ${result.audit.discontinuities} reserve discontinuities.`, '',
     `${result.audit.virtualSolOnlyDiscontinuities ?? 0} discontinuities affect virtual SOL only; ${result.audit.nonVirtualSolDiscontinuities ?? 0} affect other reserve fields. Before-reserves are reconstructed from trade amounts, so discontinuities do not by themselves prove missing transactions.`, ''];
@@ -501,7 +531,7 @@ export function markdown(result) {
       lines.push(`### ${name}`, '',
         `- Entry round-trip loss: ${losses.length ? `${losses[0] / 100}%–${losses.at(-1) / 100}%` : 'N/A'}`,
         `- Matched improved/worsened/unchanged: ${comparison ? `${comparison.better}/${comparison.worse}/${comparison.unchanged}` : 'control'}`,
-        `- TP: ${arm.cfg.profitBps / 100}% net; hold: ${arm.cfg.holdSlots} slots; liquidity guard: ${arm.cfg.liquidityExitMultiple}×`,
+        `- TP: ${arm.cfg.profitBps / 100}% net; SL: ${arm.cfg.stopLossBps ? `-${arm.cfg.stopLossBps / 100}% net` : 'off'}; hold: ${arm.cfg.holdSlots} slots; liquidity guard: ${arm.cfg.liquidityExitMultiple}×`,
         `- Baseline profit exits become: ${comparison ? JSON.stringify(comparison.baselineProfitTransitions) : 'control'}`,
         `- Exit reasons: ${JSON.stringify(arm.exitReasons)}`,
         `- Coverage exclusions: ${JSON.stringify(censored)}`, `- Signal/fill exclusions: ${JSON.stringify(arm.rejections)}`, '');
@@ -514,7 +544,7 @@ export function markdown(result) {
 
 async function main() {
   const [input, output, suite = 'exits'] = process.argv.slice(2);
-  if (!input || !output) throw new Error('Usage: node --env-file=.env research/agent-exit-sensitivity.js INPUT NEW_OUTPUT_DIRECTORY [exits|take-profit|lower-tp|loss-multiplier|gradual-multiplier|multiplier-factors]');
+  if (!input || !output) throw new Error('Usage: node --env-file=.env research/agent-exit-sensitivity.js INPUT NEW_OUTPUT_DIRECTORY [exits|take-profit|lower-tp|stop-loss|loss-multiplier|gradual-multiplier|multiplier-factors]');
   const text = await readFile(resolve(input), 'utf8');
   const result = study(JSON.parse(text), paperConfig(process.env, 'agent-sell-liquidity'), suite);
   result.sourcePath = resolve(input); result.sourceSha256 = createHash('sha256').update(text).digest('hex');

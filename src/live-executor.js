@@ -43,6 +43,13 @@ const num = (env, name, fallback, min, max) => {
   if (!Number.isFinite(value) || value < min || value > max) throw new Error(`Invalid ${name}`);
   return value;
 };
+const flag = (env, name, fallback) => {
+  const raw = String(env[name] ?? '').trim().toLowerCase();
+  if (raw === '') return fallback;
+  if (raw === 'true' || raw === '1') return true;
+  if (raw === 'false' || raw === '0') return false;
+  throw new Error(`Invalid ${name}`);
+};
 /** Nonsecret execution settings; shared env names with the auto-sell bot. */
 export function liveSettings(env = process.env) {
   const dry = String(env.LIVE_DRY_RUN ?? '').trim().toLowerCase();
@@ -52,7 +59,15 @@ export function liveSettings(env = process.env) {
     senderUrl: String(env.AS_SENDER_URL ?? '').trim() || 'auto',
     tipLamports: Math.round(num(env, 'AS_TIP_SOL', 0.000005, 0, 0.01) * 1e9),
     // Fixed price when set; otherwise a Helius estimate for the curve's accounts at AS_PRIORITY_LEVEL, capped.
-    priorityMicroLamports: String(env.AS_PRIORITY_MICROLAMPORTS ?? '').trim() === '' ? null
+    // AS_PRIORITY_FEES_ENABLED=false: no estimate calls and a 1-microlamport price (under 1 lamport per transaction).
+    // The compute-unit price instruction stays, because Helius Sender rejects transactions without one.
+    priorityFeesEnabled: flag(env, 'AS_PRIORITY_FEES_ENABLED', true),
+    priorityMicroLamports: !flag(env, 'AS_PRIORITY_FEES_ENABLED', true) ? (() => {
+      if (String(env.AS_PRIORITY_MICROLAMPORTS ?? '').trim() !== '') {
+        throw new Error('AS_PRIORITY_MICROLAMPORTS cannot be set when AS_PRIORITY_FEES_ENABLED=false');
+      }
+      return 1;
+    })() : String(env.AS_PRIORITY_MICROLAMPORTS ?? '').trim() === '' ? null
       : num(env, 'AS_PRIORITY_MICROLAMPORTS', 0, 0, 10_000_000),
     priorityLevel: (() => {
       const level = String(env.AS_PRIORITY_LEVEL ?? '').trim() || 'High';

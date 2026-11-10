@@ -52,6 +52,9 @@ export function paperConfig(env = process.env, profile = null) {
       profitBps: number('PAPER_AGENT_PROFIT_BPS', 3000, 0, 100000),
       liquidityExitMultiple: number('PAPER_AGENT_EXIT_MULTIPLE', 2, 0, 100),
       swapFeeBps: number('PAPER_SWAP_FEE_BPS', 125, 0, 2000),
+      // Opt-in stop-loss on the full-sale net: 6000 = exit once the position is worth 60% less than it cost.
+      // Omitted when unset or 0 so existing trial identities are unchanged.
+      ...(() => { const bps = number('PAPER_AGENT_STOP_LOSS_BPS', 0, 0, 9999); return bps ? { stopLossBps: bps } : {}; })(),
       // Opt-in: skip entries whose fraction-based budget would reach PAPER_AGENT_MAX_SWAP_LAMPORTS.
       // Omitted when off so existing trial identities are unchanged.
       ...(flag('PAPER_AGENT_SKIP_CAPPED') ? { skipCappedEntries: true } : {}),

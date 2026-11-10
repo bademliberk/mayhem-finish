@@ -564,3 +564,17 @@ test('a halt persists across restarts until explicitly resumed, and repeated exi
     assert.equal(s.logs.filter(l => l.event === 'live_manual_action' && l.reason === 'exit_failing').length, 1);
   } finally { s.close(); }
 });
+
+test('AS_PRIORITY_FEES_ENABLED=false prices at 1 microlamport, keeps the instruction and never estimates', async () => {
+  const off = await sdkExecutor({ AS_PRIORITY_FEES_ENABLED: 'false' }, { getPriorityFeeEstimate: { priorityFeeEstimate: 500000 } });
+  assert.equal(off.ex.settings.priorityFeesEnabled, false);
+  await off.ex.refreshPriority();
+  const tx = decoded(await off.ex.prepareBuy(mint, 4800000n, 500));
+  assert.equal(tx.price, 1n, 'compute-unit price instruction present at 1 microlamport');
+  assert.deepEqual(off.methods, [], 'no fee-estimate call');
+  assert.equal(off.ex.maxOverheadLamports('buy'), 5000n + 5000n + 1n);
+  assert.equal(liveSettings({}).priorityFeesEnabled, true);
+  assert.equal(liveSettings({ AS_PRIORITY_FEES_ENABLED: '' }).priorityMicroLamports, null);
+  assert.throws(() => liveSettings({ AS_PRIORITY_FEES_ENABLED: 'no' }), /AS_PRIORITY_FEES_ENABLED/);
+  assert.throws(() => liveSettings({ AS_PRIORITY_FEES_ENABLED: 'false', AS_PRIORITY_MICROLAMPORTS: '5000' }), /cannot be set/);
+});

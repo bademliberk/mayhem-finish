@@ -10,7 +10,7 @@ import { PUMP, MAYHEM } from '../src/config.js';
 import { Store } from '../src/store.js';
 import { PaperEngine } from '../src/paper-engine.js';
 import { PaperStore, paperConfig } from '../src/paper-store.js';
-import { reserves, liquidityBudget, entryQuote, entryQuality, terminalExitQuote, writeOffQuote, fullSaleGross } from '../src/paper-math.js';
+import { reserves, liquidityBudget, entryQuote, entryQuality, terminalExitQuote, writeOffQuote, fullSaleGross, exitQuote } from '../src/paper-math.js';
 import { trialIdentity, bindTrial, preflightTrial } from '../src/paper-profiles.js';
 
 const key = n => new PublicKey(Buffer.alloc(32, n)).toBase58();
@@ -1123,4 +1123,62 @@ test('PAPER_AGENT_SKIP_CAPPED skips entries whose budget reaches the swap cap an
       if (entered) assert.ok(BigInt(JSON.parse(pending(s).quote_json).requestedBudgetLamports) <= 10000000n);
     } finally { s.close(); }
   }
+});
+
+test('PAPER_AGENT_STOP_LOSS_BPS is opt-in and changes trial identity only when set', () => {
+  assert.equal(paperConfig({ PAPER_AGENT_STOP_LOSS_BPS: '6000' }, 'agent-sell-liquidity').stopLossBps, 6000);
+  for (const value of [undefined, '', '0']) {
+    assert.equal(trialIdentity(paperConfig(value === undefined ? {} : { PAPER_AGENT_STOP_LOSS_BPS: value }, 'agent-sell-liquidity')), trialIdentity(config));
+  }
+  for (const value of ['10000', '-1', '1.5', 'x']) assert.throws(() => paperConfig({ PAPER_AGENT_STOP_LOSS_BPS: value }, 'agent-sell-liquidity'), /PAPER_AGENT_STOP_LOSS_BPS/);
+  assert.equal(paperConfig({ PAPER_AGENT_STOP_LOSS_BPS: '6000' }).stopLossBps, undefined, 'legacy profiles ignore it');
+});
+
+test('stop-loss latches below -60% net, outranks profit, yields to liquidity risk and timeout, and survives a bounce', async () => {
+  const s = setup({ stopLossBps: 6000, liquidityExitMultiple: 0 }); try {
+    await buy(s); const cost = BigInt(position(s).entry_cost_lamports);
+    // Price down to about a third: full-sale net well under 40% of cost (real SOL kept high so liquidity risk is off).
+    const crashed = account(40000000n, 47000000n);
+    const q = exitQuote(reserves(crashed), position(s), { ...config });
+    assert.ok(BigInt(q.net) * 10000n <= cost * 4000n, 'fixture is beyond the stop');
+    s.engine.onAccount(mint, 21, crashed); s.snapshot(crashed, 21);
+    assert.equal(watch(s).status, 'exit_blocked'); assert.equal(watch(s).reason, 'stop_loss');
+    assert.equal(pending(s).reason, 'stop_loss');
+    // A bounce before the sale does not cancel the latched stop.
+    s.engine.onAccount(mint, 22, account()); assert.equal(watch(s).reason, 'stop_loss');
+    s.snapshot(crashed, 22); await s.engine.reconcile(pending(s));
+    assert.equal(position(s), undefined);
+    const exit = s.store.get("SELECT reason FROM paper_orders WHERE side='sell' ORDER BY id DESC LIMIT 1");
+    assert.equal(exit.reason, 'stop_loss');
+  } finally { s.close(); }
+  // A drop smaller than the stop does nothing.
+  const t = setup({ stopLossBps: 6000, liquidityExitMultiple: 0 }); try {
+    await buy(t); t.engine.onAccount(mint, 21, account(40000000n, 120000000n));
+    assert.equal(watch(t).reason, null); assert.equal(pending(t), undefined);
+  } finally { t.close(); }
+  // Timeout outranks a latched stop.
+  const u = setup({ stopLossBps: 6000, liquidityExitMultiple: 0, holdSlots: 3 }); try {
+    await buy(u); u.engine.onAccount(mint, 21, account(40000000n, 47000000n));
+    assert.equal(watch(u).reason, 'stop_loss');
+    u.engine.onSlot(23); assert.equal(watch(u).reason, 'timeout');
+  } finally { u.close(); }
+});
+
+test('without a configured stop-loss, the same crash keeps the existing behavior', async () => {
+  const s = setup({ liquidityExitMultiple: 0 }); try {
+    await buy(s); s.engine.onAccount(mint, 21, account(40000000n, 47000000n));
+    assert.equal(watch(s).reason, null); assert.equal(pending(s), undefined);
+  } finally { s.close(); }
+});
+
+test('stopLoss decides only on sale math: states without supply or unrelated fields never trigger it', async () => {
+  const { stopLoss } = await import('../src/paper-math.js');
+  const cfg = { ...config, stopLossBps: 6000 };
+  const position = { tokens_raw: '1000000000', entry_cost_lamports: '30000' };
+  const healthy = { virtualSol: 30000000000n, virtualTokens: 1000000000000000n, realSol: 40000000n, realTokens: 800000000000000n, complete: false };
+  assert.equal(stopLoss(healthy, position, cfg), false, 'no supply field: still evaluated on the sale, not triggered');
+  assert.equal(stopLoss(healthy, { ...position, entry_cost_lamports: '1000000' }, cfg), true, 'worth far less than cost');
+  assert.equal(stopLoss({ ...healthy, realSol: 1n }, position, cfg), true, 'curve cannot pay: triggers');
+  assert.equal(stopLoss(healthy, { ...position, entry_cost_lamports: '1000000' }, { ...config }), false, 'off when unset');
+  assert.equal(stopLoss({ ...healthy, complete: true }, position, cfg), false, 'graduation is handled separately');
 });

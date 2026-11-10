@@ -497,3 +497,27 @@ test('study is deterministic and contains separate delay assumptions and censore
   assert.equal(a.runs.delay2.arms.baseline.records[0].entrySlot, 2);
   assert.equal(a.runs.delay1.comparisons.hold40.pairs, 1);
 });
+
+test('stop-loss suite: a -60% crash exits at the next observation instead of riding to the timeout', () => {
+  // Price falls to a quarter at slot 3 (virtual SOL down, so liquidity risk stays off) and never recovers.
+  const events = tape(Array.from({ length: 96 }, (_, slot) => ({ slot,
+    ...(slot === 3 ? { reserves: { vs: 250000000 } } : {}) })));
+  const results = study(events, { ...cfg, liquidityExitMultiple: 0 }, 'stop-loss').runs.delay1;
+  assert.equal(results.arms.baseline.records[0].exitReason, 'timeout');
+  for (const name of ['sl60', 'tp60sl60']) {
+    const p = results.arms[name].records[0];
+    assert.equal(p.exitReason, 'stop_loss'); assert.equal(p.exitSlot, 4, 'one-slot execution delay');
+    assert.ok(BigInt(p.quoteProxyLamports) * 10000n <= -BigInt(p.entry_cost_lamports) * 6000n);
+  }
+  assert.equal(results.arms.tp60.records[0].exitReason, 'timeout');
+  assert.deepEqual(Object.keys(results.arms), ['baseline', 'tp60', 'sl60', 'tp60sl60']);
+  assert.equal(results.arms.sl60.cfg.stopLossBps, 6000); assert.equal(results.arms.tp60.cfg.profitBps, 6000);
+  assert.equal(results.arms.baseline.cfg.stopLossBps, undefined);
+});
+
+test('stop-loss suite: a smaller drop does not trigger the stop', () => {
+  const events = tape(Array.from({ length: 96 }, (_, slot) => ({ slot,
+    ...(slot === 3 ? { reserves: { vs: 700000000 } } : {}) })));
+  const results = study(events, { ...cfg, liquidityExitMultiple: 0 }, 'stop-loss').runs.delay1;
+  assert.equal(results.arms.sl60.records[0].exitReason, 'timeout');
+});

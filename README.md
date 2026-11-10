@@ -214,6 +214,7 @@ budget = min(maxSwapBudgetLamports, eventRealSolLamports * fractionBps / 10000)
 | Open entry cost plus pending-buy reservations | 0.05 SOL | `PAPER_AGENT_MAX_EXPOSURE_LAMPORTS=50000000` |
 | Holding deadline from confirmed entry-fill snapshot | 80 slots | `PAPER_AGENT_HOLD_SLOTS=80` |
 | Net profit target | +30% | `PAPER_AGENT_PROFIT_BPS=3000` |
+| Stop-loss on full-sale net (opt-in) | off | `PAPER_AGENT_STOP_LOSS_BPS=6000` |
 | Full-sale gross liquidity-risk multiple | 2× | `PAPER_AGENT_EXIT_MULTIPLE=2` |
 | Modeled swap fee | 125 bps | `PAPER_SWAP_FEE_BPS=125` |
 
@@ -324,7 +325,7 @@ Live behaviour:
 - **Settlement from chain only.** A transaction's signature is saved before it is sent. A send that is not seen in time stays pending (`live_unknown`); gaps, restarts and shutdowns never cancel it. It is resolved from chain on later ticks and dropped only once its blockhash can no longer land. A confirmed fill is always recorded, even past the modeled exposure cap.
 - **Costs.** Entry cost and exit proceeds are the wallet's SOL change, excluding the refundable token-account rent, so PnL and the profit target compare like with like. Tip, priority and base fees are included.
 - **Buy cost.** The buy budget is a hard cap on swap SOL. `PAPER_BUY_SLIPPAGE_BPS` is taken as fewer tokens than quoted, never as more SOL; past that tolerance the program rejects the buy.
-- **Priority fee.** By default, a Helius estimate for Pump program traffic, refreshed every 5 s in the background (estimates older than 60 s fall back to the floor), at `AS_PRIORITY_LEVEL` (default `High`), clamped between `AS_MIN_PRIORITY_MICROLAMPORTS` and `AS_MAX_PRIORITY_MICROLAMPORTS`. Set `AS_PRIORITY_MICROLAMPORTS` for a fixed price.
+- **Priority fee.** By default, a Helius estimate for Pump program traffic, refreshed every 5 s in the background (estimates older than 60 s fall back to the floor), at `AS_PRIORITY_LEVEL` (default `High`), clamped between `AS_MIN_PRIORITY_MICROLAMPORTS` and `AS_MAX_PRIORITY_MICROLAMPORTS`. Set `AS_PRIORITY_MICROLAMPORTS` for a fixed price. `AS_PRIORITY_FEES_ENABLED=false` turns priority fees off: the price drops to 1 microlamport (under 1 lamport per transaction) and no estimates are requested. The price instruction stays, because Sender rejects transactions without one. Expect buys to land later in busy blocks.
 - **Risk limits.** Entries halt when the wallet would drop below `LIVE_MIN_WALLET_SOL`. No buy is sent if realized loss, plus all open entry costs, plus the new buy, plus worst-case fees for the buy and every exit, could exceed `LIVE_MAX_LOSS_SOL`. Only one live buy is in flight at a time. Open positions keep exiting after a halt.
 - **Exits.** Timeout and liquidity-risk exits sell at a fresh quote less `LIVE_EXIT_SLIPPAGE_BPS`, never at an unbounded zero minimum. Failed exits back off (2 s doubling to 60 s). Only the tokens the trial bought are sold.
 - **Halts persist.** A halt (wallet floor, loss limit, missing tokens, failed recording, 10 failed exits on one mint) is saved in the database and survives restarts. Clear it with `npm run live:trial -- --resume-entries` once you have checked the cause.
