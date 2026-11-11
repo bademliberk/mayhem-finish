@@ -803,8 +803,10 @@ export class PaperEngine {
       const payable = BigInt(modeled.soldTokens);
       if (payable > 0n && payable < tokens) { tokens = payable; close = false; }
     }
-    // Profit exits keep the modeled minimum; mandatory exits take a fresh quote with a wider tolerance.
-    const min = order.reason === 'profit' ? BigInt(modeled.net) * BigInt(10000 - this.cfg.sellSlippageBps) / 10000n : null;
+    // LIVE_FORCE_SELL: zero minimum, so the first sell lands whatever the price. Otherwise profit exits keep the
+    // modeled minimum and mandatory exits take a fresh quote with a wider tolerance.
+    const min = this.cfg.live.forceSell ? 0n
+      : order.reason === 'profit' ? BigInt(modeled.net) * BigInt(10000 - this.cfg.sellSlippageBps) / 10000n : null;
     return this.executor.prepareSell(order.mint, tokens, min !== null && min < 0n ? 0n : min, close, this.cfg.live.exitSlippageBps);
   }
   async liveFill(order, modeled, active, confirmed = null) {

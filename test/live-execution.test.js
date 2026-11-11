@@ -599,3 +599,29 @@ test('a live stop-loss is a real full sale at a bounded fresh-quote minimum, nev
     assert.equal(s.store.get("SELECT reason FROM paper_orders WHERE side='sell' ORDER BY id DESC LIMIT 1").reason, 'stop_loss');
   } finally { s.close(); }
 });
+
+test('LIVE_FORCE_SELL sends every exit, take-profit included, with a zero minimum', async () => {
+  assert.equal(liveSettings({}).forceSell, false);
+  assert.equal(liveSettings({ LIVE_FORCE_SELL: 'true' }).forceSell, true);
+  assert.throws(() => liveSettings({ LIVE_FORCE_SELL: 'yes' }), /LIVE_FORCE_SELL/);
+  const s = setup({ cfg: liveCfg({ live: { ...limits, forceSell: true } }) });
+  try {
+    s.ex.submitResult = bought();
+    await entry(s);
+    s.ex.tokens = 100000000n;
+    for (const reason of ['profit', 'timeout', 'stop_loss']) {
+      await s.engine.liveBuild({ id: 0, side: 'sell', mint, reason }, { net: '9000000' });
+      assert.equal(s.ex.calls.at(-1)[3], 0n, `${reason}: zero minimum`);
+    }
+  } finally { s.close(); }
+  const t = setup();
+  try {
+    t.ex.submitResult = bought();
+    await entry(t);
+    t.ex.tokens = 100000000n;
+    await t.engine.liveBuild({ id: 0, side: 'sell', mint, reason: 'profit' }, { net: '9000000' });
+    assert.equal(t.ex.calls.at(-1)[3], 8550000n, 'default: profit keeps the modeled minimum less 5%');
+    await t.engine.liveBuild({ id: 0, side: 'sell', mint, reason: 'timeout' }, { net: '0' });
+    assert.equal(t.ex.calls.at(-1)[3], null, 'default: forced exits use a fresh quote less LIVE_EXIT_SLIPPAGE_BPS');
+  } finally { t.close(); }
+});

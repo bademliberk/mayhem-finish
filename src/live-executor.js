@@ -86,6 +86,9 @@ export function liveSettings(env = process.env) {
     perTradeReserveLamports: Math.round(num(env, 'LIVE_TRADE_RESERVE_SOL', 0.003, 0, 1) * 1e9),
     // Minimum accepted on a mandatory (timeout / liquidity-risk) exit: fresh quote less this many bps.
     exitSlippageBps: num(env, 'LIVE_EXIT_SLIPPAGE_BPS', 2000, 0, 10000),
+    // Every sell (profit, stop-loss, timeout, liquidity) goes out with a zero minimum: it cannot fail on slippage,
+    // and it accepts whatever the curve pays when it lands, including a sandwich.
+    forceSell: flag(env, 'LIVE_FORCE_SELL', false),
   };
 }
 

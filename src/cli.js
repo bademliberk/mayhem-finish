@@ -45,7 +45,7 @@ const paperCfg = live ? liveConfig(process.env) :
   cfg.paperMode || command === 'paper-report' ? paperConfig(process.env, profile) : null;
 const engineCfg = live ? { ...paperCfg, live: { minWalletLamports: String(settings.minWalletLamports),
   maxLossLamports: String(settings.maxLossLamports), perTradeReserveLamports: String(settings.perTradeReserveLamports),
-  exitSlippageBps: settings.exitSlippageBps } } : paperCfg;
+  exitSlippageBps: settings.exitSlippageBps, forceSell: settings.forceSell } } : paperCfg;
 if (trial && !migratePolicy) preflightTrial(cfg.db, paperCfg);
 const store = migratePolicy ? null : new Store(cfg.db, cfg);
 
