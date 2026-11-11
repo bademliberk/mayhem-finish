@@ -48,7 +48,7 @@ const newPreprocessed = () => ({
 export class PaperFeeds {
   constructor(store, rpc, {
     onAccount = noop, onTransaction = noop, onGap = noop, onReady = noop, onSlot = noop, onCoverage = noop, onSubscriptionError = noop,
-    agentMode = false, onAgentTransaction = noop,
+    agentMode = false, onAgentTransaction = noop, commitment = 'confirmed',
     socketFactory = url => new WebSocket(url, { handshakeTimeout: 10000, maxPayload: MAX_FRAME_BYTES }),
     setTimer = setTimeout, clearTimer = clearTimeout, now = Date.now,
   } = {}) {
@@ -60,8 +60,9 @@ export class PaperFeeds {
     this.ackDeadlines = new Map(); this.slotWatchdog = null; this.lastSlot = -1;
     // Agent mode never derives beta credentials or opens the legacy transport.
     this.preprocessedUrl = this.agentMode ? null : preprocessedUrl(rpc.wsUrl);
+    this.commitment = commitment;
     this.agent = this.agentMode ? new PaperAgentFeed(store, rpc, {
-      socketFactory, setTimer, clearTimer, now,
+      socketFactory, setTimer, clearTimer, now, commitment,
       onTransaction: tx => { if (this.ready) this.safe('onAgentTransaction', tx); },
       onCoverage: () => { this.notifyCoverage(); this.checkReady(); },
       onGap: reason => {
@@ -226,7 +227,7 @@ export class PaperFeeds {
     const health = this.health.standard;
     health.update({ phase: 'connecting', attempts: health.value.attempts + 1, nextRetryAt: null });
     const socket = (() => {
-      try { return this.socketFactory(this.rpc.wsUrl, 'standard'); }
+      try { return this.socketFactory(this.rpc.tradingWsUrl ?? this.rpc.wsUrl, 'standard'); }
       catch (error) { health.failure('connect_failed', error); return null; }
     })();
     if (!socket) { this.markGap('standard_connect_failed'); this.schedule(link); return; }
@@ -361,7 +362,7 @@ export class PaperFeeds {
   }
   subscribe(watch) {
     if (watch.request != null || watch.subscription != null || watch.retry != null) return;
-    const id = this.send(this.standard, 'accountSubscribe', [watch.curve, { commitment: this.agentMode ? 'confirmed' : 'processed', encoding: 'base64' }]);
+    const id = this.send(this.standard, 'accountSubscribe', [watch.curve, { commitment: this.agentMode ? this.commitment : 'processed', encoding: 'base64' }]);
     if (id == null) return;
     watch.request = id; this.requests.set(id, watch);
     this.ackDeadlines.set(id, this.now() + ACK_TIMEOUT_MS);

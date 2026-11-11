@@ -45,7 +45,8 @@ const paperCfg = live ? liveConfig(process.env) :
   cfg.paperMode || command === 'paper-report' ? paperConfig(process.env, profile) : null;
 const engineCfg = live ? { ...paperCfg, live: { minWalletLamports: String(settings.minWalletLamports),
   maxLossLamports: String(settings.maxLossLamports), perTradeReserveLamports: String(settings.perTradeReserveLamports),
-  exitSlippageBps: settings.exitSlippageBps, forceSell: settings.forceSell } } : paperCfg;
+  exitSlippageBps: settings.exitSlippageBps, forceSell: settings.forceSell,
+  maxBuysInFlight: settings.maxBuysInFlight, checkBalancePerBuy: settings.checkBalancePerBuy } } : paperCfg;
 if (trial && !migratePolicy) preflightTrial(cfg.db, paperCfg);
 const store = migratePolicy ? null : new Store(cfg.db, cfg);
 
@@ -109,7 +110,7 @@ async function start(rpc, executor = null) {
   try {
     if (cfg.paperMode) {
       tracker.attach(new PaperFeeds(store, rpc, {
-        agentMode: paperCfg.strategy === 'agent-sell-liquidity',
+        agentMode: paperCfg.strategy === 'agent-sell-liquidity', commitment: paperCfg.feedCommitment ?? 'confirmed',
         onAgentTransaction: tx => tracker.agentTransaction(tx),
         onAccount: (...args) => tracker.onAccount(...args), onTransaction: raw => tracker.enqueue(raw),
         onGap: reason => tracker.gap(reason), onReady: () => tracker.onReady(), onSlot: slot => tracker.onSlot(slot),

@@ -89,6 +89,10 @@ export function liveSettings(env = process.env) {
     // Every sell (profit, stop-loss, timeout, liquidity) goes out with a zero minimum: it cannot fail on slippage,
     // and it accepts whatever the curve pays when it lands, including a sandwich.
     forceSell: flag(env, 'LIVE_FORCE_SELL', false),
+    // Buys allowed in flight at once (1 keeps wallet and exposure checks exact).
+    maxBuysInFlight: num(env, 'LIVE_MAX_BUYS_IN_FLIGHT', 1, 1, 4),
+    // false: no balance RPC per buy; a cached balance (refreshed every 5 s and after each fill) guards the floor instead.
+    checkBalancePerBuy: flag(env, 'LIVE_CHECK_BALANCE_PER_BUY', true),
   };
 }
 
@@ -148,6 +152,8 @@ export class LiveExecutor {
     this.senderUrl = url.toString();
     await Promise.all([this.refreshBlockhash(), this.refreshFees(), this.refreshPriority().catch(() => {})]);
     this.timers.push(setInterval(() => this.refreshPriority().catch(() => {}), 5_000));
+    await this.refreshBalance().catch(() => {});
+    this.timers.push(setInterval(() => this.refreshBalance().catch(() => {}), 5_000));
     this.timers.push(setInterval(() => this.refreshBlockhash().catch(() => {}), 10_000));
     this.timers.push(setInterval(() => this.refreshFees().catch(() => {}), 300_000));
     this.timers.push(setInterval(() => this.fetch(this.pingUrl).catch(() => {}), 5_000));
@@ -164,6 +170,9 @@ export class LiveExecutor {
   }
   /** Wallet SOL in lamports at confirmed commitment; throws on RPC failure. */
   async balance() { return BigInt(await this.conn.getBalance(this.user, 'confirmed')); }
+  /** Background balance, so a buy need not wait on a balance RPC. Stale after 15 s. */
+  async refreshBalance() { this.cachedBalance = { lamports: await this.balance(), at: Date.now() }; }
+  balanceCached() { return this.cachedBalance && Date.now() - this.cachedBalance.at <= 15_000 ? this.cachedBalance.lamports : null; }
   /** Raw token balance of our ATA for `mint`; 0 only when the account does not exist. Throws on RPC failure. */
   async tokenBalance(mint, tokenProgram) {
     const ata = getAssociatedTokenAddressSync(new PublicKey(mint), this.user, true, new PublicKey(tokenProgram));

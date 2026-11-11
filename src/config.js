@@ -25,6 +25,9 @@ export function config() {
   };
   return {
     key: env('HELIUS_API_KEY') ?? env('HELIUS_KEY'),
+    // Trading feeds' WebSocket host: 'mainnet' (default) or 'beta' (Helius Gatekeeper, beta). Discovery stays on mainnet.
+    wsHost: (() => { const h = (env('HELIUS_WS_HOST') ?? 'mainnet').trim().toLowerCase();
+      if (!['mainnet', 'beta'].includes(h)) throw new Error('Invalid HELIUS_WS_HOST (mainnet or beta)'); return h; })(),
     db: env('DB_PATH') ?? 'data/collector.sqlite',
     firstCheck: positive('FIRST_CHECK_SECONDS', 30),
     recheck: positive('RECHECK_SECONDS', 30),

@@ -25,7 +25,7 @@ export class PaperEngine {
     // Live mode: a real executor replaces the simulated fill. Orders in `submitted` may already be on-chain:
     // only chain results settle them, never gaps, stops, supersedes or TTLs.
     this.executor = executor; this.log = log; this.submitted = new Set(); this.liveHalted = null;
-    this.liveForeign = new Set(); this.liveExitFailures = new Map(); this.liveResolveAt = new Map(); this.liveBuying = null;
+    this.liveForeign = new Set(); this.liveExitFailures = new Map(); this.liveResolveAt = new Map(); this.liveBuying = new Set();
     const live = ['live', 'live_dry_run'].includes(cfg.mode);
     if (Boolean(executor) !== live) throw new Error('Live configurations require an executor, and an executor requires a live configuration');
     if (live && (cfg.strategy !== 'agent-sell-liquidity' || !cfg.live)) throw new Error('Live execution supports only agent-sell-liquidity with live limits');
@@ -253,7 +253,7 @@ export class PaperEngine {
     const { state, code, subtype } = validateAccount(account);
     if (code) { this.invalidateAccount(mint, slot, account, code, subtype); return; }
     try {
-      const row = { state, slot, at: this.now(), revision: ++this.observationRevision,
+      const row = { state, slot, at: this.now(), revision: ++this.observationRevision, account,
         since: old?.since ?? Math.max(slot, this.coverageSlots.get(mint) ?? slot), history: old?.history ?? [] };
       // Confirmation snapshots cannot authorize another exit attempt by themselves.
       row.exitRevision = source === 'rpc' ? old?.exitRevision : row.revision;
@@ -452,6 +452,11 @@ export class PaperEngine {
             ...Object.fromEntries(Object.entries(event.reserves).map(([key, value]) => [key, BigInt(value)])) };
           if (state.complete || state.realSol < BigInt(this.cfg.minRealSolLamports)) return reject('minimum_real_liquidity');
           if (this.cfg.skipCappedEntries && budgetCapped(state.realSol, this.cfg)) return reject('capped_budget_skipped');
+          if (this.cfg.minEntryMcSol != null || this.cfg.maxEntryMcSol != null) {
+            const mc = cap(state);
+            if (this.cfg.minEntryMcSol != null && mc < this.cfg.minEntryMcSol) return reject('mcap_below_band', { mc });
+            if (this.cfg.maxEntryMcSol != null && mc >= this.cfg.maxEntryMcSol) return reject('mcap_above_band', { mc });
+          }
           const budget = liquidityBudget(state.realSol, this.cfg);
           if (budget <= 0n) return reject('budget_too_small');
           const quote = entryQuote(state, this.cfg, budget);
@@ -589,11 +594,48 @@ export class PaperEngine {
     });
     return active.promise;
   }
+  /**
+   * Fast entry (live only): no getSignatureStatuses recheck and no confirmed curve refetch. The buy is quoted and
+   * built from the triggering sell event's post-trade reserves and sent at once; the 5% buy slippage limit is the
+   * guard against a stale price. Entry quality and the liquidity budget are still enforced.
+   */
+  async fastEntry(order, active) {
+    const predicted = JSON.parse(order.quote_json);
+    const watch = this.paper.watch(order.mint);
+    if (!this.ready || !this.cfg.entriesEnabled || watch.status !== 'watching' || !this.feeds.covers(order.mint)) {
+      this.cancel(order.id, this.now(), 'entries_paused'); return;
+    }
+    if (!this.agentFresh(order.mint, order.signal_slot)) { this.cancel(order.id, this.now(), 'coverage_or_state_stale'); return; }
+    const reference = predicted.referenceReserves;
+    const state = { ...this.states.get(order.mint).state,
+      ...Object.fromEntries(Object.entries(reference).map(([key, value]) => [key, BigInt(value)])) };
+    const budget = BigInt(predicted.requestedBudgetLamports);
+    const quote = entryQuote(state, this.cfg, budget);
+    quote.entryQuality = entryQuality(state, this.cfg, budget);
+    if (this.cfg.entryQualityEnabled && quote.entryQuality.rejection) { this.cancel(order.id, this.now(), quote.entryQuality.rejection); return; }
+    Object.assign(quote, { requestedBudgetLamports: budget.toString(), triggerRevision: predicted.triggerRevision,
+      eventIndex: predicted.eventIndex, referenceReserves: reference, slot: order.signal_slot, model: 'live_fast_entry_event_reserves' });
+    this.diagnose(order, { stage: 'ready_to_fill', requestedBudgetLamports: budget.toString(),
+      currentRealSolLamports: state.realSol.toString(), exposureLamports: this.paper.exposure().total.toString() });
+    if (!this.current(order, active)) return;
+    // The SDK quotes from a curve account; rebuild one from the event reserves on the cached account layout.
+    await this.liveFill(order, quote, active, this.eventCurveAccount(order.mint, reference));
+  }
+  /** The last observed curve account with its reserve fields replaced by the event's post-trade reserves. */
+  eventCurveAccount(mint, reserves) {
+    const account = this.states.get(mint)?.account;
+    if (!account) return null;
+    const bytes = Buffer.from(account.data[0], 'base64');
+    bytes.writeBigUInt64LE(BigInt(reserves.virtualTokens), 8); bytes.writeBigUInt64LE(BigInt(reserves.virtualSol), 16);
+    bytes.writeBigUInt64LE(BigInt(reserves.realTokens), 24); bytes.writeBigUInt64LE(BigInt(reserves.realSol), 32);
+    return { ...account, data: [bytes.toString('base64'), 'base64'] };
+  }
   async reconcileActive(order, active) {
     const { generation, controller } = active;
     try {
       let executedSlot = null;
       if (!this.current(order, active)) return;
+      if (this.executor && this.cfg.fastEntry && this.agentMode && order.side === 'buy') { await this.fastEntry(order, active); return; }
       if (order.signal_signature) {
         this.diagnose(order, { stage: 'status_pending', statusAttempts: (active.diagnostics.statusAttempts ?? 0) + 1 });
         active.waitKind = 'status'; active.waitAt = this.now();
@@ -812,11 +854,11 @@ export class PaperEngine {
   async liveFill(order, modeled, active, confirmed = null) {
     if (order.side === 'sell' && this.liveBackoff(order.mint)) { this.cancel(order.id, this.now(), 'live_exit_backoff'); return; }
     if (order.side === 'buy') {
-      if (this.liveBuying !== null) { this.cancel(order.id, this.now(), 'live_buy_in_flight'); return; }
-      this.liveBuying = order.id;
+      if (this.liveBuying.size >= (this.cfg.live.maxBuysInFlight ?? 1)) { this.cancel(order.id, this.now(), 'live_buy_in_flight'); return; }
+      this.liveBuying.add(order.id);
     }
     try { await this.liveFillUnlocked(order, modeled, active, confirmed); }
-    finally { if (this.liveBuying === order.id) this.liveBuying = null; }
+    finally { this.liveBuying.delete(order.id); }
   }
   async liveFillUnlocked(order, modeled, active, confirmed) {
     // Checks and the (send-free) build run together: every RPC here delays the send inside a ~5-slot signal window.
@@ -969,17 +1011,32 @@ export class PaperEngine {
   async liveBuyBlocked(order, budget) {
     if (this.liveHalted) return `live_halted_${this.liveHalted}`;
     if (this.liveForeign.has(order.mint)) return 'live_foreign_holding';
-    // One live buy at a time keeps wallet-balance and exposure checks exact.
-    if (this.liveBuying !== null && this.liveBuying !== order.id) return 'live_buy_in_flight';
-    for (const id of this.submitted) if (this.store.get('SELECT side FROM paper_orders WHERE id=?', id)?.side === 'buy') return 'live_buy_in_flight';
+    // At most LIVE_MAX_BUYS_IN_FLIGHT live buys at once (default 1, which keeps wallet and exposure checks exact).
+    const limit = this.cfg.live.maxBuysInFlight ?? 1;
+    const inFlight = new Set([...this.liveBuying].filter(id => id !== order.id));
+    for (const id of this.submitted) if (id !== order.id && this.store.get('SELECT side FROM paper_orders WHERE id=?', id)?.side === 'buy') inFlight.add(id);
+    if (inFlight.size >= limit) return 'live_buy_in_flight';
     // Worst case: every open position and this buy go to zero, after paying the buy's and every exit's overhead.
     // The buy budget is a hard cap on swap SOL (executor), so this bound is exact up to the priority-fee ceiling.
     const openCount = BigInt(this.store.get("SELECT COUNT(*) n FROM paper_positions WHERE status='open'").n);
     const overhead = this.executor.maxOverheadLamports('buy') + (openCount + 1n) * this.executor.maxOverheadLamports('sell');
     const worst = -this.liveRealizedLamports() + this.paper.exposure(order.id).open + budget + overhead;
     if (worst > BigInt(this.cfg.live.maxLossLamports)) return 'live_loss_budget';
+    // Other buys in flight have not settled yet: count their budgets against the loss and wallet limits too.
+    const pendingBudgets = [...inFlight].reduce((sum, id) => {
+      const row = this.store.get('SELECT quote_json FROM paper_orders WHERE id=?', id);
+      return sum + (row ? BigInt(JSON.parse(row.quote_json).requestedBudgetLamports ?? 0) : 0n);
+    }, 0n);
+    if (pendingBudgets && worst + pendingBudgets > BigInt(this.cfg.live.maxLossLamports)) return 'live_loss_budget';
     let balance;
-    try { balance = await this.executor.balance(); } catch { return 'live_balance_unavailable'; }
+    if (this.cfg.live.checkBalancePerBuy === false) {
+      balance = this.executor.balanceCached?.() ?? null;
+      if (balance == null) return 'live_balance_unavailable';
+      balance -= pendingBudgets;
+    } else {
+      try { balance = await this.executor.balance(); } catch { return 'live_balance_unavailable'; }
+      balance -= pendingBudgets;
+    }
     const reserve = budget + BigInt(this.cfg.live.perTradeReserveLamports);
     if (balance - reserve < BigInt(this.cfg.live.minWalletLamports)) { this.liveHalt('wallet_floor'); return 'live_wallet_floor'; }
     return null;

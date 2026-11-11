@@ -10,9 +10,9 @@ const noop = () => {};
 const bufferOf = raw => Buffer.isBuffer(raw) ? raw : Array.isArray(raw) ? Buffer.concat(raw)
   : raw instanceof ArrayBuffer ? Buffer.from(raw) : Buffer.from(String(raw));
 
-export const agentParams = curves => [
+export const agentParams = (curves, commitment = 'confirmed') => [
   { accountRequired: [MAYHEM], accountInclude: curves, vote: false, failed: false },
-  { commitment: 'confirmed', encoding: 'jsonParsed', transactionDetails: 'full', showRewards: false, maxSupportedTransactionVersion: 1 },
+  { commitment, encoding: 'jsonParsed', transactionDetails: 'full', showRewards: false, maxSupportedTransactionVersion: 1 },
 ];
 
 // Helius wraps the RPC-style transaction and metadata inside result.transaction.
@@ -33,9 +33,10 @@ export class PaperAgentFeed {
   constructor(store, rpc, {
     socketFactory = url => new WebSocket(url, { handshakeTimeout: 10000, maxPayload: MAX_FRAME_BYTES }),
     setTimer = setTimeout, clearTimer = clearTimeout, now = Date.now,
-    onTransaction = noop, onCoverage = noop, onGap = noop, onSubscriptionError = noop,
+    onTransaction = noop, onCoverage = noop, onGap = noop, onSubscriptionError = noop, commitment = 'confirmed',
   } = {}) {
-    Object.assign(this, { store, rpc, socketFactory, setTimer, clearTimer, now });
+    if (!['processed', 'confirmed'].includes(commitment)) throw new Error('Unsupported agent feed commitment');
+    Object.assign(this, { store, rpc, socketFactory, setTimer, clearTimer, now, commitment });
     this.callbacks = { onTransaction, onCoverage, onGap, onSubscriptionError };
     this.health = new FeedHealth(store, 'agent', now);
     this.conn = null; this.next = null; this.retry = null;
@@ -67,7 +68,7 @@ export class PaperAgentFeed {
     const health = this.health;
     health.update({ phase: this.conn ? 'subscribed' : 'connecting', attempts: health.value.attempts + 1, nextRetryAt: null });
     let socket;
-    try { socket = this.socketFactory(this.rpc.wsUrl, 'agent'); }
+    try { socket = this.socketFactory(this.rpc.tradingWsUrl ?? this.rpc.wsUrl, 'agent'); }
     catch (error) { this.failed(null, 'connect_failed', error); return; }
     const conn = { socket, curves, curveSet: new Set(curves), key, request: null, subscription: null, heartbeat: null, ackTimer: null, stableTimer: null, alive: true };
     this.next = conn;
@@ -76,7 +77,7 @@ export class PaperAgentFeed {
       if (!live() || conn.request != null) return;
       health.update({ phase: this.conn ? 'subscribed' : 'subscribing' });
       conn.request = ++this.sequence;
-      try { socket.send(JSON.stringify({ jsonrpc: '2.0', id: conn.request, method: 'transactionSubscribe', params: agentParams(curves) })); }
+      try { socket.send(JSON.stringify({ jsonrpc: '2.0', id: conn.request, method: 'transactionSubscribe', params: agentParams(curves, this.commitment) })); }
       catch { this.failed(conn, 'send_failed'); return; }
       const beat = () => {
         if (!live()) return;

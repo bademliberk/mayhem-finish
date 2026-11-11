@@ -25,6 +25,8 @@ export class Rpc {
     if (!cfg.key) throw new Error('Set HELIUS_API_KEY in .env');
     this.url = `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(cfg.key)}`;
     this.wsUrl = `wss://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(cfg.key)}`;
+    // Trading feeds (curves, agent sells, slots) may use the faster beta host; discovery keeps wsUrl.
+    this.tradingWsUrl = cfg.wsHost === 'beta' ? `wss://beta.helius-rpc.com/?api-key=${encodeURIComponent(cfg.key)}` : this.wsUrl;
     this.interval = cfg.rpcInterval;
     this.requestTimeoutMs = cfg.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
     this.attemptTimeoutMs = cfg.attemptTimeoutMs ?? ATTEMPT_TIMEOUT_MS;

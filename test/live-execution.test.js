@@ -360,7 +360,7 @@ test('a partial terminal liquidation sells only the payable tokens and reports t
 test('only one live buy runs at a time, and exit backoff stops new sell orders being created', async () => {
   const s = setup();
   try {
-    s.engine.liveBuying = 999;
+    s.engine.liveBuying.add(999);
     const row = await entry(s);
     assert.equal(order(s, row.id).error, 'live_buy_in_flight');
     assert.equal(s.ex.calls.some(c => c[0] === 'prepareBuy'), false);
@@ -624,4 +624,89 @@ test('LIVE_FORCE_SELL sends every exit, take-profit included, with a zero minimu
     await t.engine.liveBuild({ id: 0, side: 'sell', mint, reason: 'timeout' }, { net: '0' });
     assert.equal(t.ex.calls.at(-1)[3], null, 'default: forced exits use a fresh quote less LIVE_EXIT_SLIPPAGE_BPS');
   } finally { t.close(); }
+});
+
+test('fast entry sends from the sell event reserves without the status recheck or curve refetch', async () => {
+  const s = setup({ cfg: liveCfg({ fastEntry: true }) });
+  try {
+    let statusCalls = 0, accountCalls = 0;
+    s.rpc.call = async () => { statusCalls++; return { value: [{ slot: 20, err: null, confirmationStatus: 'confirmed' }] }; };
+    s.rpc.accounts = async () => { accountCalls++; return { context: { slot: 20 }, value: [account()] }; };
+    s.ex.submitResult = bought();
+    const row = await entry(s);
+    assert.equal(statusCalls, 0, 'no getSignatureStatuses'); assert.equal(accountCalls, 0, 'no curve refetch');
+    const build = s.ex.calls.find(c => c[0] === 'prepareBuy');
+    assert.equal(build[3], true, 'built from a curve account rebuilt from the event');
+    assert.equal(order(s, row.id).status, 'filled'); assert.ok(position(s));
+  } finally { s.close(); }
+});
+
+test('up to LIVE_MAX_BUYS_IN_FLIGHT buys run at once, and pending budgets count against the loss limit', async () => {
+  const s = setup({ cfg: liveCfg({ live: { ...limits, maxBuysInFlight: 2 } }) });
+  try {
+    s.engine.liveBuying.add(999);
+    s.store.run("INSERT INTO paper_orders (mint,side,status,created_at_ms,expires_at_ms,reason,quote_json,assumptions_json) VALUES(?,'buy','pending',1,1,'agent_sell',?,?)",
+      mint2, JSON.stringify({ requestedBudgetLamports: '4800000' }), JSON.stringify({ networkFeeLamports: '10000' }));
+    const other = Number(s.store.get('SELECT MAX(id) id FROM paper_orders').id);
+    s.engine.liveBuying.clear(); s.engine.liveBuying.add(other);
+    assert.equal(await s.engine.liveBuyBlocked({ id: -1, mint: key(5) }, 4800000n), null, 'second buy allowed');
+    s.engine.liveBuying.add(1000);
+    assert.equal(await s.engine.liveBuyBlocked({ id: -1, mint: key(5) }, 4800000n), 'live_buy_in_flight', 'third refused');
+    s.engine.liveBuying.delete(1000);
+    s.engine.cfg = { ...s.engine.cfg, live: { ...s.engine.cfg.live, maxLossLamports: '9000000' } };
+    assert.equal(await s.engine.liveBuyBlocked({ id: -1, mint: key(5) }, 4800000n), 'live_loss_budget', 'in-flight budget counted');
+  } finally { s.close(); }
+});
+
+test('LIVE_CHECK_BALANCE_PER_BUY=false uses the cached balance and refuses when it is missing', async () => {
+  const s = setup({ cfg: liveCfg({ live: { ...limits, checkBalancePerBuy: false } }) });
+  try {
+    let rpc = 0; s.ex.balance = async () => { rpc++; return 1000000000n; };
+    s.ex.balanceCached = () => null;
+    assert.equal(await s.engine.liveBuyBlocked({ id: -1, mint: key(5) }, 4800000n), 'live_balance_unavailable');
+    s.ex.balanceCached = () => 1000000000n;
+    assert.equal(await s.engine.liveBuyBlocked({ id: -1, mint: key(5) }, 4800000n), null);
+    assert.equal(rpc, 0, 'no balance RPC per buy');
+  } finally { s.close(); }
+});
+
+test('the entry market-cap band rejects signals outside it', async () => {
+  const cfgIn = paperConfig({ PAPER_AGENT_MIN_ENTRY_MC_SOL: '0.02', PAPER_AGENT_MAX_ENTRY_MC_SOL: '1' }, 'agent-sell-liquidity');
+  assert.equal(cfgIn.minEntryMcSol, 0.02); assert.equal(cfgIn.maxEntryMcSol, 1);
+  assert.equal(paperConfig({}, 'agent-sell-liquidity').minEntryMcSol, undefined);
+  assert.throws(() => paperConfig({ PAPER_AGENT_MIN_ENTRY_MC_SOL: '2', PAPER_AGENT_MAX_ENTRY_MC_SOL: '1' }, 'agent-sell-liquidity'));
+  assert.throws(() => paperConfig({ PAPER_AGENT_FEED_COMMITMENT: 'finalized' }, 'agent-sell-liquidity'), /PAPER_AGENT_FEED_COMMITMENT/);
+  assert.equal(paperConfig({ PAPER_AGENT_FEED_COMMITMENT: 'processed' }, 'agent-sell-liquidity').feedCommitment, 'processed');
+  // The fixture curve's market cap is ~0.29 SOL (virtual 140M lamports / 800B tokens of 1e15 supply... see below).
+  const mc = (await import('../src/paper-math.js')).cap(reserves(account()));
+  for (const [lo, hi, entered] of [[mc / 2, mc * 2, true], [mc * 2, mc * 4, false], [mc / 4, mc / 2, false]]) {
+    const s = setup({ cfg: liveCfg({ minEntryMcSol: lo, maxEntryMcSol: hi }) });
+    try {
+      s.engine.agentTransaction(tx(`band-${lo}`, 20));
+      const outcome = s.store.get('SELECT outcome FROM paper_agent_events WHERE signature=?', `band-${lo}`).outcome;
+      assert.equal(Boolean(pending(s)), entered, `${lo}-${hi}: ${outcome}`);
+      if (!entered) assert.match(outcome, /^mcap_(below|above)_band$/);
+    } finally { s.close(); }
+  }
+});
+
+test('the agent feed subscribes at the configured commitment', async () => {
+  const { agentParams } = await import('../src/paper-agent-feed.js');
+  assert.equal(agentParams(['c'])[1].commitment, 'confirmed');
+  assert.equal(agentParams(['c'], 'processed')[1].commitment, 'processed');
+});
+
+test('HELIUS_WS_HOST=beta moves only the trading feeds to the beta host', async () => {
+  const { Rpc } = await import('../src/rpc.js');
+  const main = new Rpc({ key: 'k', rpcInterval: 150 }, null), beta = new Rpc({ key: 'k', rpcInterval: 150, wsHost: 'beta' }, null);
+  assert.equal(main.tradingWsUrl, main.wsUrl);
+  assert.match(beta.tradingWsUrl, /^wss:\/\/beta\.helius-rpc\.com\/\?api-key=k$/);
+  assert.match(beta.wsUrl, /^wss:\/\/mainnet\.helius-rpc\.com\//, 'discovery stays on mainnet');
+  const urls = [];
+  const { PaperFeeds } = await import('../src/paper-feeds.js');
+  const feeds = new PaperFeeds({ usage() {} }, beta, { agentMode: true, socketFactory: url => { urls.push(url); throw new Error('offline'); },
+    setTimer: () => 0, clearTimer: () => {} });
+  feeds.add(mint, key(9), false); feeds.start();
+  assert.ok(urls.length && urls.every(u => u.startsWith('wss://beta.helius-rpc.com/')), urls.join(','));
+  feeds.stop();
 });

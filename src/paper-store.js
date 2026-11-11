@@ -52,6 +52,19 @@ export function paperConfig(env = process.env, profile = null) {
       profitBps: number('PAPER_AGENT_PROFIT_BPS', 3000, 0, 100000),
       liquidityExitMultiple: number('PAPER_AGENT_EXIT_MULTIPLE', 2, 0, 100),
       swapFeeBps: number('PAPER_SWAP_FEE_BPS', 125, 0, 2000),
+      // Opt-in speed: processed feeds and fast entries (send from the sell event's reserves, no confirm/refetch).
+      // Omitted when off so existing trial identities are unchanged.
+      ...(() => { const c = String(env.PAPER_AGENT_FEED_COMMITMENT ?? '').trim() || 'confirmed';
+        if (!['processed', 'confirmed'].includes(c)) throw new Error('Invalid PAPER_AGENT_FEED_COMMITMENT');
+        return c === 'processed' ? { feedCommitment: 'processed' } : {}; })(),
+      ...(flag('PAPER_AGENT_FAST_ENTRY') ? { fastEntry: true } : {}),
+      // Opt-in entry band on market cap in SOL, checked at the signal on the sell event's reserves.
+      ...(() => { const lo = String(env.PAPER_AGENT_MIN_ENTRY_MC_SOL ?? '').trim(), hi = String(env.PAPER_AGENT_MAX_ENTRY_MC_SOL ?? '').trim();
+        const out = {};
+        if (lo !== '') out.minEntryMcSol = number('PAPER_AGENT_MIN_ENTRY_MC_SOL', 0, 0, 1e9, false);
+        if (hi !== '') out.maxEntryMcSol = number('PAPER_AGENT_MAX_ENTRY_MC_SOL', 0, 0, 1e9, false);
+        if (out.minEntryMcSol != null && out.maxEntryMcSol != null && out.minEntryMcSol >= out.maxEntryMcSol) throw new Error('Invalid PAPER_AGENT_MIN_ENTRY_MC_SOL / PAPER_AGENT_MAX_ENTRY_MC_SOL');
+        return out; })(),
       // Opt-in stop-loss on the full-sale net: 6000 = exit once the position is worth 60% less than it cost.
       // Omitted when unset or 0 so existing trial identities are unchanged.
       ...(() => { const bps = number('PAPER_AGENT_STOP_LOSS_BPS', 0, 0, 9999); return bps ? { stopLossBps: bps } : {}; })(),

@@ -159,7 +159,7 @@ export function outcomeMetrics(records) {
 }
 
 export function simulate(tape, cfg, delaySlots = 1, continuity = 'strict', options = {}) {
-  if (![1, 2].includes(delaySlots)) throw new Error('unsupported_delay');
+  if (![1, 2, 3, 4].includes(delaySlots)) throw new Error('unsupported_delay');
   if (!['strict', 'observed_virtual'].includes(continuity)) throw new Error('unsupported_continuity');
   const sizingPolicy = options.sizingPolicy ?? 'fixed';
   if (!['fixed', 'loss_multiplier', 'gradual_multiplier'].includes(sizingPolicy)) throw new Error('unsupported_sizing_policy');
@@ -272,6 +272,16 @@ export function simulate(tape, cfg, delaySlots = 1, continuity = 'strict', optio
         const { budget, evidence } = scaledBudget(amount(signal.rs_after), cfg, frozenMultiplier, minimumBudget);
         if (evidence.capBinding) cappedSignals++;
         if (evidence.multiplierClipped) multiplierClippedSignals++;
+        // Optional entry band on market cap in SOL (supply 1e15 raw units, as live Mayhem mints report).
+        if (cfg.entryMcPredicate) {
+          const mc = Number(BigInt(signal.vs_after) * 1000000000000000n / BigInt(signal.vt_after)) / 1e9;
+          if (!cfg.entryMcPredicate(mc)) throw new Error('mcap_outside_bands');
+        }
+        if (cfg.minEntryMcSol != null || cfg.maxEntryMcSol != null) {
+          const mc = Number(BigInt(signal.vs_after) * 1000000000000000n / BigInt(signal.vt_after)) / 1e9;
+          if (cfg.minEntryMcSol != null && mc < cfg.minEntryMcSol) throw new Error('mcap_below_band');
+          if (cfg.maxEntryMcSol != null && mc >= cfg.maxEntryMcSol) throw new Error('mcap_above_band');
+        }
         const q = quality(signal, budget, frozenMultiplier);
         pending.set(mint, { signal, budget, tokens: q.buy.tokens, frozenMultiplier, sizingEvidence: evidence,
           signalLossBps: q.quality.roundTripLossBps, target: slot + delaySlots });
