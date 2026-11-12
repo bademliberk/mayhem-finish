@@ -14,7 +14,7 @@ import {
 
 const require = createRequire(import.meta.url);
 const { PUMP_SDK, OnlinePumpSdk, bondingCurvePda, getBuyTokenAmountFromSolAmount, getSellSolAmountFromTokenAmount } = require('@pump-fun/pump-sdk');
-const { getAssociatedTokenAddressSync, createCloseAccountInstruction, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } = require('@solana/spl-token');
+const { getAssociatedTokenAddressSync, createCloseAccountInstruction, createBurnCheckedInstruction, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } = require('@solana/spl-token');
 
 const WSOL = new PublicKey('So11111111111111111111111111111111111111112');
 const PUMP_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
@@ -217,7 +217,7 @@ export class LiveExecutor {
       const info = await this.conn.getAccountInfo(mintKey, 'confirmed');
       if (!info) throw new Error('mint_missing');
       // Mayhem mints carry their real supply on the mint (u64 at 36); fee tiers use it.
-      this.mints.set(id, { tokenProgram: info.owner, mintSupply: info.data.readBigUInt64LE(36) });
+      this.mints.set(id, { tokenProgram: info.owner, mintSupply: info.data.readBigUInt64LE(36), decimals: info.data[44] });
       if (this.mints.size > 5000) this.mints.delete(this.mints.keys().next().value);
     }
     return this.mints.get(id);
@@ -238,8 +238,8 @@ export class LiveExecutor {
     }
     const bc = PUMP_SDK.decodeBondingCurve(curveInfo);
     if (bc.complete) throw new Error('curve_complete');
-    const { tokenProgram, mintSupply } = await this.mintInfo(mintKey);
-    return { mintKey, curveInfo, bc, tokenProgram, mintSupply };
+    const { tokenProgram, mintSupply, decimals } = await this.mintInfo(mintKey);
+    return { mintKey, curveInfo, bc, tokenProgram, mintSupply, decimals };
   }
   /** Refresh the cached Helius estimate for Pump program traffic. Estimates older than 60 s are not used. */
   async refreshPriority() {
@@ -292,15 +292,28 @@ export class LiveExecutor {
    * Sell `tokens` for at least `minLamports`; with `minLamports === null`, at least a fresh quote less `slippageBps`
    * (mandatory exits: never an unbounded zero minimum). Closes the ATA (reclaims rent) when selling the whole balance.
    */
-  async sellInstructions(mint, tokens, minLamports, close, slippageBps = 2000) {
+  async sellInstructions(mint, tokens, minLamports, close, slippageBps = 2000, mode = 'capped') {
     if (!this.fees) throw new Error('fees_unavailable');
     const c = await this.curve(mint);
-    // A drained curve cannot pay out more than its real SOL: selling past that fails on-chain with Overflow (6024),
-    // and retrying the same amount fails forever. Cap the amount at what the fresh curve can pay (gross <= real SOL,
-    // with a 1% margin for trades landing first); the rest stays in the wallet and is reported as residual.
-    const payable = payableTokens(c.bc, tokens);
-    if (payable <= 0n) throw new Error('curve_drained');
-    if (payable < tokens) { tokens = payable; close = false; }
+    // mode 'full': sell the whole amount (the first attempt). mode 'capped' (the retry after a failed sale): a drained
+    // curve cannot pay out more than its real SOL, and selling past that fails on-chain with Overflow (6024) forever.
+    // Sell only what the fresh curve can pay (gross <= 99% of real SOL), then burn the rest and close the account in
+    // the same transaction, so nothing is left behind. If even that is nothing, just burn and close.
+    let burn = 0n;
+    if (mode === 'capped') {
+      const payable = payableTokens(c.bc, tokens);
+      if (payable < tokens) { burn = tokens - payable; tokens = payable; }
+      if (burn > 0n && !close) burn = 0n;   // never burn a balance this trial does not own (close=false)
+    }
+    const ata = getAssociatedTokenAddressSync(c.mintKey, this.user, true, c.tokenProgram);
+    const tail = [];
+    if (burn > 0n) tail.push(createBurnCheckedInstruction(ata, c.mintKey, this.user, burn, c.decimals, [], c.tokenProgram));
+    if (close) tail.push(createCloseAccountInstruction(ata, this.user, this.user, [], c.tokenProgram));
+    if (tokens <= 0n) {
+      if (!burn) throw new Error('curve_drained');
+      return { instructions: tail, tokenProgram: c.tokenProgram.toBase58(), quotedLamports: 0n, burnedTokens: burn, soldTokens: 0n,
+        accounts: [c.mintKey, bondingCurvePda(c.mintKey)] };
+    }
     const quoted = big(getSellSolAmountFromTokenAmount({ global: this.fees.global, feeConfig: this.fees.feeConfig,
       mintSupply: bn(c.mintSupply), bondingCurve: c.bc, amount: bn(tokens) }));
     if (minLamports === null) minLamports = quoted * BigInt(10000 - slippageBps) / 10000n;
@@ -308,8 +321,8 @@ export class LiveExecutor {
     const instructions = await PUMP_SDK.sellInstructions({ global: this.fees.global, bondingCurveAccountInfo: c.curveInfo,
       bondingCurve: c.bc, mint: c.mintKey, user: this.user, amount: bn(tokens), solAmount: bn(minLamports), slippage: 0,
       tokenProgram: c.tokenProgram, mayhemMode: c.bc.isMayhemMode, cashback: c.bc.isCashbackCoin });
-    if (close) instructions.push(createCloseAccountInstruction(getAssociatedTokenAddressSync(c.mintKey, this.user, true, c.tokenProgram), this.user, this.user, [], c.tokenProgram));
-    return { instructions, tokenProgram: c.tokenProgram.toBase58(), quotedLamports: quoted,
+    instructions.push(...tail);
+    return { instructions, tokenProgram: c.tokenProgram.toBase58(), quotedLamports: quoted, burnedTokens: burn, soldTokens: tokens,
       accounts: [c.mintKey, bondingCurvePda(c.mintKey)] };
   }
   /** Build and sign a buy without sending it: the caller persists `signature` before `submit`. */
@@ -318,9 +331,10 @@ export class LiveExecutor {
     return this.prepare(built.instructions, mint, this.settings.buyUnits, { tokenProgram: built.tokenProgram, quotedTokens: built.quotedTokens.toString() },
       this.priorityPrice());
   }
-  async prepareSell(mint, tokens, minLamports, close = true, slippageBps = 2000) {
-    const built = await this.sellInstructions(mint, tokens, minLamports, close, slippageBps);
-    return this.prepare(built.instructions, mint, this.settings.sellUnits, { tokenProgram: built.tokenProgram, quotedLamports: built.quotedLamports.toString() },
+  async prepareSell(mint, tokens, minLamports, close = true, slippageBps = 2000, mode = 'capped') {
+    const built = await this.sellInstructions(mint, tokens, minLamports, close, slippageBps, mode);
+    return this.prepare(built.instructions, mint, this.settings.sellUnits, { tokenProgram: built.tokenProgram, quotedLamports: built.quotedLamports.toString(),
+      soldTokens: built.soldTokens.toString(), burnedTokens: built.burnedTokens.toString() },
       this.priorityPrice());
   }
   prepare(instructions, mint, units, extra = {}, microLamports) {
@@ -338,7 +352,7 @@ export class LiveExecutor {
     return BigInt(this.settings.tipLamports) + 5000n + BigInt(Math.ceil(units * price / 1e6));
   }
   async buy(mint, lamports, slippageBps) { return this.submit(await this.prepareBuy(mint, lamports, slippageBps)); }
-  async sell(mint, tokens, minLamports, close = true, slippageBps = 2000) { return this.submit(await this.prepareSell(mint, tokens, minLamports, close, slippageBps)); }
+  async sell(mint, tokens, minLamports, close = true, slippageBps = 2000, mode = 'capped') { return this.submit(await this.prepareSell(mint, tokens, minLamports, close, slippageBps, mode)); }
   /** Current block height at confirmed commitment; a signature unseen past its lastValidBlockHeight can never land. */
   async blockHeight() { return this.conn.getBlockHeight('confirmed'); }
   async rpc(method, params, timeoutMs = 10_000) {

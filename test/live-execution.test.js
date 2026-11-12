@@ -60,9 +60,11 @@ function fakeExecutor() {
       ex.calls.push(['prepareBuy', m, lamports, Boolean(confirmed)]);
       return { mint: m, signature: sig(++n), wire: 'w', lastValidBlockHeight: 150, tokenProgram: TOKEN_PROGRAM, lamports };
     },
-    async prepareSell(m, tokens, min, close, slippage) {
-      ex.calls.push(['prepareSell', m, tokens, min, close, slippage]);
-      return { mint: m, signature: sig(++n), wire: 'w', lastValidBlockHeight: 150, tokenProgram: TOKEN_PROGRAM, tokens };
+    async prepareSell(m, tokens, min, close, slippage, mode) {
+      ex.calls.push(['prepareSell', m, tokens, min, close, slippage, mode]);
+      const burned = mode === 'capped' && ex.burnOnCapped ? ex.burnOnCapped : 0n;
+      return { mint: m, signature: sig(++n), wire: 'w', lastValidBlockHeight: 150, tokenProgram: TOKEN_PROGRAM, tokens,
+        soldTokens: (tokens - burned).toString(), burnedTokens: burned.toString() };
     },
     async submit(prepared) { ex.calls.push(['submit', prepared.signature]); return ex.submitResult(prepared); },
     async resolve(signature) { ex.calls.push(['resolve', signature]); return ex.resolveResult(signature); },
@@ -241,16 +243,22 @@ test('mandatory live exits sell only the trial balance with a bounded minimum an
     assert.equal(s.engine.liveExit(mint, 'timeout', 'stale_observation', {}), false);
     await Promise.all([...s.engine.reconciliations.values()].map(a => a.promise));
     const call = s.ex.calls.find(c => c[0] === 'prepareSell');
-    assert.deepEqual(call.slice(2), [100000000n, null, false, 2000], 'own tokens only, fresh-quote minimum, keep the account open');
+    assert.deepEqual(call.slice(2), [100000000n, null, false, 2000, 'full'], 'own tokens only, fresh-quote minimum, keep the account open, full sale first');
     const failed = s.store.get("SELECT * FROM paper_orders WHERE side='sell' ORDER BY id DESC LIMIT 1");
     assert.equal(failed.error, 'live_failed'); assert.equal(JSON.parse(failed.diagnostics_json).failure.customCode, 6003);
-    const sells = () => s.ex.calls.filter(c => c[0] === 'prepareSell').length;
-    s.engine.liveExit(mint, 'timeout', 'stale_observation', {});
-    assert.equal(sells(), 1, 'no retry inside the backoff window');
-    s.now(102500); s.ex.tokens = 100000000n; s.ex.submitResult = sold(6000000n, 100000000n);
+    const sells = () => s.ex.calls.filter(c => c[0] === 'prepareSell');
+    // The first failed full sale is retried at once, as a capped sale + burn.
     s.engine.liveExit(mint, 'timeout', 'stale_observation', {});
     await Promise.all([...s.engine.reconciliations.values()].map(a => a.promise));
-    assert.equal(sells(), 2);
+    assert.equal(sells().length, 2, 'immediate retry after the first failure');
+    assert.equal(sells()[1][6], 'capped', 'retry sells what the curve can pay');
+    // A second failure backs off.
+    s.engine.liveExit(mint, 'timeout', 'stale_observation', {});
+    assert.equal(sells().length, 2, 'no retry inside the backoff window after a second failure');
+    s.now(105000); s.ex.tokens = 100000000n; s.ex.submitResult = sold(6000000n, 100000000n);
+    s.engine.liveExit(mint, 'timeout', 'stale_observation', {});
+    await Promise.all([...s.engine.reconciliations.values()].map(a => a.promise));
+    assert.equal(sells().length, 3);
     assert.equal(position(s), undefined);
     const closed = s.store.get('SELECT * FROM paper_positions WHERE mint=?', mint);
     assert.equal(closed.exit_net_lamports, '6000000'); assert.equal(closed.pnl_lamports, (6000000n - 4810000n).toString());
@@ -353,7 +361,7 @@ test('startup tolerates a wallet/database mismatch while a submission is still b
   } finally { s.close(); }
 });
 
-test('a partial terminal liquidation sells only the payable tokens and reports the residual', async () => {
+test('the first sale sells everything; after a failure the retry sells the payable part and burns the rest', async () => {
   const s = setup();
   try {
     s.ex.submitResult = bought();
@@ -361,9 +369,30 @@ test('a partial terminal liquidation sells only the payable tokens and reports t
     s.ex.tokens = 100000000n;
     const sell = { id: 0, side: 'sell', mint, reason: 'timeout' };
     await s.engine.liveBuild(sell, { terminalOutcome: 'partial_sale', soldTokens: '40000000', net: '1' });
-    assert.deepEqual(s.ex.calls.at(-1).slice(2, 5), [40000000n, null, false]);
-    await s.engine.liveBuild(sell, { terminalOutcome: 'full_sale', soldTokens: '100000000', net: '1' });
-    assert.deepEqual(s.ex.calls.at(-1).slice(2, 5), [100000000n, null, true]);
+    assert.deepEqual(s.ex.calls.at(-1).slice(2, 7), [100000000n, null, true, 2000, 'full'], 'first attempt: whole position');
+    s.engine.liveExitFailed(mint, 'live_failed');
+    await s.engine.liveBuild(sell, { net: '1' });
+    assert.deepEqual(s.ex.calls.at(-1).slice(2, 7), [100000000n, null, true, 2000, 'capped'], 'retry: capped sale + burn, account closed');
+    // A capped sale that burned the rest closes the position and is logged as a sale + burn.
+    s.ex.burnOnCapped = 60000000n;
+    s.ex.submitResult = p => sold(3000000n, 100000000n)(p);
+    s.engine.liveExitFailures.get(mint).until = 0;
+    s.engine.liveExit(mint, 'timeout', 'stale_observation', {});
+    await Promise.all([...s.engine.reconciliations.values()].map(a => a.promise));
+    assert.equal(position(s), undefined);
+    const burnLog = s.logs.find(l => l.event === 'live_sell_and_burn');
+    assert.deepEqual([burnLog.soldTokens, burnLog.burnedTokens], ['40000000', '60000000']);
+    const fill = JSON.parse(s.store.get("SELECT fill_json FROM paper_orders WHERE side='sell' AND status='filled'").fill_json);
+    assert.equal(fill.burnedTokens, '60000000');
+  } finally { s.close(); }
+});
+
+test('leftover tokens a sale could not move are still reported as residual', async () => {
+  const s = setup();
+  try {
+    s.ex.submitResult = bought();
+    await entry(s);
+    s.ex.tokens = 100000000n;
     s.ex.submitResult = p => ({ ...sold(3000000n, 40000000n)(p), postTokens: 60000000n });
     s.engine.liveExit(mint, 'timeout', 'stale_observation', {});
     await Promise.all([...s.engine.reconciliations.values()].map(a => a.promise));
@@ -742,12 +771,27 @@ test('sells on a drained curve are capped at what its real SOL can pay, avoiding
   ex.curve = async () => ({ mintKey: new PublicKey(mint), curveInfo: { data: Buffer.alloc(0) }, mintSupply: 1000000000000000n,
     tokenProgram: new PublicKey(TOKEN_PROGRAM), bc: { ...(await (async () => { const c = PUMP_SDK.decodeBondingCurve({ data: (await sdkExecutor()).curveData }); return c; })()),
       virtualQuoteReserves: new BNx('30000000000'), virtualTokenReserves: new BNx('1073000000000000'), realQuoteReserves: new BNx('800000') } });
-  const built = await ex.sellInstructions(mint, want, 0n, true, 2000);
+  const built = await ex.sellInstructions(mint, want, 0n, true, 2000, 'capped');
   const sellIx = built.instructions.find(i => i.programId.toBase58() === PUMP);
   const amount = Buffer.from(sellIx.data).readBigUInt64LE(8);
   assert.ok(amount === got, `instruction amount ${amount} = capped ${got}`);
-  assert.equal(built.instructions.some(i => i.programId.toBase58() === TOKEN_PROGRAM), false, 'account not closed (residual kept)');
+  const tokenIxs = built.instructions.filter(i => i.programId.toBase58() === TOKEN_PROGRAM);
+  assert.deepEqual(tokenIxs.map(i => i.data[0]), [15, 9], 'BurnChecked then CloseAccount');
+  assert.equal(Buffer.from(tokenIxs[0].data).readBigUInt64LE(1), want - got, 'burns exactly the unsellable rest');
+  assert.equal(built.burnedTokens, want - got); assert.equal(built.soldTokens, got);
+  // 'full' sells the whole amount (the first attempt) and closes the account.
+  const full = await ex.sellInstructions(mint, want, 0n, true, 2000, 'full');
+  assert.equal(Buffer.from(full.instructions.find(i => i.programId.toBase58() === PUMP).data).readBigUInt64LE(8), want);
+  assert.equal(full.burnedTokens, 0n);
+  // A balance this trial does not fully own (close=false) is never burned.
+  const kept = await ex.sellInstructions(mint, want, 0n, false, 2000, 'capped');
+  assert.equal(kept.burnedTokens, 0n); assert.equal(kept.instructions.some(i => i.programId.toBase58() === TOKEN_PROGRAM), false);
   ex.curve = async () => ({ mintKey: new PublicKey(mint), curveInfo: { data: Buffer.alloc(0) }, mintSupply: 1n, tokenProgram: new PublicKey(TOKEN_PROGRAM),
     bc: { virtualQuoteReserves: new BNx('30000000000'), virtualTokenReserves: new BNx('1073000000000000'), realQuoteReserves: new BNx('0') } });
-  await assert.rejects(ex.sellInstructions(mint, want, 0n, true), /curve_drained/);
+  // A fully drained curve: nothing to sell, so the capped retry only burns and closes.
+  const drained = await ex.sellInstructions(mint, want, 0n, true, 2000, 'capped');
+  assert.equal(drained.instructions.some(i => i.programId.toBase58() === PUMP), false, 'no sell instruction');
+  assert.deepEqual(drained.instructions.map(i => i.data[0]), [15, 9]);
+  assert.equal(drained.burnedTokens, want);
+  await assert.rejects(ex.sellInstructions(mint, want, 0n, false, 2000, 'capped'), /curve_drained/);
 });

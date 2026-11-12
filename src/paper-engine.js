@@ -817,8 +817,10 @@ export class PaperEngine {
       return { ...base, tokens: result.tokens.toString(), cost: (-(result.lamports + result.ataLamports)).toString(),
         requestedBudgetLamports: modeled.requestedBudgetLamports };
     }
+    // tokensDelta covers sold + burned tokens; record how many were burned so the split is visible.
     return { ...base, tokens: (-result.tokens).toString(), gross: modeled.gross ?? null,
-      net: (result.lamports + result.ataLamports).toString() };
+      net: (result.lamports + result.ataLamports).toString(),
+      ...(result.burnedTokens && result.burnedTokens !== '0' ? { soldTokens: result.soldTokens, burnedTokens: result.burnedTokens } : {}) };
   }
   async liveTokenProgram(mint) {
     const position = this.paper.position(mint);
@@ -840,16 +842,14 @@ export class PaperEngine {
       if (held < owned) tokens = held;
       else if (held > owned) close = false;
     }
-    // The confirmed snapshot showed the curve cannot pay for the whole balance: sell only the payable part.
-    if (modeled.terminalOutcome === 'partial_sale' && /^[0-9]+$/.test(modeled.soldTokens ?? '')) {
-      const payable = BigInt(modeled.soldTokens);
-      if (payable > 0n && payable < tokens) { tokens = payable; close = false; }
-    }
+    // First attempt sells everything. Once a sale of this position has failed on-chain, retries sell what the curve
+    // can pay and burn the remainder in the same transaction (closing the account), so no tokens are left behind.
+    const mode = this.liveExitFailures.get(order.mint)?.failures ? 'capped' : 'full';
     // LIVE_FORCE_SELL: zero minimum, so the first sell lands whatever the price. Otherwise profit exits keep the
     // modeled minimum and mandatory exits take a fresh quote with a wider tolerance.
     const min = this.cfg.live.forceSell ? 0n
       : order.reason === 'profit' ? BigInt(modeled.net) * BigInt(10000 - this.cfg.sellSlippageBps) / 10000n : null;
-    return this.executor.prepareSell(order.mint, tokens, min !== null && min < 0n ? 0n : min, close, this.cfg.live.exitSlippageBps);
+    return this.executor.prepareSell(order.mint, tokens, min !== null && min < 0n ? 0n : min, close, this.cfg.live.exitSlippageBps, mode);
   }
   async liveFill(order, modeled, active, confirmed = null) {
     if (order.side === 'sell' && this.liveBackoff(order.mint)) { this.cancel(order.id, this.now(), 'live_exit_backoff'); return; }
@@ -889,7 +889,8 @@ export class PaperEngine {
     let result;
     try { result = await this.executor.submit(prepared); }
     catch { result = { signature: prepared.signature, status: 'unknown' }; }
-    await this.liveSettle(order, modeled, { tokenProgram: prepared.tokenProgram, ...result });
+    await this.liveSettle(order, modeled, { tokenProgram: prepared.tokenProgram, soldTokens: prepared.soldTokens,
+      burnedTokens: prepared.burnedTokens, ...result });
   }
   async liveDryRun(order, modeled, prepared) {
     let simulation = null;
@@ -973,6 +974,11 @@ export class PaperEngine {
       if (order.side === 'sell') {
         this.unwatch(order.mint); this.liveCheckLoss();
         // A partial liquidation (or a balance this trial did not open) leaves tokens behind: report, never track.
+        if (result.burnedTokens && result.burnedTokens !== '0') {
+          this.paper.count('live:sell_and_burn');
+          this.log(JSON.stringify({ event: 'live_sell_and_burn', mint: order.mint, soldTokens: result.soldTokens,
+            burnedTokens: result.burnedTokens, note: 'Curve could not pay for the whole position: sold the payable part, burned the rest.' }));
+        }
         if (typeof result.postTokens === 'bigint' && result.postTokens > 0n) {
           this.liveForeign.add(order.mint);
           this.log(JSON.stringify({ event: 'live_manual_action', mint: order.mint, reason: 'residual_tokens_after_exit',
@@ -987,7 +993,12 @@ export class PaperEngine {
       if (result.status === 'failed' && typeof result.lamports === 'bigint' && result.lamports < 0n) {
         this.liveAddCost(-(result.lamports + (result.ataLamports ?? 0n)));
       }
-      if (order.side === 'sell') this.liveExitFailed(order.mint, `live_${result.status}`);
+      if (order.side === 'sell') {
+        const first = !this.liveExitFailures.get(order.mint)?.failures;
+        this.liveExitFailed(order.mint, `live_${result.status}`);
+        // The first failed full sale is retried immediately as a capped sale + burn, not after a backoff.
+        if (first && result.status === 'failed') this.liveExitFailures.get(order.mint).until = 0;
+      }
       this.cancel(order.id, this.now(), `live_${result.status}`, { ...record,
         ...(Number.isSafeInteger(result.errorCode) ? { liveErrorCode: result.errorCode } : {}),
         ...(result.err ? { failure: transactionFailure(result.err) } : {}) });
