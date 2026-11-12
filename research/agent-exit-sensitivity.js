@@ -273,6 +273,10 @@ export function simulate(tape, cfg, delaySlots = 1, continuity = 'strict', optio
         if (evidence.capBinding) cappedSignals++;
         if (evidence.multiplierClipped) multiplierClippedSignals++;
         // Optional entry band on market cap in SOL (supply 1e15 raw units, as live Mayhem mints report).
+        // Mirrors the live engine: skip a signal whose 12% budget would reach the swap cap.
+        if (cfg.skipCappedEntries && amount(signal.rs_after) * BigInt(cfg.fractionBps) / 10000n >= BigInt(cfg.maxSwapBudgetLamports)) {
+          throw new Error('capped_budget_skipped');
+        }
         if (cfg.entryMcPredicate) {
           const mc = Number(BigInt(signal.vs_after) * 1000000000000000n / BigInt(signal.vt_after)) / 1e9;
           if (!cfg.entryMcPredicate(mc)) throw new Error('mcap_outside_bands');

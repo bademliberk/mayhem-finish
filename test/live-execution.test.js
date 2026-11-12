@@ -710,3 +710,29 @@ test('HELIUS_WS_HOST=beta moves only the trading feeds to the beta host', async 
   assert.ok(urls.length && urls.every(u => u.startsWith('wss://beta.helius-rpc.com/')), urls.join(','));
   feeds.stop();
 });
+
+test('sells on a drained curve are capped at what its real SOL can pay, avoiding the on-chain Overflow (6024)', async () => {
+  const { payableTokens } = await import('../src/live-executor.js');
+  const BNx = require('bn.js');
+  // Reserves similar to the failing live case: tiny real SOL behind a large virtual curve.
+  const bc = { virtualQuoteReserves: new BNx('30000000000'), virtualTokenReserves: new BNx('1073000000000000'), realQuoteReserves: new BNx('800000') };
+  const want = 620070963844n, got = payableTokens(bc, want);
+  assert.ok(got > 0n && got < want, `capped: ${got}`);
+  const gross = t => t * 30000000000n / (1073000000000000n + t);
+  assert.ok(gross(got) <= 800000n * 99n / 100n, 'sale fits within 99% of real SOL');
+  assert.ok(gross(got * 101n / 100n) > 800000n * 99n / 100n, 'a 1% larger amount would not fit');
+  assert.equal(payableTokens({ ...bc, realQuoteReserves: new BNx('40000000') }, want), want, 'a healthy curve sells everything');
+  // Through the real SDK builder: the sell instruction carries the capped amount and keeps the account open.
+  const { ex } = await sdkExecutor({ AS_PRIORITY_MICROLAMPORTS: '1000' });
+  ex.curve = async () => ({ mintKey: new PublicKey(mint), curveInfo: { data: Buffer.alloc(0) }, mintSupply: 1000000000000000n,
+    tokenProgram: new PublicKey(TOKEN_PROGRAM), bc: { ...(await (async () => { const c = PUMP_SDK.decodeBondingCurve({ data: (await sdkExecutor()).curveData }); return c; })()),
+      virtualQuoteReserves: new BNx('30000000000'), virtualTokenReserves: new BNx('1073000000000000'), realQuoteReserves: new BNx('800000') } });
+  const built = await ex.sellInstructions(mint, want, 0n, true, 2000);
+  const sellIx = built.instructions.find(i => i.programId.toBase58() === PUMP);
+  const amount = Buffer.from(sellIx.data).readBigUInt64LE(8);
+  assert.ok(amount === got, `instruction amount ${amount} = capped ${got}`);
+  assert.equal(built.instructions.some(i => i.programId.toBase58() === TOKEN_PROGRAM), false, 'account not closed (residual kept)');
+  ex.curve = async () => ({ mintKey: new PublicKey(mint), curveInfo: { data: Buffer.alloc(0) }, mintSupply: 1n, tokenProgram: new PublicKey(TOKEN_PROGRAM),
+    bc: { virtualQuoteReserves: new BNx('30000000000'), virtualTokenReserves: new BNx('1073000000000000'), realQuoteReserves: new BNx('0') } });
+  await assert.rejects(ex.sellInstructions(mint, want, 0n, true), /curve_drained/);
+});

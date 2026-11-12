@@ -96,6 +96,18 @@ export function liveSettings(env = process.env) {
   };
 }
 
+/** Largest token amount (<= `tokens`) whose curve sale needs at most 99% of the curve's real SOL. */
+export function payableTokens(bc, tokens) {
+  const vs = big(bc.virtualQuoteReserves ?? bc.virtualSolReserves), vt = big(bc.virtualTokenReserves);
+  const real = big(bc.realQuoteReserves ?? bc.realSolReserves) * 99n / 100n;
+  const gross = t => t * vs / (vt + t);
+  if (gross(tokens) <= real) return tokens;
+  if (vs <= real) return tokens;
+  // gross(t) <= real  <=>  t <= real * vt / (vs - real)
+  const limit = real * vt / (vs - real);
+  return limit < tokens ? limit : tokens;
+}
+
 /** Lamport/token deltas for `owner` in a confirmed jsonParsed transaction (auto-sell detect.js ownerDelta). */
 export function ownerDelta(tx, owner, mint) {
   const keys = (tx?.transaction?.message?.accountKeys ?? []).map(k => typeof k === 'string' ? k : k.pubkey?.toString?.() ?? String(k.pubkey));
@@ -283,6 +295,12 @@ export class LiveExecutor {
   async sellInstructions(mint, tokens, minLamports, close, slippageBps = 2000) {
     if (!this.fees) throw new Error('fees_unavailable');
     const c = await this.curve(mint);
+    // A drained curve cannot pay out more than its real SOL: selling past that fails on-chain with Overflow (6024),
+    // and retrying the same amount fails forever. Cap the amount at what the fresh curve can pay (gross <= real SOL,
+    // with a 1% margin for trades landing first); the rest stays in the wallet and is reported as residual.
+    const payable = payableTokens(c.bc, tokens);
+    if (payable <= 0n) throw new Error('curve_drained');
+    if (payable < tokens) { tokens = payable; close = false; }
     const quoted = big(getSellSolAmountFromTokenAmount({ global: this.fees.global, feeConfig: this.fees.feeConfig,
       mintSupply: bn(c.mintSupply), bondingCurve: c.bc, amount: bn(tokens) }));
     if (minLamports === null) minLamports = quoted * BigInt(10000 - slippageBps) / 10000n;
