@@ -913,13 +913,34 @@ export class PaperEngine {
     if (this.paper.fill(order, quote, this.now()) && order.side === 'sell') { this.unwatch(order.mint); this.liveCheckLoss(); }
   }
   liveNoTokens(order) {
-    // The trial thinks it holds tokens the wallet does not have: never fabricate a fill. Stop managing the mint.
+    // The wallet no longer holds this position's tokens (sold or moved outside this trial). Assume they are gone:
+    // close the position at zero recovery, unsubscribe, and keep trading. No SOL from that sale reached this trial's
+    // books, so the full entry cost counts as a loss, which keeps LIVE_MAX_LOSS_SOL conservative.
     this.cancel(order.id, this.now(), 'live_no_tokens');
-    this.store.run("UPDATE paper_watches SET status='stopped',reason='live_manual_reconciliation' WHERE mint=?", order.mint);
+    const closed = this.liveCloseMissing(order.mint, 'sell_without_tokens');
     this.unwatch(order.mint);
-    this.liveHalt('sell_without_tokens');
-    this.log(JSON.stringify({ event: 'live_manual_action', mint: order.mint, reason: 'position_without_wallet_tokens',
-      note: 'Open position kept in the database; reconcile manually.' }));
+    this.liveCheckLoss();
+    this.log(JSON.stringify({ event: 'live_external_exit', mint: order.mint, reason: 'position_without_wallet_tokens', closed,
+      note: 'Tokens missing from the wallet; position closed at zero recovery and the mint unsubscribed. Trading continues.' }));
+  }
+  /** Close an open position whose tokens left the wallet outside this trial, at zero recovery. Returns true if closed. */
+  liveCloseMissing(mint, cause) {
+    return this.store.atomic(() => {
+      const position = this.paper.position(mint);
+      if (!position) return false;
+      const at = this.now();
+      const quote = { model: 'live_external_exit', note: 'Tokens left the wallet outside this trial; recorded at zero recovery.',
+        cause, tokens: position.tokens_raw, net: '0', entryOrderId: position.entry_order_id };
+      const id = Number(this.store.run(`INSERT INTO paper_orders (mint,side,status,created_at_ms,expires_at_ms,reason,quote_json,
+          assumptions_json,settled_at_ms,fill_json,diagnostics_json) VALUES(?,'sell','filled',?,?,'external_exit',?,?,?,?,?)`,
+        mint, at, at, JSON.stringify(quote), JSON.stringify(this.cfg), at, JSON.stringify(quote),
+        JSON.stringify({ stage: 'filled', liveStatus: 'ok' })).lastInsertRowid);
+      this.store.run(`UPDATE paper_positions SET status='closed',exit_order_id=?,closed_at_ms=?,exit_net_lamports='0',pnl_lamports=?
+        WHERE mint=? AND status='open'`, id, at, (-BigInt(position.entry_cost_lamports)).toString(), mint);
+      this.store.run("UPDATE paper_watches SET status='closed',reason='external_exit' WHERE mint=?", mint);
+      this.paper.count('live:external_exit');
+      return true;
+    });
   }
   async liveSettle(order, modeled, result) {
     const record = { liveSignature: result.signature ?? undefined, liveStatus: result.status };
@@ -1104,8 +1125,15 @@ export class PaperEngine {
       const unresolved = new Set(this.paper.pending().filter(order =>
         ['live_submitted', 'live_unknown'].includes(readOrderDiagnostics(order.diagnostics_json)?.stage)).map(order => order.mint));
       const missing = [...owned].filter(mint => !held.has(mint) && !unresolved.has(mint) &&
-        !['live_manual_reconciliation', 'graduated_live_unsellable'].includes(this.paper.watch(mint)?.reason));
-      if (missing.length) throw new Error(`Live DB has ${missing.length} open position(s) the wallet no longer holds; manual reconciliation required (first: ${missing[0]})`);
+        this.paper.watch(mint)?.reason !== 'graduated_live_unsellable');
+      // Positions the wallet no longer holds were sold or moved outside this trial: close them at zero recovery.
+      for (const mint of missing) {
+        if (this.liveCloseMissing(mint, 'missing_at_startup')) {
+          owned.delete(mint);
+          this.log(JSON.stringify({ event: 'live_external_exit', mint, reason: 'missing_at_startup',
+            note: 'Wallet no longer holds this position; closed at zero recovery.' }));
+        }
+      }
       // Tokens this trial did not open (airdrops, another bot) are left alone: never bought into, never sold.
       this.liveForeign = new Set([...held].filter(mint => !owned.has(mint) && !unresolved.has(mint)));
       if (this.liveForeign.size) this.log(JSON.stringify({ event: 'live_foreign_tokens', count: this.liveForeign.size,

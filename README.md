@@ -333,7 +333,8 @@ Live behaviour:
 - **Entry market-cap band.** `PAPER_AGENT_MIN_ENTRY_MC_SOL` / `PAPER_AGENT_MAX_ENTRY_MC_SOL` reject signals outside the band (SOL, at the sell event's reserves).
 - **Halts persist.** A halt (wallet floor, loss limit, missing tokens, failed recording, 10 failed exits on one mint) is saved in the database and survives restarts. Clear it with `npm run live:trial -- --resume-entries` once you have checked the cause.
 - **Failed transactions** that land still pay fees; those fees count toward `LIVE_MAX_LOSS_SOL`.
-- **Manual action.** A graduated curve cannot be sold here (no AMM), and a position whose tokens are missing from the wallet is never filled. Both are logged as `live_manual_action` and left open in the database.
+- **Missing tokens.** If a position's tokens are no longer in the wallet (sold or moved outside this trial, e.g. by another bot on the same wallet), the position is closed at zero recovery as `external_exit`, the mint is unsubscribed, and trading continues. The full entry cost counts as a loss. The same happens at startup for any open position the wallet no longer holds.
+- **Manual action.** A graduated curve cannot be sold here (no AMM); it is logged as `live_manual_action` and left open in the database.
 - **Startup.** The process refuses to start if the database has open positions the wallet no longer holds. Other wallet tokens (airdrops) are ignored, and their mints are excluded from entries. Tokens left over after an exit are excluded from entries the same way, immediately.
 
 ## Dependencies and tests

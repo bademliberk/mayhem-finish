@@ -213,15 +213,21 @@ test('live buys respect the worst-case loss budget, in-flight buys and foreign w
   } finally { t.close(); }
 });
 
-test('startup refuses an open position the wallet no longer holds', async () => {
+test('startup closes an open position the wallet no longer holds at zero recovery and keeps going', async () => {
   const s = setup();
   try {
     s.ex.submitResult = bought();
     await entry(s);
+    const cost = BigInt(position(s).entry_cost_lamports);
     s.ex.held = new Set();
-    await assert.rejects(s.engine.liveStartupChecks(), /no longer holds/);
-    s.ex.held = new Set([mint]);
     await s.engine.liveStartupChecks();
+    assert.equal(position(s), undefined, 'closed');
+    const closed = s.store.get('SELECT * FROM paper_positions WHERE mint=?', mint);
+    assert.equal(closed.status, 'closed'); assert.equal(closed.exit_net_lamports, '0'); assert.equal(BigInt(closed.pnl_lamports), -cost);
+    assert.equal(s.store.get('SELECT reason FROM paper_orders WHERE id=?', closed.exit_order_id).reason, 'external_exit');
+    assert.equal(s.engine.paper.watch(mint).reason, 'external_exit');
+    assert.equal(s.engine.liveHalted, null, 'no halt');
+    assert.ok(s.logs.some(l => l.event === 'live_external_exit' && l.reason === 'missing_at_startup'));
   } finally { s.close(); }
 });
 
@@ -251,18 +257,27 @@ test('mandatory live exits sell only the trial balance with a bounded minimum an
   } finally { s.close(); }
 });
 
-test('a sell with no wallet tokens halts entries and is left for manual reconciliation, never filled', async () => {
+test('a sell with no wallet tokens closes the position at zero recovery, unsubscribes, and keeps trading', async () => {
   const s = setup();
   try {
     s.ex.submitResult = bought();
     await entry(s);
+    const cost = BigInt(position(s).entry_cost_lamports);
+    const removed = []; s.engine.feeds.remove = m => removed.push(m);
     s.ex.tokens = 0n;
     s.engine.liveExit(mint, 'timeout', 'stale_observation', {});
     await Promise.all([...s.engine.reconciliations.values()].map(a => a.promise));
-    assert.ok(position(s), 'position kept'); assert.equal(s.engine.paper.watch(mint).reason, 'live_manual_reconciliation');
-    assert.equal(s.engine.liveHalted, 'sell_without_tokens');
-    assert.equal(s.ex.calls.some(c => c[0] === 'submit'), true, 'only the buy was submitted');
-    assert.equal(s.ex.calls.filter(c => c[0] === 'submit').length, 1);
+    assert.equal(position(s), undefined, 'position closed');
+    const closed = s.store.get('SELECT * FROM paper_positions WHERE mint=?', mint);
+    assert.equal(closed.exit_net_lamports, '0'); assert.equal(BigInt(closed.pnl_lamports), -cost, 'full cost counted as a loss');
+    assert.equal(s.engine.paper.watch(mint).status, 'closed'); assert.equal(s.engine.paper.watch(mint).reason, 'external_exit');
+    assert.deepEqual(removed, [mint], 'unsubscribed');
+    assert.equal(s.engine.liveHalted, null, 'no halt');
+    assert.equal(s.ex.calls.filter(c => c[0] === 'submit').length, 1, 'only the buy was submitted');
+    // Trading continues: the other mint can still be bought.
+    s.engine.onAccount(mint2, 20, account()); s.engine.coverage(mint2);
+    s.engine.agentTransaction(tx('next', 20, mint2));
+    assert.ok(s.engine.paper.pending().some(o => o.mint === mint2 && o.side === 'buy'), 'new buy requested');
     s.ex.held = new Set();
     await s.engine.liveStartupChecks();
   } finally { s.close(); }
