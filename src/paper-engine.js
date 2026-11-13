@@ -2,7 +2,7 @@ import { PUMP } from './config.js';
 import { agentSellEvents } from './chain.js';
 import { LookupCache } from './paper-lookups.js';
 import { PaperStore } from './paper-store.js';
-import { transactionFailure, readOrderDiagnostics } from './paper-diagnostics.js';
+import { buildFailureCode, transactionFailure, readOrderDiagnostics } from './paper-diagnostics.js';
 import { reserves, cap, entryQuote, entryQuality, exitQuote, terminalExitQuote, writeOffQuote, liquidityRisk, stopLoss, liquidityBudget, budgetCapped, profitable, meetsDrop, higher } from './paper-math.js';
 
 const mandatoryExit = reason => ['floor', 'stop_loss', 'liquidity_risk', 'timeout'].includes(reason);
@@ -31,12 +31,15 @@ export class PaperEngine {
     if (live && (cfg.strategy !== 'agent-sell-liquidity' || !cfg.live)) throw new Error('Live execution supports only agent-sell-liquidity with live limits');
     this.dryRun = cfg.mode === 'live_dry_run';
     this.paper = new PaperStore(store, cfg); this.states = new Map(); this.ready = false;
+    for (const row of store.all('SELECT mint,failures,last_code,last_at_ms,retry_at_ms FROM live_exit_failures')) {
+      this.liveExitFailures.set(row.mint, { failures: row.failures, code: row.last_code, at: row.last_at_ms, until: row.retry_at_ms });
+    }
     this.agentMode = cfg.strategy === 'agent-sell-liquidity'; this.observationRevision = 0;
     this.terminalExits = this.agentMode && cfg.version === 'agent_sell_liquidity_v3_terminal_exit';
     this.startupExitGrace = new Map();
     this.coverageSlots = new Map();
     this.lookups = new LookupCache(rpc, name => { if (!this.stopped) this.paper.count(name); }, now);
-    this.slot = 0; this.slotAt = 0; this.epoch = 0; this.queue = []; this.working = false; this.stopped = false;
+    this.slot = 0; this.slotAt = 0; this.epoch = 0; this.queue = []; this.working = false; this.stopped = false; this.draining = false;
     this.reconciliations = new Map(); this.exitAttempts = new Map(); this.stopPromise = null;
   }
   attach(feeds) { this.feeds = feeds; }
@@ -273,6 +276,12 @@ export class PaperEngine {
       if (state.complete) {
         for (const order of this.paper.pending().filter(o => o.mint === mint)) this.cancel(order.id, this.now(), 'graduated');
         this.store.run('UPDATE paper_watches SET status=?,reason=? WHERE mint=?', this.paper.position(mint) ? 'exit_blocked' : 'stopped', 'graduated_no_amm_exit', mint);
+        // Live mode has no AMM adapter. Persist a manual action immediately instead of leaving a
+        // graduated holding as an unreported blocked position (or attempting the curve seller).
+        if (this.executor && !this.dryRun && this.paper.position(mint)) {
+          this.liveExit(mint, 'graduated_no_amm_exit', 'graduated_no_amm_exit', { observedSlot: slot });
+          return;
+        }
         if (this.terminalExits && this.writeOff(mint, 'graduated_no_amm_exit', 'graduated_no_amm_exit', { observedSlot: slot })) return;
         this.unwatch(mint); return;
       }
@@ -443,6 +452,7 @@ export class PaperEngine {
         const reject = (reason, detail) => this.paper.agentOutcome(event, reason, detail);
         if (!event.reserves) return reject('missing_sell_reserves');
         if (!this.agentFresh(event.mint, event.slot)) return reject('coverage_or_state_stale');
+        if (this.draining) return reject('shutdown_draining');
         if (watch.status !== 'watching' || this.paper.position(event.mint) || !this.cfg.entriesEnabled ||
             !this.paper.capacity().remaining) return reject('entries_disabled_or_cap');
         if (this.liveHalted) return reject('live_halted');
@@ -498,8 +508,15 @@ export class PaperEngine {
           this.unwatch(watch.mint); continue;
         }
         const row = this.states.get(watch.mint);
-        if (watch.status === 'exit_blocked' && mandatoryExit(watch.reason) && row) {
+        if (!this.draining && watch.status === 'exit_blocked' && mandatoryExit(watch.reason) && row) {
           this.requestExit(watch.mint, row.state, watch.reason, null);
+        }
+      }
+      if (this.draining && this.executor) {
+        for (const position of this.store.all("SELECT mint FROM paper_positions WHERE status='open'")) {
+          if (!this.paper.pending().some(order => order.mint === position.mint)) {
+            this.liveExit(position.mint, 'timeout', 'shutdown_drain', { requestedAtMs: this.now() });
+          }
         }
       }
       if (this.executor && this.submitted.size) await this.liveResolveUnknown();
@@ -796,20 +813,28 @@ export class PaperEngine {
   }
   liveExitFailed(mint, code) {
     const failures = (this.liveExitFailures.get(mint)?.failures ?? 0) + 1;
+    const delay = Math.min(60000, 2000 * 2 ** Math.min(failures - 1, 5));
+    const entry = { failures, until: this.now() + delay, at: this.now(), code };
+    this.liveExitFailures.set(mint, entry);
+    this.store.run(`INSERT INTO live_exit_failures(mint,failures,last_code,last_at_ms,retry_at_ms) VALUES(?,?,?,?,?)
+      ON CONFLICT(mint) DO UPDATE SET failures=excluded.failures,last_code=excluded.last_code,
+      last_at_ms=excluded.last_at_ms,retry_at_ms=excluded.retry_at_ms`, mint, failures, code, entry.at, entry.until);
     if (failures === 10) {
       this.liveHalt('exit_failing');
+      const tokens = this.paper.position(mint)?.tokens_raw ?? null;
+      this.paper.manualAction(mint, 'exit_failing', { failures, code, tokens }, this.now());
       this.log(JSON.stringify({ event: 'live_manual_action', mint, reason: 'exit_failing', failures, lastError: code,
         note: 'Exits keep retrying every 60 s; check the curve and sell manually if needed.' }));
     }
-    const delay = Math.min(60000, 2000 * 2 ** Math.min(failures - 1, 5));
-    this.liveExitFailures.set(mint, { failures, until: this.now() + delay, code });
     this.paper.count('live:exit_retry_backoff');
+    return entry;
   }
   /** Confirmed on-chain result -> recorded quote. Refundable token-account rent is excluded on both sides, so
    * PnL and profit targets compare like with like; the tip, priority and base fees are real costs and included. */
   liveQuote(order, modeled, result) {
     const base = { model: 'live_fill', slot: result.slot, signature: result.signature,
       modeled: { cost: modeled.cost ?? null, net: modeled.net ?? null, tokens: modeled.tokens ?? null, slot: modeled.slot ?? null },
+      ...(modeled.burnOnly ? { executionMode: 'burn_only' } : {}),
       solDeltaLamports: result.lamports.toString(), ataLamports: result.ataLamports.toString(),
       transactionFeeLamports: result.fee.toString(), tokensDelta: result.tokens.toString(),
       tokenProgram: result.tokenProgram ?? null };
@@ -851,6 +876,17 @@ export class PaperEngine {
       : order.reason === 'profit' ? BigInt(modeled.net) * BigInt(10000 - this.cfg.sellSlippageBps) / 10000n : null;
     return this.executor.prepareSell(order.mint, tokens, min !== null && min < 0n ? 0n : min, close, this.cfg.live.exitSlippageBps, mode);
   }
+  /** Opt-in zero-recovery fallback. It never burns tokens that exceed this trial's recorded position. */
+  async liveBurnBuild(order) {
+    const position = this.paper.position(order.mint);
+    if (!position) throw new Error('no_position');
+    const program = await this.liveTokenProgram(order.mint);
+    const held = await this.executor.tokenBalance(order.mint, program);
+    if (held <= 0n) return { status: 'no_tokens' };
+    const owned = BigInt(position.tokens_raw);
+    if (held > owned) throw new Error('foreign_balance_present');
+    return this.executor.prepareBurnClose(order.mint, held, program);
+  }
   async liveFill(order, modeled, active, confirmed = null) {
     if (order.side === 'sell' && this.liveBackoff(order.mint)) { this.cancel(order.id, this.now(), 'live_exit_backoff'); return; }
     if (order.side === 'buy') {
@@ -862,20 +898,46 @@ export class PaperEngine {
   }
   async liveFillUnlocked(order, modeled, active, confirmed) {
     // Checks and the (send-free) build run together: every RPC here delays the send inside a ~5-slot signal window.
-    const [blocked, built] = await Promise.all([
+    const [blocked, initialBuild] = await Promise.all([
       order.side === 'buy' ? this.liveBuyBlocked(order, BigInt(modeled.requestedBudgetLamports)) : null,
       this.liveBuild(order, modeled, confirmed).then(value => ({ value }), error => ({ error })),
     ]);
     if (blocked) { this.cancel(order.id, this.now(), blocked); return; }
     if (order.side === 'buy' && !this.current(order, active)) return;
+    let built = initialBuild;
+    // A mandatory exit gets one on-demand refresh and rebuild before it contributes to the durable failure count.
+    if (built.error && order.side === 'sell' && mandatoryExit(order.reason) && this.executor.refreshExitState) {
+      try {
+        await this.executor.refreshExitState();
+        built = await this.liveBuild(order, modeled, confirmed).then(value => ({ value }), error => ({ error }));
+      } catch (error) { built = { error }; }
+    }
     let prepared = built.value;
     if (built.error) {
       const error = built.error;
       // Nothing was signed for broadcast: safe to cancel.
-      const code = /^[a-z0-9_]{1,64}$/.test(error?.message ?? '') ? error.message : 'build_error';
-      if (order.side === 'sell') this.liveExitFailed(order.mint, code);
-      this.cancel(order.id, this.now(), 'live_build_failed', { liveError: code });
-      return;
+      let code = buildFailureCode(error), failure = null;
+      if (order.side === 'sell') failure = this.liveExitFailed(order.mint, code);
+      const threshold = Number(this.cfg.live.burnOnlyAfterFailures ?? 0);
+      if (order.side === 'sell' && mandatoryExit(order.reason) && threshold > 0 && failure.failures >= threshold) {
+        try {
+          prepared = await this.liveBurnBuild(order);
+          if (prepared.status !== 'no_tokens') {
+            modeled = { ...modeled, model: 'live_burn_only', burnOnly: true, net: '0' };
+            this.diagnose(order, { stage: 'ready_to_fill', liveError: code });
+          }
+        } catch (burnError) {
+          code = buildFailureCode(burnError);
+          prepared = null;
+          if (failure.failures === threshold) this.paper.manualAction(order.mint, 'burn_only_failed', {
+            failures: failure.failures, code, tokens: this.paper.position(order.mint)?.tokens_raw ?? null,
+          }, this.now());
+        }
+      }
+      if (!prepared) {
+        this.cancel(order.id, this.now(), 'live_build_failed', { liveError: code });
+        return;
+      }
     }
     if (prepared.status === 'no_tokens') { this.liveNoTokens(order); return; }
     // A gap, stop, expiry or supersede during the build cancels the order: then nothing may be sent or recorded.
@@ -939,6 +1001,9 @@ export class PaperEngine {
       this.store.run(`UPDATE paper_positions SET status='closed',exit_order_id=?,closed_at_ms=?,exit_net_lamports='0',pnl_lamports=?
         WHERE mint=? AND status='open'`, id, at, (-BigInt(position.entry_cost_lamports)).toString(), mint);
       this.store.run("UPDATE paper_watches SET status='closed',reason='external_exit' WHERE mint=?", mint);
+      this.store.run('DELETE FROM live_exit_failures WHERE mint=?', mint);
+      this.liveExitFailures.delete(mint);
+      this.paper.resolveManualActions(mint, cause, at);
       this.paper.count('live:external_exit');
       return true;
     });
@@ -951,6 +1016,7 @@ export class PaperEngine {
         this.submitted.delete(order.id);
         this.cancel(order.id, this.now(), 'live_buy_without_tokens', record);
         this.liveHalt('buy_without_tokens');
+        this.paper.manualAction(order.mint, 'buy_without_tokens', {}, this.now());
         this.log(JSON.stringify({ event: 'live_manual_action', mint: order.mint, signature: result.signature, reason: 'buy_without_tokens' }));
         return;
       }
@@ -969,9 +1035,11 @@ export class PaperEngine {
         return;
       }
       this.submitted.delete(order.id); this.liveExitFailures.delete(order.mint);
+      this.store.run('DELETE FROM live_exit_failures WHERE mint=?', order.mint);
       this.log(JSON.stringify({ event: 'live_fill', side: order.side, reason: order.reason, mint: order.mint,
         signature: result.signature, solDelta: result.lamports.toString(), tokens: result.tokens.toString() }));
       if (order.side === 'sell') {
+        this.paper.resolveManualActions(order.mint, modeled.burnOnly ? 'burn_only_confirmed' : 'exit_confirmed', this.now());
         this.unwatch(order.mint); this.liveCheckLoss();
         // A partial liquidation (or a balance this trial did not open) leaves tokens behind: report, never track.
         if (result.burnedTokens && result.burnedTokens !== '0') {
@@ -981,6 +1049,7 @@ export class PaperEngine {
         }
         if (typeof result.postTokens === 'bigint' && result.postTokens > 0n) {
           this.liveForeign.add(order.mint);
+          this.paper.manualAction(order.mint, 'residual_tokens_after_exit', { tokens: result.postTokens.toString() }, this.now());
           this.log(JSON.stringify({ event: 'live_manual_action', mint: order.mint, reason: 'residual_tokens_after_exit',
             tokens: result.postTokens.toString(), note: 'Position closed; the remaining tokens are excluded from entries.' }));
         }
@@ -1041,6 +1110,7 @@ export class PaperEngine {
     }
   }
   async liveBuyBlocked(order, budget) {
+    if (this.draining) return 'live_shutdown_draining';
     if (this.liveHalted) return `live_halted_${this.liveHalted}`;
     if (this.liveForeign.has(order.mint)) return 'live_foreign_holding';
     // At most LIVE_MAX_BUYS_IN_FLIGHT live buys at once (default 1, which keeps wallet and exposure checks exact).
@@ -1098,14 +1168,24 @@ export class PaperEngine {
   }
   /** Live mandatory exit: a real full sale at whatever a fresh quote supports (within LIVE_EXIT_SLIPPAGE_BPS). */
   liveExit(mint, reason, cause, evidence) {
-    if (this.stopped || this.paper.pending().some(order => order.mint === mint) || this.liveBackoff(mint)) return false;
     if (cause === 'graduated_no_amm_exit') {
       this.store.run("UPDATE paper_watches SET status='stopped',reason='graduated_live_unsellable' WHERE mint=?", mint);
-      this.paper.count('live:graduated_unsellable');
-      this.log(JSON.stringify({ event: 'live_manual_action', mint, reason: 'graduated_held_tokens', note: 'Curve completed; sell on PumpSwap manually.' }));
+      const position = this.paper.position(mint);
+      if (position) {
+        const recorded = this.paper.manualAction(mint, 'graduated_held_tokens', {
+          tokens: position.tokens_raw,
+          detail: { observed_slot: Number.isSafeInteger(evidence?.observedSlot) ? evidence.observedSlot : null },
+        }, this.now());
+        if (recorded) {
+          this.paper.count('live:graduated_unsellable');
+          this.log(JSON.stringify({ event: 'live_manual_action', mint, reason: 'graduated_held_tokens',
+            tokens: position.tokens_raw, note: 'Curve completed; sell on PumpSwap manually.' }));
+        }
+      }
       this.unwatch(mint);
       return true;
     }
+    if (this.stopped || this.paper.pending().some(order => order.mint === mint) || this.liveBackoff(mint)) return false;
     const id = this.request(mint, 'sell', reason, { net: '0', model: 'live_mandatory_full_sale', liveCause: cause, evidence }, null);
     if (!id) return false;
     const order = this.store.get('SELECT * FROM paper_orders WHERE id=?', id);
@@ -1116,8 +1196,36 @@ export class PaperEngine {
       .finally(() => this.reconciliations.delete(id));
     return false;
   }
+  /** Reconcile this database with current wallet ownership without sending an order. */
+  async liveReconcileWallet({ allowForeign = false } = {}) {
+    if (this.dryRun) return { held: 0, closedMissing: [], foreign: [] };
+    const held = await this.executor.heldMints();
+    const owned = new Set(this.store.all("SELECT mint FROM paper_positions WHERE status='open'").map(row => row.mint));
+    // A sell or buy that may have landed before a crash is resolved from chain after startup, so the wallet may
+    // legitimately disagree with the database for those mints until then.
+    const unresolved = new Set(this.paper.pending().filter(order =>
+      ['live_submitted', 'live_unknown'].includes(readOrderDiagnostics(order.diagnostics_json)?.stage)).map(order => order.mint));
+    const missing = [...owned].filter(mint => !held.has(mint) && !unresolved.has(mint) &&
+      this.paper.watch(mint)?.reason !== 'graduated_live_unsellable');
+    const closedMissing = [];
+    for (const mint of missing) {
+      if (this.liveCloseMissing(mint, 'missing_at_startup')) {
+        owned.delete(mint); closedMissing.push(mint);
+        this.log(JSON.stringify({ event: 'live_external_exit', mint, reason: 'missing_at_startup',
+          note: 'Wallet no longer holds this position; closed at zero recovery.' }));
+      }
+    }
+    const foreign = [...held].filter(mint => !owned.has(mint) && !unresolved.has(mint));
+    this.liveForeign = new Set(foreign);
+    if (foreign.length) {
+      this.log(JSON.stringify({ event: 'live_foreign_tokens', count: foreign.length,
+        note: 'Wallet holds tokens this trial did not open; those mints are excluded from entries.' }));
+      if (!allowForeign) throw new Error(`Wallet holds ${foreign.length} mint(s) not owned by this database; refusing to rotate live databases. Resume the owning database or pass --abandon-open-positions.`);
+    }
+    return { held: held.size, closedMissing, foreign };
+  }
   /** Startup: the wallet and this database must agree before any order is sent. */
-  async liveStartupChecks({ resume = false } = {}) {
+  async liveStartupChecks({ resume = false, allowForeign = false } = {}) {
     const halted = this.store.get("SELECT value FROM metadata WHERE key='live_halted'")?.value;
     if (halted && resume) {
       this.store.run("DELETE FROM metadata WHERE key='live_halted'");
@@ -1128,29 +1236,56 @@ export class PaperEngine {
     }
     const balance = await this.executor.balance();
     if (balance < BigInt(this.cfg.live.minWalletLamports)) throw new Error('Wallet SOL is below LIVE_MIN_WALLET_SOL; refusing to start');
-    if (!this.dryRun) {
-      const held = await this.executor.heldMints();
-      const owned = new Set(this.store.all("SELECT mint FROM paper_positions WHERE status='open'").map(row => row.mint));
-      // A sell or buy that may have landed before a crash is resolved from chain after startup, so the wallet may
-      // legitimately disagree with the database for those mints until then.
-      const unresolved = new Set(this.paper.pending().filter(order =>
-        ['live_submitted', 'live_unknown'].includes(readOrderDiagnostics(order.diagnostics_json)?.stage)).map(order => order.mint));
-      const missing = [...owned].filter(mint => !held.has(mint) && !unresolved.has(mint) &&
-        this.paper.watch(mint)?.reason !== 'graduated_live_unsellable');
-      // Positions the wallet no longer holds were sold or moved outside this trial: close them at zero recovery.
-      for (const mint of missing) {
-        if (this.liveCloseMissing(mint, 'missing_at_startup')) {
-          owned.delete(mint);
-          this.log(JSON.stringify({ event: 'live_external_exit', mint, reason: 'missing_at_startup',
-            note: 'Wallet no longer holds this position; closed at zero recovery.' }));
-        }
-      }
-      // Tokens this trial did not open (airdrops, another bot) are left alone: never bought into, never sold.
-      this.liveForeign = new Set([...held].filter(mint => !owned.has(mint) && !unresolved.has(mint)));
-      if (this.liveForeign.size) this.log(JSON.stringify({ event: 'live_foreign_tokens', count: this.liveForeign.size,
-        note: 'Wallet holds tokens this trial did not open; those mints are excluded from entries.' }));
+    await this.liveReconcileWallet({ allowForeign });
+    for (const row of this.store.all(`SELECT p.mint FROM paper_positions p JOIN paper_watches w ON w.mint=p.mint
+      WHERE p.status='open' AND w.reason IN ('graduated_no_amm_exit','graduated_live_unsellable')`)) {
+      this.liveExit(row.mint, 'graduated_no_amm_exit', 'graduated_no_amm_exit', { recoveredAtStartup: true });
     }
     this.liveCheckLoss();
+  }
+  /** First shutdown signal: stop entries and actively liquidate every owned position. */
+  beginDrain() {
+    if (this.draining || this.stopped) return this.drainStatus();
+    this.draining = true;
+    for (const order of this.paper.pending().filter(row => row.side === 'buy')) this.cancel(order.id, this.now(), 'shutdown_draining');
+    for (const position of this.store.all(`SELECT p.mint FROM paper_positions p
+      LEFT JOIN paper_watches w ON w.mint=p.mint
+      WHERE p.status='open' AND COALESCE(w.reason,'')!='graduated_live_unsellable'`)) {
+      this.latchExit(position.mint, 'timeout');
+      this.liveExit(position.mint, 'timeout', 'shutdown_drain', { requestedAtMs: this.now() });
+    }
+    const status = this.drainStatus();
+    this.log(JSON.stringify({ event: 'live_shutdown_draining', ...status,
+      note: status.manualPositions.length
+        ? 'New entries are disabled; actionable positions are being exited. Graduated positions require manual sale.'
+        : 'New entries are disabled; open positions are being exited before shutdown.' }));
+    return status;
+  }
+  drainStatus() {
+    const graduated = this.store.all(`SELECT p.mint,p.tokens_raw FROM paper_positions p
+      JOIN paper_watches w ON w.mint=p.mint
+      WHERE p.status='open' AND w.reason='graduated_live_unsellable'`);
+    return {
+      openPositions: this.store.get("SELECT COUNT(*) n FROM paper_positions WHERE status='open'").n,
+      actionablePositions: this.store.get(`SELECT COUNT(*) n FROM paper_positions p
+        LEFT JOIN paper_watches w ON w.mint=p.mint
+        WHERE p.status='open' AND COALESCE(w.reason,'')!='graduated_live_unsellable'`).n,
+      manualPositions: graduated,
+      pendingExits: this.store.get("SELECT COUNT(*) n FROM paper_orders WHERE side='sell' AND status='pending'").n,
+      submitted: this.submitted.size,
+    };
+  }
+  recordDrainFailure(reason = 'shutdown_drain_timeout') {
+    const rows = this.store.all(`SELECT p.mint,p.tokens_raw FROM paper_positions p
+      LEFT JOIN paper_watches w ON w.mint=p.mint
+      WHERE p.status='open' AND COALESCE(w.reason,'')!='graduated_live_unsellable'`);
+    for (const row of rows) {
+      const failure = this.liveExitFailures.get(row.mint);
+      this.paper.manualAction(row.mint, reason, {
+        failures: failure?.failures ?? null, code: failure?.code ?? null, tokens: row.tokens_raw,
+      }, this.now());
+    }
+    return rows.map(row => row.mint);
   }
   stop() {
     if (this.stopPromise) return this.stopPromise;

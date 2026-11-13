@@ -93,6 +93,11 @@ export function liveSettings(env = process.env) {
     maxBuysInFlight: num(env, 'LIVE_MAX_BUYS_IN_FLIGHT', 1, 1, 4),
     // false: no balance RPC per buy; a cached balance (refreshed every 5 s and after each fill) guards the floor instead.
     checkBalancePerBuy: flag(env, 'LIVE_CHECK_BALANCE_PER_BUY', true),
+    // Disabled by default. When enabled, repeated mandatory-exit build failures may burn the wallet balance and
+    // close its token account without depending on a bonding-curve sell. This is irreversible zero recovery.
+    burnOnlyAfterFailures: num(env, 'LIVE_BURN_ONLY_AFTER_EXIT_FAILURES', 0, 0, 100),
+    // First SIGINT/SIGTERM drains open positions for this long; a second signal still stops immediately.
+    shutdownDrainMs: num(env, 'LIVE_SHUTDOWN_DRAIN_MS', 120_000, 0, 1_800_000),
   };
 }
 
@@ -179,6 +184,10 @@ export class LiveExecutor {
   async refreshFees() {
     const [global, feeConfig] = await Promise.all([this.sdk.fetchGlobal(), this.sdk.fetchFeeConfig()]);
     this.fees = { global, feeConfig };
+  }
+  /** One on-demand refresh before classifying an exit build as failed. */
+  async refreshExitState() {
+    await Promise.all([this.refreshBlockhash(), this.refreshFees(), this.refreshPriority().catch(() => {})]);
   }
   /** Wallet SOL in lamports at confirmed commitment; throws on RPC failure. */
   async balance() { return BigInt(await this.conn.getBalance(this.user, 'confirmed')); }
@@ -336,6 +345,22 @@ export class LiveExecutor {
     return this.prepare(built.instructions, mint, this.settings.sellUnits, { tokenProgram: built.tokenProgram, quotedLamports: built.quotedLamports.toString(),
       soldTokens: built.soldTokens.toString(), burnedTokens: built.burnedTokens.toString() },
       this.priorityPrice());
+  }
+  /** Irreversible emergency exit that does not read or invoke the bonding curve. */
+  async prepareBurnClose(mint, tokens, tokenProgram = null) {
+    if (tokens <= 0n) throw new Error('no_tokens');
+    const mintKey = new PublicKey(mint);
+    const info = await this.mintInfo(mintKey);
+    const program = tokenProgram ? new PublicKey(tokenProgram) : info.tokenProgram;
+    if (!program.equals(info.tokenProgram)) throw new Error('token_program_mismatch');
+    const ata = getAssociatedTokenAddressSync(mintKey, this.user, true, program);
+    const instructions = [
+      createBurnCheckedInstruction(ata, mintKey, this.user, tokens, info.decimals, [], program),
+      createCloseAccountInstruction(ata, this.user, this.user, [], program),
+    ];
+    return this.prepare(instructions, mint, this.settings.sellUnits, {
+      tokenProgram: program.toBase58(), quotedLamports: '0', soldTokens: '0', burnedTokens: tokens.toString(), burnOnly: true,
+    }, this.priorityPrice());
   }
   prepare(instructions, mint, units, extra = {}, microLamports) {
     if (this.stopped) throw new Error('executor_stopped');

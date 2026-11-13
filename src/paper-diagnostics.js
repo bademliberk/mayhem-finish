@@ -21,6 +21,28 @@ const transactionKinds = new Set(['AccountInUse', 'AccountLoadedTwice', 'Account
   'CommitCancelled', 'InstructionError', 'Unknown']);
 const nonnegative = value => Number.isSafeInteger(value) && value >= 0;
 
+// Stable, credential-free build categories. Raw provider/SDK messages must never be
+// persisted because they can contain URLs, API keys or response payloads.
+export function buildFailureCode(error) {
+  const message = String(error?.message ?? '').toLowerCase();
+  const code = String(error?.code ?? '').toLowerCase();
+  if (/^[a-z0-9_]{1,64}$/.test(message)) return message;
+  if (message.includes('blockhash')) return 'blockhash_unavailable';
+  if (message.includes('transaction too large') || message.includes('encoding overruns') ||
+      message.includes('too many account')) return 'transaction_too_large';
+  if (message.includes('429') || message.includes('rate limit') || code === '429') return 'rpc_rate_limited';
+  if (message.includes('fetch failed') || message.includes('failed to fetch') || message.includes('network') ||
+      message.includes('timeout') || message.includes('timed out') || message.includes('socket') ||
+      message.includes('econn') || message.includes('rpc') || code.startsWith('econn') || code === 'etimedout') {
+    return 'rpc_unavailable';
+  }
+  if (message.includes('account') && (message.includes('missing') || message.includes('not found'))) return 'account_missing';
+  if (message.includes('insufficient funds')) return 'insufficient_funds';
+  if (error?.name === 'TypeError') return 'sdk_type_error';
+  if (error?.name === 'RangeError') return 'sdk_range_error';
+  return 'sdk_build_failure';
+}
+
 export function transactionFailure(error) {
   if (error === null) return null;
   if (typeof error === 'string') return { kind: transactionKinds.has(error) ? error : 'Unknown' };

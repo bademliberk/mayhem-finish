@@ -11,7 +11,7 @@ import { PaperEngine } from '../src/paper-engine.js';
 import { paperConfig, liveConfig } from '../src/paper-store.js';
 import { reserves } from '../src/paper-math.js';
 import { trialIdentity, livePath } from '../src/paper-profiles.js';
-import { safeOrderDiagnostics } from '../src/paper-diagnostics.js';
+import { buildFailureCode, safeOrderDiagnostics } from '../src/paper-diagnostics.js';
 import { LiveExecutor, liveSettings, ownerDelta } from '../src/live-executor.js';
 
 // Synthetic accounts, events and a fake executor only: no wallet, provider or network access.
@@ -62,10 +62,18 @@ function fakeExecutor() {
     },
     async prepareSell(m, tokens, min, close, slippage, mode) {
       ex.calls.push(['prepareSell', m, tokens, min, close, slippage, mode]);
+      if (ex.sellBuildError) throw ex.sellBuildError;
       const burned = mode === 'capped' && ex.burnOnCapped ? ex.burnOnCapped : 0n;
       return { mint: m, signature: sig(++n), wire: 'w', lastValidBlockHeight: 150, tokenProgram: TOKEN_PROGRAM, tokens,
         soldTokens: (tokens - burned).toString(), burnedTokens: burned.toString() };
     },
+    async prepareBurnClose(m, tokens, program) {
+      ex.calls.push(['prepareBurnClose', m, tokens, program]);
+      if (ex.burnBuildError) throw ex.burnBuildError;
+      return { mint: m, signature: sig(++n), wire: 'w', lastValidBlockHeight: 150, tokenProgram: program,
+        soldTokens: '0', burnedTokens: tokens.toString(), burnOnly: true };
+    },
+    async refreshExitState() { ex.calls.push(['refreshExitState']); },
     async submit(prepared) { ex.calls.push(['submit', prepared.signature]); return ex.submitResult(prepared); },
     async resolve(signature) { ex.calls.push(['resolve', signature]); return ex.resolveResult(signature); },
   };
@@ -109,6 +117,14 @@ test('live diagnostics keep the signature, stage and token program needed to res
   assert.deepEqual(safeOrderDiagnostics({ liveSignature: 'https://x/?api-key=secret', liveError: 'Error: api-key=abc', liveStatus: 'weird' }), {});
 });
 
+test('build failures retain safe actionable categories without persisting provider text', () => {
+  assert.equal(buildFailureCode(new Error('fetch failed: https://rpc/?api-key=secret')), 'rpc_unavailable');
+  assert.equal(buildFailureCode(new Error('Transaction too large: 1400 > 1232')), 'transaction_too_large');
+  assert.equal(buildFailureCode(new Error('curve_complete')), 'curve_complete');
+  assert.equal(buildFailureCode(new TypeError('unexpected SDK internals')), 'sdk_type_error');
+  assert.equal(buildFailureCode(new Error('provider said secret payload')), 'sdk_build_failure');
+});
+
 test('live and dry-run trials have their own identities and databases; risk limits are not identity', () => {
   const paper = paperConfig({}, 'agent-sell-liquidity'), live = liveConfig({}), dry = liveConfig({ LIVE_DRY_RUN: 'true' });
   assert.equal(live.mode, 'live'); assert.equal(dry.mode, 'live_dry_run');
@@ -116,6 +132,10 @@ test('live and dry-run trials have their own identities and databases; risk limi
   assert.equal(trialIdentity(liveConfig({ LIVE_MAX_LOSS_SOL: '5' })), trialIdentity(live));
   assert.throws(() => liveConfig({ LIVE_DRY_RUN: 'yes' }), /LIVE_DRY_RUN/);
   assert.throws(() => liveSettings({ LIVE_DRY_RUN: 'yes' }), /LIVE_DRY_RUN/);
+  assert.equal(liveSettings({}).burnOnlyAfterFailures, 0);
+  assert.equal(liveSettings({ LIVE_BURN_ONLY_AFTER_EXIT_FAILURES: '10' }).burnOnlyAfterFailures, 10);
+  assert.equal(liveSettings({}).shutdownDrainMs, 120000);
+  assert.throws(() => liveSettings({ LIVE_BURN_ONLY_AFTER_EXIT_FAILURES: '-1' }), /LIVE_BURN_ONLY/);
   assert.notEqual(livePath(true), livePath(false));
   assert.throws(() => new PaperEngine(new Store(':memory:', storeConfig), {}, live, {}), /executor/);
   assert.throws(() => new PaperEngine(new Store(':memory:', storeConfig), {}, paper, { executor: fakeExecutor() }), /executor/);
@@ -207,7 +227,8 @@ test('live buys respect the worst-case loss budget, in-flight buys and foreign w
   const t = setup();
   try {
     t.ex.held = new Set([mint]);
-    await t.engine.liveStartupChecks();
+    await assert.rejects(t.engine.liveStartupChecks(), /refusing to rotate live databases/);
+    await t.engine.liveStartupChecks({ allowForeign: true });
     t.engine.agentTransaction(tx('foreign', 20));
     assert.equal(pending(t), undefined, 'no order is requested for a mint the wallet already holds');
     assert.equal(t.store.get('SELECT outcome FROM paper_agent_events WHERE signature=?', 'foreign').outcome, 'live_foreign_holding');
@@ -387,6 +408,42 @@ test('the first sale sells everything; after a failure the retry sells the payab
   } finally { s.close(); }
 });
 
+test('an opt-in burn-only fallback closes a mandatory exit after refreshed sell builds still fail', async () => {
+  const s = setup({ cfg: liveCfg({ live: { ...limits, burnOnlyAfterFailures: 1 } }) });
+  try {
+    s.ex.submitResult = bought();
+    await entry(s);
+    s.ex.tokens = 100000000n;
+    s.ex.sellBuildError = new Error('fetch failed: provider detail must not persist');
+    s.ex.submitResult = sold(0n, 100000000n);
+    s.engine.liveExit(mint, 'timeout', 'shutdown_drain', {});
+    await Promise.all([...s.engine.reconciliations.values()].map(active => active.promise));
+    assert.equal(position(s), undefined);
+    assert.equal(s.ex.calls.filter(call => call[0] === 'prepareSell').length, 2, 'initial build plus one refreshed retry');
+    assert.equal(s.ex.calls.some(call => call[0] === 'refreshExitState'), true);
+    assert.deepEqual(s.ex.calls.find(call => call[0] === 'prepareBurnClose').slice(1, 4), [mint, 100000000n, TOKEN_PROGRAM]);
+    const fill = JSON.parse(s.store.get("SELECT fill_json FROM paper_orders WHERE side='sell' AND status='filled'").fill_json);
+    assert.equal(fill.executionMode, 'burn_only'); assert.equal(fill.burnedTokens, '100000000');
+    assert.equal(s.store.get('SELECT * FROM live_exit_failures WHERE mint=?', mint), undefined, 'confirmed fallback clears durable failure state');
+  } finally { s.close(); }
+});
+
+test('shutdown drain blocks entries and exits open positions before hard stop', async () => {
+  const s = setup();
+  try {
+    s.ex.submitResult = bought(); await entry(s);
+    s.ex.tokens = 100000000n; s.ex.submitResult = sold(3000000n, 100000000n);
+    const initial = s.engine.beginDrain();
+    assert.equal(initial.openPositions, 1);
+    await Promise.all([...s.engine.reconciliations.values()].map(active => active.promise));
+    assert.deepEqual(s.engine.drainStatus(), {
+      openPositions: 0, actionablePositions: 0, manualPositions: [], pendingExits: 0, submitted: 0,
+    });
+    s.engine.agentTransaction(tx('during-drain', 21, mint2));
+    assert.equal(s.store.get('SELECT outcome FROM paper_agent_events WHERE signature=?', 'during-drain').outcome, 'shutdown_draining');
+  } finally { s.close(); }
+});
+
 test('leftover tokens a sale could not move are still reported as residual', async () => {
   const s = setup();
   try {
@@ -529,6 +586,13 @@ test('a real SDK sell uses a fresh-quote minimum for mandatory exits and closes 
   assert.equal(profit.programs.includes(TOKEN_PROGRAM), false, 'account kept open');
 });
 
+test('burn-only preparation contains no Pump instruction and closes the token account', async () => {
+  const { ex } = await sdkExecutor({ AS_PRIORITY_MICROLAMPORTS: '1000' });
+  const burned = decoded(await ex.prepareBurnClose(mint, 100000000n, TOKEN_PROGRAM));
+  assert.equal(burned.pump.length, 0);
+  assert.equal(burned.programs.filter(program => program === TOKEN_PROGRAM).length, 2, 'burn plus close-account');
+});
+
 test('residual tokens after a live exit exclude the mint from entries immediately', async () => {
   const s = setup();
   try {
@@ -606,7 +670,25 @@ test('a halt persists across restarts until explicitly resumed, and repeated exi
     for (let i = 0; i < 10; i++) s.engine.liveExitFailed(mint, 'live_failed');
     assert.equal(s.engine.liveHalted, 'exit_failing');
     assert.equal(s.logs.filter(l => l.event === 'live_manual_action' && l.reason === 'exit_failing').length, 1);
+    const failure = s.store.get('SELECT failures,last_code FROM live_exit_failures WHERE mint=?', mint);
+    assert.equal(failure.failures, 10); assert.equal(failure.last_code, 'live_failed');
+    const action = s.store.get('SELECT reason,failure_count,error_code FROM live_manual_actions WHERE mint=?', mint);
+    assert.equal(action.reason, 'exit_failing'); assert.equal(action.failure_count, 10); assert.equal(action.error_code, 'live_failed');
+    assert.equal(s.engine.paper.report().recentManualActions[0].reason, 'exit_failing');
   } finally { s.close(); }
+});
+
+test('exit failure count and retry backoff survive a process restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'live-failures-')), path = join(dir, 'live.sqlite');
+  try {
+    const first = setup({ path });
+    first.engine.liveExitFailed(mint, 'rpc_unavailable'); first.close();
+    const second = setup({ path });
+    try {
+      assert.equal(second.engine.liveExitFailures.get(mint).failures, 1);
+      assert.equal(second.engine.liveBackoff(mint).code, 'rpc_unavailable');
+    } finally { second.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('AS_PRIORITY_FEES_ENABLED=false prices at 1 microlamport, keeps the instruction and never estimates', async () => {

@@ -127,6 +127,15 @@ export class PaperStore {
       );
       CREATE TABLE IF NOT EXISTS paper_rejections (id INTEGER PRIMARY KEY, reason TEXT NOT NULL, at_ms INTEGER NOT NULL, detail TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS paper_counters (name TEXT PRIMARY KEY, count INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS live_exit_failures (
+        mint TEXT PRIMARY KEY REFERENCES paper_watches(mint), failures INTEGER NOT NULL,
+        last_code TEXT NOT NULL, last_at_ms INTEGER NOT NULL, retry_at_ms INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS live_manual_actions (
+        id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, mint TEXT, reason TEXT NOT NULL,
+        failure_count INTEGER, error_code TEXT, tokens_raw TEXT, detail_json TEXT NOT NULL,
+        resolved_at_ms INTEGER, resolution TEXT
+      );
     `);
     // Rebuild only the parent table; preserve child FK names and all historical paper rows.
     if (store.all('PRAGMA foreign_key_list(paper_watches)').some(row => row.table === 'candidates')) {
@@ -197,6 +206,25 @@ export class PaperStore {
   }
   count(name) {
     this.store.run('INSERT INTO paper_counters VALUES(?,1) ON CONFLICT(name) DO UPDATE SET count=count+1', name);
+  }
+  manualAction(mint, reason, { failures = null, code = null, tokens = null, detail = {} } = {}, now = Date.now()) {
+    const safeCode = typeof code === 'string' && /^[a-z0-9_-]{1,64}$/.test(code) ? code : null;
+    const safeMint = typeof mint === 'string' && BASE58_MINT.test(mint) ? mint : null;
+    const safeTokens = typeof tokens === 'string' && /^(0|[1-9][0-9]{0,39})$/.test(tokens) ? tokens : null;
+    const safeDetail = Object.fromEntries(Object.entries(detail).filter(([, value]) =>
+      typeof value === 'boolean' || Number.isSafeInteger(value) ||
+      (typeof value === 'string' && /^[a-z0-9_-]{1,64}$/.test(value))));
+    const result = this.store.run(`INSERT INTO live_manual_actions(at_ms,mint,reason,failure_count,error_code,tokens_raw,detail_json)
+      SELECT ?,?,?,?,?,?,? WHERE NOT (?='graduated_held_tokens' AND EXISTS (
+        SELECT 1 FROM live_manual_actions WHERE mint=? AND reason=? AND resolved_at_ms IS NULL
+      ))`, now, safeMint, reason, Number.isSafeInteger(failures) ? failures : null,
+    safeCode, safeTokens, JSON.stringify(safeDetail), reason, safeMint, reason);
+    return result.changes > 0;
+  }
+  resolveManualActions(mint, resolution, now = Date.now()) {
+    if (!/^[a-z0-9_-]{1,64}$/.test(resolution)) return;
+    this.store.run(`UPDATE live_manual_actions SET resolved_at_ms=?,resolution=?
+      WHERE mint=? AND resolved_at_ms IS NULL`, now, resolution, mint);
   }
   rejection(reason, details = {}, now) {
     this.count(`decode:${reason}`);
@@ -481,6 +509,7 @@ export class PaperStore {
       orderDiagnosticsNote: 'Bounded evidence recorded after diagnostics were enabled; historical missing evidence is unknown. Status/account elapsed times include RPC queueing and retries, not network latency alone.',
       recentSignals: this.store.all('SELECT * FROM paper_signals ORDER BY received_at_ms DESC LIMIT 25'),
       recentRejections: this.store.all('SELECT * FROM paper_rejections ORDER BY id DESC LIMIT 25'),
+      recentManualActions: this.store.all('SELECT * FROM live_manual_actions ORDER BY id DESC LIMIT 100'),
       recentAccountFaults: this.store.all(`SELECT at_ms atMs,mint,slot,code,subtype,present,owner_matches ownerMatches,base64,bytes,${evidenceColumns}
         FROM paper_account_faults ORDER BY id DESC LIMIT ${FAULT_SAMPLE_LIMIT}`).map(row => ({ ...row, present: Boolean(row.present),
         ownerMatches: Boolean(row.ownerMatches), base64: Boolean(row.base64),
