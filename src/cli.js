@@ -23,18 +23,20 @@ const command = process.argv[2] ?? 'start';
 // `live-trial agent-sell-liquidity`: the agent strategy with real (or, with LIVE_DRY_RUN=true, simulated) orders.
 const live = command === 'live-trial';
 const liveArgs = live ? process.argv.slice(4) : [];
-const allowedLiveArgs = new Set(['--resume-entries', '--abandon-open-positions', '--reconcile-wallet', '--confirm-offline']);
+const allowedLiveArgs = new Set(['--resume-entries', '--abandon-open-positions', '--strict-wallet-ownership', '--reconcile-wallet', '--confirm-offline']);
 if (liveArgs.some(arg => !allowedLiveArgs.has(arg)) || new Set(liveArgs).size !== liveArgs.length ||
     (live && process.argv[3] !== 'agent-sell-liquidity')) {
-  throw new Error('Usage: live-trial agent-sell-liquidity [--resume-entries] [--abandon-open-positions] OR --reconcile-wallet --confirm-offline');
+  throw new Error('Usage: live-trial agent-sell-liquidity [--resume-entries] [--strict-wallet-ownership] OR --reconcile-wallet --confirm-offline');
 }
 const resumeEntries = liveArgs.includes('--resume-entries');
 const abandonOpenPositions = liveArgs.includes('--abandon-open-positions');
+const strictWalletOwnership = liveArgs.includes('--strict-wallet-ownership');
 const reconcileWallet = liveArgs.includes('--reconcile-wallet');
 const confirmOffline = liveArgs.includes('--confirm-offline');
-if (live && (reconcileWallet !== confirmOffline || (reconcileWallet && (resumeEntries || abandonOpenPositions)))) {
+if (live && (reconcileWallet !== confirmOffline || (reconcileWallet && (resumeEntries || abandonOpenPositions || strictWalletOwnership)))) {
   throw new Error('Wallet reconciliation requires exactly --reconcile-wallet --confirm-offline; stop all writers first');
 }
+if (live && abandonOpenPositions && strictWalletOwnership) throw new Error('Choose either default abandon behavior or --strict-wallet-ownership, not both');
 const trial = command === 'paper-trial' || live;
 const profile = trial ? process.argv[3] : null;
 const trialArgs = command === 'paper-trial' ? process.argv.slice(4) : [];
@@ -105,7 +107,7 @@ async function start(rpc, executor = null) {
     : new CandidateTracker(store, rpc);
   // Wallet and database must agree before any session, feed or order starts.
   if (executor) {
-    try { await tracker.liveStartupChecks({ resume: resumeEntries, allowForeign: abandonOpenPositions }); } catch (error) { rpc.stop(); throw error; }
+    try { await tracker.liveStartupChecks({ resume: resumeEntries, allowForeign: !strictWalletOwnership }); } catch (error) { rpc.stop(); throw error; }
   }
   const now = nowSeconds();
   store.run("INSERT OR IGNORE INTO metadata VALUES('monitoring_started_at',?)", String(now));

@@ -227,8 +227,9 @@ test('live buys respect the worst-case loss budget, in-flight buys and foreign w
   const t = setup();
   try {
     t.ex.held = new Set([mint]);
-    await assert.rejects(t.engine.liveStartupChecks(), /refusing to rotate live databases/);
-    await t.engine.liveStartupChecks({ allowForeign: true });
+    await assert.rejects(t.engine.liveStartupChecks({ allowForeign: false }), /refusing startup/);
+    await t.engine.liveStartupChecks();
+    assert.deepEqual([...t.engine.liveForeign], [mint], 'foreign holdings are abandoned by default');
     t.engine.agentTransaction(tx('foreign', 20));
     assert.equal(pending(t), undefined, 'no order is requested for a mint the wallet already holds');
     assert.equal(t.store.get('SELECT outcome FROM paper_agent_events WHERE signature=?', 'foreign').outcome, 'live_foreign_holding');

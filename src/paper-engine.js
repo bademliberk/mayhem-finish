@@ -1221,7 +1221,7 @@ export class PaperEngine {
     return false;
   }
   /** Reconcile this database with current wallet ownership without sending an order. */
-  async liveReconcileWallet({ allowForeign = false } = {}) {
+  async liveReconcileWallet({ allowForeign = true } = {}) {
     if (this.dryRun) return { held: 0, closedMissing: [], foreign: [] };
     const held = await this.executor.heldMints();
     const owned = new Set(this.store.all("SELECT mint FROM paper_positions WHERE status='open'").map(row => row.mint));
@@ -1243,13 +1243,13 @@ export class PaperEngine {
     this.liveForeign = new Set(foreign);
     if (foreign.length) {
       this.log(JSON.stringify({ event: 'live_foreign_tokens', count: foreign.length,
-        note: 'Wallet holds tokens this trial did not open; those mints are excluded from entries.' }));
-      if (!allowForeign) throw new Error(`Wallet holds ${foreign.length} mint(s) not owned by this database; refusing to rotate live databases. Resume the owning database or pass --abandon-open-positions.`);
+        note: 'Wallet holds tokens this trial did not open; they are left untouched and excluded from entries.' }));
+      if (!allowForeign) throw new Error(`Wallet holds ${foreign.length} mint(s) not owned by this database; refusing startup. Resume the owning database or remove strict wallet ownership enforcement.`);
     }
     return { held: held.size, closedMissing, foreign };
   }
   /** Startup: the wallet and this database must agree before any order is sent. */
-  async liveStartupChecks({ resume = false, allowForeign = false } = {}) {
+  async liveStartupChecks({ resume = false, allowForeign = true } = {}) {
     const halted = this.store.get("SELECT value FROM metadata WHERE key='live_halted'")?.value;
     if (halted && resume) {
       this.store.run("DELETE FROM metadata WHERE key='live_halted'");
