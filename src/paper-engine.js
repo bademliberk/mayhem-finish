@@ -260,7 +260,9 @@ export class PaperEngine {
         since: old?.since ?? Math.max(slot, this.coverageSlots.get(mint) ?? slot), history: old?.history ?? [] };
       // Confirmation snapshots cannot authorize another exit attempt by themselves.
       row.exitRevision = source === 'rpc' ? old?.exitRevision : row.revision;
-      row.history = row.history.filter(item => item.slot >= slot - this.cfg.windowSlots + 1);
+      const historySlots = Math.max(this.cfg.windowSlots ?? 5,
+        this.cfg.localBottomSlots ? this.cfg.localBottomSlots + (this.cfg.signalValiditySlots ?? 0) + 2 : 0);
+      row.history = row.history.filter(item => item.slot >= slot - historySlots + 1);
       if (!state.complete) row.history.push({ state, slot, at: row.at });
       // Several writes in one slot have no transaction index; retain their observed peak only.
       if (row.history.length > 1000) { this.paper.count('history_overflow'); row.history = []; row.since = slot; }
@@ -434,6 +436,25 @@ export class PaperEngine {
       slot >= (this.coverageSlots.get(mint) ?? Infinity) && slot <= this.slot + 2 &&
       this.slot < slot + this.cfg.signalValiditySlots;
   }
+  agentLocalBottom(mint, event, state) {
+    const window = this.cfg.localBottomSlots;
+    if (!window) return { enabled: false, accepted: true };
+    const row = this.states.get(mint), coverage = this.coverageSlots.get(mint);
+    const startSlot = event.slot - window + 1;
+    if (!row || !Number.isSafeInteger(coverage) || coverage > startSlot || row.since > startSlot) {
+      return { enabled: true, accepted: false, complete: false, startSlot, currentMc: cap(state), priorLowMc: null };
+    }
+    // Same-slot curve notifications have no transaction ordering. Exclude them to avoid using a state
+    // that may have arrived after the triggering sell; the sell's own post-trade reserves are the endpoint.
+    const history = row.history.filter(sample => sample.slot < event.slot);
+    const baseline = history.filter(sample => sample.slot <= startSlot)
+      .reduce((latest, sample) => !latest || sample.slot > latest.slot ? sample : latest, null);
+    if (!baseline) return { enabled: true, accepted: false, complete: false, startSlot, currentMc: cap(state), priorLowMc: null };
+    const samples = [baseline, ...history.filter(sample => sample.slot >= startSlot && sample.slot < event.slot)];
+    const priorLowMc = samples.reduce((low, sample) => Math.min(low, cap(sample.state)), Infinity);
+    const currentMc = cap(state);
+    return { enabled: true, accepted: currentMc <= priorLowMc, complete: true, startSlot, currentMc, priorLowMc };
+  }
   agentTransaction(tx) {
     if (this.stopped || !this.agentMode) return;
     const receivedAt = this.now();
@@ -462,6 +483,8 @@ export class PaperEngine {
             ...Object.fromEntries(Object.entries(event.reserves).map(([key, value]) => [key, BigInt(value)])) };
           if (state.complete || state.realSol < BigInt(this.cfg.minRealSolLamports)) return reject('minimum_real_liquidity');
           if (this.cfg.skipCappedEntries && budgetCapped(state.realSol, this.cfg)) return reject('capped_budget_skipped');
+          const localBottom = this.agentLocalBottom(event.mint, event, state);
+          if (!localBottom.accepted) return reject(localBottom.complete ? 'not_local_bottom' : 'local_bottom_history_incomplete', localBottom);
           if (this.cfg.minEntryMcSol != null || this.cfg.maxEntryMcSol != null) {
             const mc = cap(state);
             if (this.cfg.minEntryMcSol != null && mc < this.cfg.minEntryMcSol) return reject('mcap_below_band', { mc });
@@ -474,7 +497,8 @@ export class PaperEngine {
           if (quote.entryQuality.rejection) return reject(quote.entryQuality.rejection, quote.entryQuality);
           Object.assign(quote, { requestedBudgetLamports: budget.toString(), triggerRevision: revision,
             eventIndex: event.index, eventActor: event.user, referenceReserves: event.reserves,
-            provenance: 'successful_mayhem_ancestor', receivedAtMs: receivedAt });
+            provenance: 'successful_mayhem_ancestor', receivedAtMs: receivedAt,
+            ...(localBottom.enabled ? { localBottomEvidence: localBottom } : {}) });
           if (!this.paper.exposureAllows(budget + BigInt(this.cfg.networkFeeLamports))) return reject('exposure_cap');
           const id = this.request(event.mint, 'buy', 'agent_sell', quote, { signature: event.signature, slot: event.slot, side: 'sell' },
             { eventIndex: event.index, triggerRevision: revision, requestedBudgetLamports: budget.toString(),

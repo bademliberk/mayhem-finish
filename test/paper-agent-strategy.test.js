@@ -104,6 +104,56 @@ test('agent admission and restart retain 1000 watches and reject the next nonrep
   } finally { await engine.stop(); store.close(); }
 });
 
+test('local-bottom filter compares the signal to a fully covered trailing slot window', () => {
+  const localCfg = paperConfig({ PAPER_AGENT_LOCAL_BOTTOM_SLOTS: '20' }, 'agent-sell-liquidity');
+  assert.equal(localCfg.localBottomSlots, 20);
+  assert.notEqual(trialIdentity(localCfg), trialIdentity(config));
+  assert.throws(() => paperConfig({ PAPER_AGENT_LOCAL_BOTTOM_SLOTS: '1' }, 'agent-sell-liquidity'), /PAPER_AGENT_LOCAL_BOTTOM_SLOTS/);
+  const s = setup(localCfg);
+  try {
+    const row = s.engine.states.get(mint), high = reserves(account(40000000n, 160000000n));
+    s.engine.coverageSlots.set(mint, 100); row.since = 100;
+    row.history = [{ state: high, slot: 100, at: 100000 }];
+    const current = reserves(account(40000000n, 140000000n));
+    const eventAt119 = { slot: 119 };
+    assert.equal(s.engine.agentLocalBottom(mint, eventAt119, current).accepted, true);
+    row.history.push({ state: reserves(account(40000000n, 130000000n)), slot: 110, at: 100100 });
+    const higher = reserves(account(40000000n, 150000000n));
+    assert.equal(s.engine.agentLocalBottom(mint, eventAt119, higher).accepted, false);
+    s.engine.coverageSlots.set(mint, 101);
+    assert.equal(s.engine.agentLocalBottom(mint, eventAt119, current).complete, false);
+  } finally { s.close(); }
+});
+
+test('agent entry accepts a 20-slot low and rejects a signal above a lower observed cap', () => {
+  const localCfg = paperConfig({ PAPER_AGENT_LOCAL_BOTTOM_SLOTS: '20' }, 'agent-sell-liquidity');
+  const low = reserves(account(40000000n, 130000000n));
+  const setupWindow = s => {
+    s.engine.onAccount(mint, 20, account(40000000n, 160000000n));
+    for (const slot of [28, 36, 39]) {
+      s.engine.onSlot(slot);
+      s.engine.onAccount(mint, slot, account(40000000n, 150000000n));
+    }
+  };
+  const valid = setup(localCfg);
+  try {
+    setupWindow(valid);
+    valid.engine.agentTransaction(tx('local-low', 39, [event(mint, reserves(account(40000000n, 140000000n)))]));
+    assert.ok(pending(valid));
+  } finally { valid.close(); }
+
+  const rejected = setup(localCfg);
+  try {
+    rejected.engine.onAccount(mint, 20, account(40000000n, 160000000n));
+    rejected.engine.onSlot(28); rejected.engine.onAccount(mint, 28, account(40000000n, 130000000n));
+    rejected.engine.onSlot(36); rejected.engine.onAccount(mint, 36, account(40000000n, 150000000n));
+    rejected.engine.onSlot(39); rejected.engine.onAccount(mint, 39, account(40000000n, 150000000n));
+    rejected.engine.agentTransaction(tx('not-local-low', 39, [event(mint, reserves(account(40000000n, 140000000n)))]));
+    assert.equal(pending(rejected), undefined);
+    assert.equal(outcome(rejected), 'not_local_bottom');
+  } finally { rejected.close(); }
+});
+
 test('integer fraction truncates, applies cap, and explicit budgets retain exact fee-inclusive semantics', () => {
   const state = reserves(account());
   assert.equal(liquidityBudget(40246230n, config), 4829547n);

@@ -65,6 +65,9 @@ export function paperConfig(env = process.env, profile = null) {
         if (hi !== '') out.maxEntryMcSol = number('PAPER_AGENT_MAX_ENTRY_MC_SOL', 0, 0, 1e9, false);
         if (out.minEntryMcSol != null && out.maxEntryMcSol != null && out.minEntryMcSol >= out.maxEntryMcSol) throw new Error('Invalid PAPER_AGENT_MIN_ENTRY_MC_SOL / PAPER_AGENT_MAX_ENTRY_MC_SOL');
         return out; })(),
+      // Require the triggering sell's post-trade market cap to be the lowest observed level over a covered slot window.
+      ...(() => { const raw = String(env.PAPER_AGENT_LOCAL_BOTTOM_SLOTS ?? '').trim();
+        return raw === '' ? {} : { localBottomSlots: number('PAPER_AGENT_LOCAL_BOTTOM_SLOTS', 20, 2, 10000) }; })(),
       // Opt-in stop-loss on the full-sale net: 6000 = exit once the position is worth 60% less than it cost.
       // Omitted when unset or 0 so existing trial identities are unchanged.
       ...(() => { const bps = number('PAPER_AGENT_STOP_LOSS_BPS', 0, 0, 9999); return bps ? { stopLossBps: bps } : {}; })(),
