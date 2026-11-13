@@ -12,8 +12,10 @@ import { bindTrial, preflightTrial, trialIdentity, migrateAgentExitPolicy } from
 
 const profile = 'agent-sell-liquidity';
 const current = paperConfig({}, profile);
-const v1 = { ...current, version: 'agent_sell_liquidity_v1' };
-const v2 = { ...current, version: 'agent_sell_liquidity_v2_event_only' };
+const prior = { ...current };
+delete prior.dropConfirmSlots; delete prior.maxPostDropDrawdownBps;
+const v1 = { ...prior, version: 'agent_sell_liquidity_v1' };
+const v2 = { ...prior, version: 'agent_sell_liquidity_v2_event_only' };
 const storeConfig = { firstCheck: 30, recheck: 30, horizon: 86400, paperMode: true };
 const mint = '9HzQCGsFEwLxZyHgf4XNzJSCi6EzCr1UHW1296SWpump';
 const cli = fileURLToPath(new URL('../src/cli.js', import.meta.url));
@@ -57,10 +59,10 @@ function cliOptions(dir) {
 
 for (const old of [v1, v2]) {
   test(`agent policy identity rejects ${old.version} resumes without changing holdings or history`, t => {
-    assert.equal(current.version, 'agent_sell_liquidity_v3_terminal_exit');
+    assert.equal(current.version, 'agent_sell_liquidity_v4_post_drop_confirmation');
     assert.notEqual(trialIdentity(current), trialIdentity(old));
     const { path, dir } = fixture(t, old), before = snapshot(path);
-    assert.throws(() => preflightTrial(path, current), /not this trial.*v1 or v2.*v3.*--migrate-exit-policy/);
+    assert.throws(() => preflightTrial(path, current), /not this trial.*v1, v2 or v3.*v4.*--migrate-exit-policy/);
     const store = new Store(path, storeConfig);
     try { assert.throws(() => bindTrial(store, current), /configuration changed.*--migrate-exit-policy/); }
     finally { store.close(); }
@@ -71,7 +73,7 @@ for (const old of [v1, v2]) {
     assert.equal(existsSync(join(dir, 'normal.sqlite')), false);
   });
 
-  test(`explicit offline ${old.version} to v3 migration retains holdings, history and audit boundaries`, t => {
+  test(`explicit offline ${old.version} to v4 migration retains holdings, history and audit boundaries`, t => {
     const { path, dir, entry, pending, priorAudit } = fixture(t, old, { priorMigration: old === v2 });
     const before = read(path, db => ({ position: db.prepare('SELECT * FROM paper_positions').get(),
       entry: db.prepare('SELECT * FROM paper_orders WHERE id=?').get(entry),
@@ -87,7 +89,8 @@ for (const old of [v1, v2]) {
     assert.equal(migration.oldIdentity, trialIdentity(old));
     assert.equal(migration.newIdentity, trialIdentity(current));
     assert.deepEqual(migration.oldConfig, old); assert.deepEqual(migration.newConfig, current);
-    assert.deepEqual({ ...migration.oldConfig, version: current.version }, migration.newConfig);
+    assert.deepEqual({ ...migration.oldConfig, version: current.version,
+      dropConfirmSlots: current.dropConfirmSlots, maxPostDropDrawdownBps: current.maxPostDropDrawdownBps }, migration.newConfig);
     assert.ok(Number.isSafeInteger(migration.atMs));
     preflightTrial(path, current);
     const store = new Store(path, storeConfig), paper = new PaperStore(store, current);

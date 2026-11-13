@@ -3,6 +3,7 @@
 !.env.example
 node_modules/
 data/
+research/downloads/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm

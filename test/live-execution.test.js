@@ -91,7 +91,7 @@ function setup({ cfg = liveCfg(), path = ':memory:', ex = fakeExecutor() } = {})
   const rpc = { accounts: async () => ({ context: { slot: 20 }, value: [account()] }),
     call: async () => ({ value: [{ slot: 20, err: null, confirmationStatus: 'confirmed' }] }) };
   const logs = [];
-  const engine = new PaperEngine(store, rpc, cfg, { now: () => now, project: raw => raw, executor: ex, log: line => logs.push(JSON.parse(line)) });
+  const engine = new PaperEngine(store, rpc, { ...cfg, dropConfirmSlots: 0 }, { now: () => now, project: raw => raw, executor: ex, log: line => logs.push(JSON.parse(line)) });
   engine.attach({ add() {}, remove() {}, setPreprocessed() {}, covers: () => true, start() {}, stop() {}, resync() {} });
   engine.add(mint); engine.add(mint2); engine.onReady(); engine.onSlot(20);
   engine.onAccount(mint, 20, account()); engine.onAccount(mint2, 20, account()); engine.coverage(mint); engine.coverage(mint2);

@@ -7,6 +7,15 @@ import { reserves, cap, entryQuote, entryQuality, exitQuote, terminalExitQuote, 
 
 const mandatoryExit = reason => ['floor', 'stop_loss', 'liquidity_risk', 'timeout'].includes(reason);
 const exitPriority = reason => ({ profit: 0, stop_loss: 1, liquidity_risk: 2, timeout: 3, floor: 4, graduated_no_amm_exit: 5 }[reason] ?? -1);
+const downMoreThanBps = (current, baseline, bps) =>
+  current.virtualSol * baseline.virtualTokens * 10000n <
+  baseline.virtualSol * current.virtualTokens * BigInt(10000 - bps);
+const priceLower = (left, right) => left.virtualSol * right.virtualTokens < right.virtualSol * left.virtualTokens;
+const drawdownBps = (current, baseline) => {
+  const whole = baseline.virtualSol * current.virtualTokens;
+  const drop = whole - current.virtualSol * baseline.virtualTokens;
+  return drop <= 0n ? 0 : Number(drop * 10000n / whole);
+};
 
 function validateAccount(account) {
   if (!account) return { code: 'missing_account' };
@@ -35,7 +44,8 @@ export class PaperEngine {
       this.liveExitFailures.set(row.mint, { failures: row.failures, code: row.last_code, at: row.last_at_ms, until: row.retry_at_ms });
     }
     this.agentMode = cfg.strategy === 'agent-sell-liquidity'; this.observationRevision = 0;
-    this.terminalExits = this.agentMode && cfg.version === 'agent_sell_liquidity_v3_terminal_exit';
+    this.terminalExits = this.agentMode && cfg.version === 'agent_sell_liquidity_v4_post_drop_confirmation';
+    this.dropConfirmations = new Map();
     this.startupExitGrace = new Map();
     this.coverageSlots = new Map();
     this.lookups = new LookupCache(rpc, name => { if (!this.stopped) this.paper.count(name); }, now);
@@ -146,6 +156,12 @@ export class PaperEngine {
       .sort((a, b) => b.enrolled_at_ms - a.enrolled_at_ms || a.mint.localeCompare(b.mint));
     const excess = unheld.slice(this.cfg.maxWatches - monitoredHeld.length);
     this.store.atomic(() => {
+      for (const event of this.store.all("SELECT signature,mint,event_index FROM paper_agent_events WHERE outcome='drop_confirmation_pending'")) {
+        this.store.run(`UPDATE paper_agent_events SET outcome='drop_confirmation_interrupted',detail=?
+          WHERE signature=? AND mint=? AND event_index=?`, JSON.stringify({ reason: 'restart_before_confirmation' }),
+        event.signature, event.mint, event.event_index);
+        this.paper.count('agent:drop_confirmation_interrupted');
+      }
       // Unknown pending fills are canceled on restart, not assumed to have happened.
       // Live submissions may be on-chain: keep them blocked and resolve them from chain in tick().
       for (const order of this.paper.pending()) {
@@ -188,6 +204,7 @@ export class PaperEngine {
     this.coverageSlots.clear(); this.lookups.clear();
     this.paper.count(`gap:${reason}`);
     for (const order of this.paper.pending()) this.cancel(order.id, this.now(), 'feed_gap');
+    this.clearDropConfirmations('drop_confirmation_feed_gap');
     if (this.terminalExits) {
       // A gap is missing data, not evidence of zero recovery: hold write-offs until feeds recover (see onReady).
       for (const watch of this.paper.active()) {
@@ -213,10 +230,12 @@ export class PaperEngine {
       // sockets that actually fail report their own gaps. Restart only local signal windows so no
       // entry spans the discontinuity, without tearing down feeds or canceling orders.
       this.paper.count('slot_discontinuity');
+      this.clearDropConfirmations('drop_confirmation_slot_gap');
       // Only mints that already had coverage: a jump must not grant coverage the feeds never acknowledged.
       for (const mint of [...this.coverageSlots.keys()]) this.coverage(mint);
     }
     for (const order of this.paper.pending()) this.expire(order);
+    if (this.agentMode) this.checkDropConfirmations();
     if (this.agentMode) this.checkAgentExits();
     if (slot) {
       for (const [mint, since] of this.coverageSlots) {
@@ -226,6 +245,7 @@ export class PaperEngine {
   }
   invalidateAccount(mint, slot, account, code, subtype = null) {
     if (this.stopped) return;
+    this.cancelDropConfirmation(mint, 'drop_confirmation_invalid_account', { slot, code });
     this.states.delete(mint); this.startupExitGrace.delete(mint);
     this.coverageSlots.set(mint, Math.max(slot, this.slot) || Infinity);
     for (const order of this.paper.pending().filter(order => order.mint === mint)) {
@@ -273,6 +293,7 @@ export class PaperEngine {
       const fingerprint = account.data[0];
       const changed = fingerprint !== watch.fingerprint;
       if (changed) this.store.run('UPDATE paper_watches SET fingerprint=?,last_change_ms=? WHERE mint=?', fingerprint, this.now(), mint);
+      if (this.agentMode) this.checkDropConfirmation(mint);
       if (!this.agentMode && !state.complete && cap(state) > this.cfg.floorCap &&
           (this.paper.position(mint) || (changed && cap(state) < this.cfg.activationCap))) this.membership(mint, true);
       if (state.complete) {
@@ -351,7 +372,7 @@ export class PaperEngine {
   observationFresh(row) {
     return Boolean(row) && this.now() >= row.at && this.now() - row.at <= this.cfg.maxStateAgeMs;
   }
-  // v3 only: accountSubscribe notifies on change, so silence on a live, covered subscription means unchanged
+  // Terminal-exit policy: accountSubscribe notifies on change, so silence on a live, covered subscription means unchanged
   // reserves, not unknown ones. Gaps and invalid accounts clear cached rows, so a cached row implies neither since.
   quietCovered(mint, row) {
     return this.terminalExits && this.ready && Boolean(row) && this.now() >= row.at && this.feeds.covers(mint) &&
@@ -455,6 +476,121 @@ export class PaperEngine {
     const currentMc = cap(state);
     return { enabled: true, accepted: currentMc <= priorLowMc, complete: true, startSlot, currentMc, priorLowMc };
   }
+  cancelDropConfirmation(mint, outcome, detail = null) {
+    const candidate = this.dropConfirmations.get(mint);
+    if (!candidate) return false;
+    this.dropConfirmations.delete(mint);
+    this.paper.agentOutcome(candidate.event, outcome, detail);
+    return true;
+  }
+  clearDropConfirmations(outcome) {
+    for (const mint of [...this.dropConfirmations.keys()]) this.cancelDropConfirmation(mint, outcome);
+  }
+  checkDropConfirmations() {
+    for (const mint of [...this.dropConfirmations.keys()]) this.checkDropConfirmation(mint);
+  }
+  checkDropConfirmation(mint) {
+    const candidate = this.dropConfirmations.get(mint);
+    if (!candidate) return;
+    const cursor = this.paper.agentCursor(mint), watch = this.paper.watch(mint), row = this.states.get(mint);
+    if (!cursor || cursor.ambiguous || cursor.revision !== candidate.revision) {
+      this.cancelDropConfirmation(mint, 'drop_confirmation_superseded'); return;
+    }
+    if (!watch || watch.status !== 'watching' || this.paper.position(mint)) {
+      this.cancelDropConfirmation(mint, 'drop_confirmation_entry_unavailable'); return;
+    }
+    if (row?.state?.complete) {
+      this.cancelDropConfirmation(mint, 'drop_confirmation_graduated'); return;
+    }
+    // Every observed reserve update in the confirmation window counts, even if the price later recovers.
+    for (const sample of row?.history ?? []) {
+      if (sample.slot <= candidate.startSlot || sample.slot > candidate.endSlot) continue;
+      if (downMoreThanBps(sample.state, candidate.baselineState, candidate.maxDrawdownBps)) {
+        this.cancelDropConfirmation(mint, 'post_drop_drawdown', {
+          startSlot: candidate.startSlot, endSlot: candidate.endSlot, observedSlot: sample.slot,
+          baselineMc: cap(candidate.baselineState), observedMc: cap(sample.state),
+          maxDrawdownBps: candidate.maxDrawdownBps,
+        });
+        return;
+      }
+      if (sample.slot > candidate.latestSlot) {
+        candidate.latestSlot = sample.slot; candidate.latestState = sample.state;
+      }
+      if (priceLower(sample.state, candidate.lowestState)) {
+        candidate.lowestSlot = sample.slot; candidate.lowestState = sample.state;
+      }
+    }
+    // A live, covered account subscription is change-only: if no newer account arrived, reserves stayed still.
+    if (row && row.slot > candidate.startSlot && row.slot > candidate.latestSlot) {
+      candidate.latestSlot = row.slot; candidate.latestState = row.state;
+      if (priceLower(row.state, candidate.lowestState)) {
+        candidate.lowestSlot = row.slot; candidate.lowestState = row.state;
+      }
+    }
+    if (this.slot < candidate.endSlot) return;
+    if (this.slot > candidate.endSlot + (this.cfg.signalValiditySlots ?? 5)) {
+      this.cancelDropConfirmation(mint, 'drop_confirmation_stale'); return;
+    }
+    if (!this.ready || !this.feeds.covers(mint) || !row || !this.quietCovered(mint, row)) return;
+    // Check the current price as well, so a late update cannot pass the window on stale cached reserves.
+    if (downMoreThanBps(candidate.latestState, candidate.baselineState, candidate.maxDrawdownBps)) {
+      this.cancelDropConfirmation(mint, 'post_drop_drawdown', {
+        startSlot: candidate.startSlot, endSlot: candidate.endSlot, observedSlot: candidate.latestSlot,
+        baselineMc: cap(candidate.baselineState), observedMc: cap(candidate.latestState),
+        maxDrawdownBps: candidate.maxDrawdownBps,
+      });
+      return;
+    }
+    if (!this.agentFresh(mint, this.slot)) return;
+    this.dropConfirmations.delete(mint);
+    this.submitAgentBuy(candidate, candidate.latestState, true);
+  }
+  submitAgentBuy(candidate, state, confirmed) {
+    const { event, revision, localBottom, receivedAt } = candidate;
+    const mint = event.mint, reject = (reason, detail) => this.paper.agentOutcome(event, reason, detail);
+    const watch = this.paper.watch(mint), cursor = this.paper.agentCursor(mint);
+    if (!this.ready || !this.feeds.covers(mint) || !this.agentFresh(mint, confirmed ? this.slot : event.slot) ||
+        !watch || watch.status !== 'watching' || this.paper.position(mint) ||
+        !this.cfg.entriesEnabled || !this.paper.capacity().remaining ||
+        !cursor || cursor.ambiguous || cursor.revision !== revision) {
+      reject('drop_confirmation_entry_unavailable'); return;
+    }
+    if (this.liveHalted) { reject('live_halted'); return; }
+    if (this.liveForeign.has(mint)) { reject('live_foreign_holding'); return; }
+    try {
+      if (state.complete || state.realSol < BigInt(this.cfg.minRealSolLamports)) return reject('minimum_real_liquidity');
+      if (this.cfg.skipCappedEntries && budgetCapped(state.realSol, this.cfg)) return reject('capped_budget_skipped');
+      const mc = cap(state);
+      if ((this.cfg.minEntryMcSol != null && mc < this.cfg.minEntryMcSol) ||
+          (this.cfg.maxEntryMcSol != null && mc >= this.cfg.maxEntryMcSol)) return reject('mcap_outside_band', { mc });
+      const budget = liquidityBudget(state.realSol, this.cfg);
+      if (budget <= 0n) return reject('budget_too_small');
+      const quote = entryQuote(state, this.cfg, budget);
+      quote.entryQuality = entryQuality(state, this.cfg, budget);
+      if (quote.entryQuality.rejection) return reject(quote.entryQuality.rejection, quote.entryQuality);
+      const signalSlot = confirmed ? this.slot : event.slot;
+      const referenceReserves = Object.fromEntries(['realSol', 'realTokens', 'virtualSol', 'virtualTokens']
+        .map(key => [key, state[key].toString()]));
+      Object.assign(quote, { requestedBudgetLamports: budget.toString(), triggerRevision: revision,
+        eventIndex: event.index, eventActor: event.user, referenceReserves,
+        provenance: 'successful_mayhem_ancestor', receivedAtMs: receivedAt,
+        ...(localBottom.enabled ? { localBottomEvidence: localBottom } : {}),
+        ...(confirmed ? { dropConfirmationEvidence: { startSlot: candidate.startSlot, endSlot: candidate.endSlot,
+          baselineMc: cap(candidate.baselineState), lowestMc: cap(candidate.lowestState), lowestSlot: candidate.lowestSlot,
+          observedDrawdownBps: drawdownBps(candidate.lowestState, candidate.baselineState),
+          confirmedMc: mc, maxDrawdownBps: candidate.maxDrawdownBps },
+          triggerSignature: event.signature, triggerSlot: event.slot } : {}) });
+      if (!this.paper.exposureAllows(budget + BigInt(this.cfg.networkFeeLamports))) return reject('exposure_cap');
+      const id = this.request(mint, 'buy', 'agent_sell', quote,
+        { signature: confirmed ? null : event.signature, slot: signalSlot, side: 'sell' },
+        { eventIndex: event.index, triggerRevision: revision, requestedBudgetLamports: budget.toString(),
+          referenceRealSolLamports: state.realSol.toString(), triggerToRequestSlots: Math.max(0, this.slot - event.slot),
+          ...(confirmed ? { dropConfirmSlots: candidate.endSlot - candidate.startSlot,
+            dropConfirmationDrawdownBps: candidate.maxDrawdownBps } : {}) }, this.now());
+      reject(id ? (confirmed ? 'drop_confirmation_passed' : 'buy_pending') : 'entry_blocked',
+        { requestedBudgetLamports: budget.toString(), referenceReserves, ...(confirmed ? { endSlot: candidate.endSlot } : {}) });
+    } catch { reject('entry_quote_unavailable'); }
+  }
   agentTransaction(tx) {
     if (this.stopped || !this.agentMode) return;
     const receivedAt = this.now();
@@ -466,6 +602,8 @@ export class PaperEngine {
       this.store.atomic(() => {
         const { outcome, revision } = this.paper.advanceAgent(event, receivedAt);
         if (outcome === 'duplicate_sell' || outcome === 'older_sell') return;
+        if (outcome === 'ambiguous_sell_slot') this.cancelDropConfirmation(event.mint, 'drop_confirmation_ambiguous_signal');
+        if (outcome === 'received') this.cancelDropConfirmation(event.mint, 'drop_confirmation_superseded');
         for (const order of this.paper.pending().filter(o => o.mint === event.mint && o.side === 'buy')) {
           this.cancel(order.id, receivedAt, outcome === 'ambiguous_sell_slot' ? outcome : 'sell_superseded');
         }
@@ -475,7 +613,7 @@ export class PaperEngine {
         if (!this.agentFresh(event.mint, event.slot)) return reject('coverage_or_state_stale');
         if (this.draining) return reject('shutdown_draining');
         if (watch.status !== 'watching' || this.paper.position(event.mint) || !this.cfg.entriesEnabled ||
-            !this.paper.capacity().remaining) return reject('entries_disabled_or_cap');
+            this.paper.capacity().remaining <= this.dropConfirmations.size) return reject('entries_disabled_or_cap');
         if (this.liveHalted) return reject('live_halted');
         if (this.liveForeign.has(event.mint)) return reject('live_foreign_holding');
         try {
@@ -500,10 +638,17 @@ export class PaperEngine {
             provenance: 'successful_mayhem_ancestor', receivedAtMs: receivedAt,
             ...(localBottom.enabled ? { localBottomEvidence: localBottom } : {}) });
           if (!this.paper.exposureAllows(budget + BigInt(this.cfg.networkFeeLamports))) return reject('exposure_cap');
-          const id = this.request(event.mint, 'buy', 'agent_sell', quote, { signature: event.signature, slot: event.slot, side: 'sell' },
-            { eventIndex: event.index, triggerRevision: revision, requestedBudgetLamports: budget.toString(),
-              referenceRealSolLamports: event.reserves.realSol, triggerToRequestSlots: Math.max(0, this.slot - event.slot) }, receivedAt);
-          reject(id ? 'buy_pending' : 'entry_blocked', { requestedBudgetLamports: budget.toString(), referenceReserves: event.reserves });
+          const startSlot = Math.max(this.slot, event.slot);
+          const candidate = { event, revision, localBottom, receivedAt, baselineState: state,
+            latestState: state, latestSlot: startSlot, lowestState: state, lowestSlot: startSlot, startSlot,
+            endSlot: startSlot + (this.cfg.dropConfirmSlots ?? 0),
+            maxDrawdownBps: this.cfg.maxPostDropDrawdownBps ?? 1000 };
+          if (this.cfg.dropConfirmSlots > 0) {
+            this.dropConfirmations.set(event.mint, candidate);
+            reject('drop_confirmation_pending', { startSlot: candidate.startSlot, endSlot: candidate.endSlot,
+              baselineMc: cap(state), maxDrawdownBps: candidate.maxDrawdownBps });
+            this.checkDropConfirmation(event.mint);
+          } else this.submitAgentBuy(candidate, state, false);
         } catch { reject('entry_quote_unavailable'); }
       });
     }
@@ -635,11 +780,7 @@ export class PaperEngine {
     });
     return active.promise;
   }
-  /**
-   * Fast entry (live only): no getSignatureStatuses recheck and no confirmed curve refetch. The buy is quoted and
-   * built from the triggering sell event's post-trade reserves and sent at once; the 5% buy slippage limit is the
-   * guard against a stale price. Entry quality and the liquidity budget are still enforced.
-   */
+  /** Fast entry (live only): use the accepted post-confirmation reserves and the normal slippage guard. */
   async fastEntry(order, active) {
     const predicted = JSON.parse(order.quote_json);
     const watch = this.paper.watch(order.mint);
@@ -1314,6 +1455,7 @@ export class PaperEngine {
   stop() {
     if (this.stopPromise) return this.stopPromise;
     this.stopped = true; this.ready = false; this.epoch++; this.queue = [];
+    this.clearDropConfirmations('drop_confirmation_stopped');
     for (const order of this.paper.pending()) this.cancel(order.id, this.now(), 'stopped');
     for (const active of this.reconciliations.values()) active.controller.abort();
     // Cancellation happens before feed teardown; wait for all continuations, including failed teardown.

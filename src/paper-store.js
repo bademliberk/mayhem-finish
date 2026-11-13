@@ -42,7 +42,7 @@ export function paperConfig(env = process.env, profile = null) {
     entriesEnabled: env.PAPER_ENTRIES_ENABLED !== 'false',
     ...(profile === null ? {} : { maxWatches: 10, ...trialProfiles[profile] }),
     ...(profile !== 'agent-sell-liquidity' ? {} : {
-      version: 'agent_sell_liquidity_v3_terminal_exit',
+      version: 'agent_sell_liquidity_v4_post_drop_confirmation',
       maxWatches: number('PAPER_AGENT_MAX_WATCHES', 20, 1, 1000),
       fractionBps: number('PAPER_AGENT_FRACTION_BPS', 1200, 1, 10000),
       maxSwapBudgetLamports: String(number('PAPER_AGENT_MAX_SWAP_LAMPORTS', 10000000, 1, 1e12)),
@@ -74,6 +74,9 @@ export function paperConfig(env = process.env, profile = null) {
       // Opt-in: skip entries whose fraction-based budget would reach PAPER_AGENT_MAX_SWAP_LAMPORTS.
       // Omitted when off so existing trial identities are unchanged.
       ...(flag('PAPER_AGENT_SKIP_CAPPED') ? { skipCappedEntries: true } : {}),
+      // After the qualifying local-bottom sell, observe the curve for a short stabilization window.
+      dropConfirmSlots: number('PAPER_AGENT_DROP_CONFIRM_SLOTS', 5, 0, 100),
+      maxPostDropDrawdownBps: number('PAPER_AGENT_MAX_POST_DROP_DRAWDOWN_BPS', 1000, 1, 10000),
     }),
   };
 }
@@ -416,7 +419,7 @@ export class PaperStore {
       const gross = BigInt(quote.gross), swapFee = BigInt(quote.swapFee);
       const writeOff = quote.terminalOutcome === 'write_off';
       if (order.side !== 'sell' || this.cfg.strategy !== 'agent-sell-liquidity' ||
-          this.cfg.version !== 'agent_sell_liquidity_v3_terminal_exit' ||
+          this.cfg.version !== 'agent_sell_liquidity_v4_post_drop_confirmation' ||
           position.entry_order_id !== quote.entryOrderId || quote.originalTokens !== position.tokens_raw ||
           quote.tokens !== position.tokens_raw || !['full_sale', 'partial_sale', 'write_off'].includes(quote.terminalOutcome) ||
           sold < 0n || burned < 0n || sold + burned !== BigInt(position.tokens_raw) ||
@@ -489,14 +492,14 @@ export class PaperStore {
       mode: this.cfg.mode ?? 'paper', assumptions: this.cfg, capacity: this.capacity(), feedHealth: readFeedHealth(this.store, now),
       ...(this.cfg.strategy !== 'agent-sell-liquidity' ? {} : {
         policyMigrations: (() => {
-          return this.store.all("SELECT value FROM metadata WHERE key IN ('paper_trial_policy_migration','paper_trial_terminal_exit_migration')")
+          return this.store.all("SELECT value FROM metadata WHERE key IN ('paper_trial_policy_migration','paper_trial_terminal_exit_migration','paper_trial_post_drop_confirmation_migration')")
             .map(row => JSON.parse(row.value)).sort((a, b) => a.atMs - b.atMs);
         })(),
         exposure: Object.fromEntries(Object.entries(this.exposure()).map(([key, value]) => [`${key}Lamports`, value.toString()])),
         recentAgentEvents: this.store.get("SELECT 1 FROM sqlite_master WHERE name='paper_agent_events'") ?
           this.store.all('SELECT * FROM paper_agent_events ORDER BY id DESC LIMIT 25') : [],
-        agentStrategyNote: this.cfg.version === 'agent_sell_liquidity_v3_terminal_exit'
-          ? 'Mandatory exits recover supported liquidity and model burning the remainder; unavailable reserves are zero-recovery write-offs. One network fee models combined sell/burn/account closure; no rent credit. Not actual sales, burns or account closures. Entry screening still requires a full modeled exit.'
+        agentStrategyNote: this.cfg.version === 'agent_sell_liquidity_v4_post_drop_confirmation'
+          ? 'Entries wait five slots after a qualifying sell and reject if observed price falls more than the configured limit. Mandatory exits recover supported liquidity and model burning the remainder; unavailable reserves are zero-recovery write-offs. One network fee models combined sell/burn/account closure; no rent credit. Not actual sales, burns or account closures. Entry screening still requires a full modeled exit.'
           : 'Budget includes swap fees; total entry cost adds modeled network fees. Rent and non-fill attempt fees excluded. Events are live confirmed signals, not recovered history. Timeout attempts do not guarantee exits.',
       }),
       performance: paperPerformance(this.store, positions, openPositionHealth),
@@ -526,7 +529,7 @@ export class PaperStore {
       counters: this.store.all('SELECT * FROM paper_counters ORDER BY name'),
       blocked: this.store.all("SELECT * FROM paper_watches WHERE status='exit_blocked'"),
       usage: this.store.all("SELECT * FROM usage WHERE source IN ('preprocessed','preprocessed_bytes','paper_agent') OR method IN ('paper_account_received_bytes','paper_agent_received_bytes') ORDER BY day,source,method"),
-      note: this.cfg.version === 'agent_sell_liquidity_v3_terminal_exit'
+      note: this.cfg.version === 'agent_sell_liquidity_v4_post_drop_confirmation'
         ? 'Paper results include confirmed-state modeled sales and explicit zero-recovery write-offs, not actual trades, balances or achievable returns. Burn/account closure is modeled with one network fee and no rent credit. No AMM execution or proceeds are assumed.'
         : 'Hypothetical fills using later executed reserves and configured fees; not actual trades, balances or achievable returns. Unsupported transactions are skipped. Graduation exits require manual attention; no AMM execution.',
     };

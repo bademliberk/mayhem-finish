@@ -32,9 +32,9 @@ export function trialIdentity(cfg) {
   return JSON.stringify(Object.fromEntries(Object.entries(cfg).sort(([a], [b]) => a.localeCompare(b))));
 }
 function mismatchMessage(cfg, prefix) {
-  if (cfg.mode && cfg.mode !== 'paper') return `${prefix}; use a new LIVE_TRIAL_DIR (open positions in the old database still need handling)`;
+  if (cfg.mode && cfg.mode !== 'paper') return `${prefix}; live-trial databases are not migrated by this command. A new LIVE_TRIAL_DIR resets persisted P&L and max-loss tracking; resolve existing holdings and loss state before switching`;
   return cfg.profile === 'agent-sell-liquidity'
-    ? `${prefix}; no policy was changed. Stop all trial processes, then explicitly migrate the otherwise-identical v1 or v2 trial to v3 terminal-exit policy with: node src/cli.js paper-trial agent-sell-liquidity --migrate-exit-policy --confirm-offline (same PAPER_TRIAL_DIR and configuration)`
+    ? `${prefix}; no policy was changed. Stop all trial processes, then explicitly migrate the otherwise-identical v1, v2 or v3 trial to v4 post-drop confirmation with: node src/cli.js paper-trial agent-sell-liquidity --migrate-exit-policy --confirm-offline (same PAPER_TRIAL_DIR and configuration)`
     : `${prefix}; use a new trial directory`;
 }
 
@@ -43,28 +43,33 @@ function mismatchMessage(cfg, prefix) {
 export function migrateAgentExitPolicy(path, cfg, { confirmOffline = false } = {}) {
   if (!confirmOffline) throw new Error('Stop all trial processes and pass --confirm-offline before policy migration');
   if (cfg.profile !== 'agent-sell-liquidity' || cfg.strategy !== 'agent-sell-liquidity' ||
-      cfg.version !== 'agent_sell_liquidity_v3_terminal_exit') throw new Error('Only the agent v1 or event-only v2 to terminal-exit v3 policy migration is supported');
+      cfg.version !== 'agent_sell_liquidity_v4_post_drop_confirmation') throw new Error('Only the agent v1, v2 or v3 to post-drop confirmation v4 policy migration is supported');
   if (!existsSync(path)) throw new Error('Policy migration requires an existing trial database');
   const db = new DatabaseSync(path);
   try {
     db.exec('BEGIN IMMEDIATE');
     try {
-      const oldIdentities = ['agent_sell_liquidity_v1', 'agent_sell_liquidity_v2_event_only']
-        .map(version => trialIdentity({ ...cfg, version }));
+      const priorConfig = { ...cfg };
+      delete priorConfig.dropConfirmSlots; delete priorConfig.maxPostDropDrawdownBps;
+      const oldIdentities = ['agent_sell_liquidity_v1', 'agent_sell_liquidity_v2_event_only', 'agent_sell_liquidity_v3_terminal_exit']
+        .map(version => trialIdentity({ ...priorConfig, version }));
       const newIdentity = trialIdentity(cfg);
       const saved = db.prepare("SELECT value FROM metadata WHERE key='paper_trial_config'").get()?.value;
       if (!oldIdentities.includes(saved)) throw new Error('Policy migration requires an otherwise-identical agent v1 or v2 trial configuration; no changes made');
-      if (db.prepare("SELECT 1 FROM metadata WHERE key='paper_trial_terminal_exit_migration'").get()) {
-        throw new Error('Terminal-exit v3 policy migration was already recorded; no changes made');
+      const fromVersion = JSON.parse(saved).version;
+      const migrationKey = fromVersion === 'agent_sell_liquidity_v3_terminal_exit'
+        ? 'paper_trial_post_drop_confirmation_migration' : 'paper_trial_terminal_exit_migration';
+      if (db.prepare('SELECT 1 FROM metadata WHERE key=?').get(migrationKey)) {
+        throw new Error('This agent policy migration was already recorded; no changes made');
       }
       const lastOldPolicyOrderId = db.prepare('SELECT COALESCE(MAX(id),0) id FROM paper_orders').get().id;
       const canceledPendingOrderIds = db.prepare("SELECT id FROM paper_orders WHERE status='pending' ORDER BY id").all().map(row => row.id);
       const atMs = Date.now();
       const migration = { atMs, oldConfig: JSON.parse(saved), newConfig: JSON.parse(newIdentity),
         oldIdentity: saved, newIdentity, lastOldPolicyOrderId, canceledPendingOrderIds,
-        note: 'Open holdings retained and now managed by terminal-exit v3; historical orders retain original assumptions. Aggregate performance spans policy versions.' };
+        note: 'Open holdings retained and now managed by terminal-exit v4 with post-drop entry confirmation; historical orders retain original assumptions. Aggregate performance spans policy versions.' };
       db.prepare("UPDATE paper_orders SET status='canceled',settled_at_ms=?,error='exit_policy_migration' WHERE status='pending'").run(atMs);
-      db.prepare("INSERT INTO metadata(key,value) VALUES('paper_trial_terminal_exit_migration',?)").run(JSON.stringify(migration));
+      db.prepare('INSERT INTO metadata(key,value) VALUES(?,?)').run(migrationKey, JSON.stringify(migration));
       db.prepare("UPDATE metadata SET value=? WHERE key='paper_trial_config'").run(newIdentity);
       db.exec('COMMIT');
       return migration;

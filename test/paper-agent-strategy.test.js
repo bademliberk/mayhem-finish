@@ -43,7 +43,7 @@ function setup(options = {}, path = ':memory:') {
   let now = 100000, snapshot = account(), snapshotSlot = 20, statusSlot = 20, covered = true;
   const rpc = { accounts: async () => ({ context: { slot: snapshotSlot }, value: [snapshot] }),
     call: async () => ({ value: [{ slot: statusSlot, err: null, confirmationStatus: 'confirmed' }] }) };
-  const engine = new PaperEngine(store, rpc, { ...config, ...options }, { now: () => now, project: raw => raw });
+  const engine = new PaperEngine(store, rpc, { ...config, ...options, dropConfirmSlots: 0 }, { now: () => now, project: raw => raw });
   engine.attach({ add() {}, remove() {}, setPreprocessed() {}, covers: () => covered, start() {}, stop() {}, resync() {} });
   engine.add(mint); engine.add(mint2); engine.onReady(); engine.onSlot(20);
   engine.onAccount(mint, 20, account()); engine.onAccount(mint2, 20, account()); engine.coverage(mint); engine.coverage(mint2);
